@@ -297,12 +297,13 @@ impl GenerationEngine {
     /// tied embeddings (`token_embedding`).
     fn project_to_logits(&self, hidden: &DeviceTensor, row: usize) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
-        let hidden_data = hidden.tensor.as_f32();
+        let hidden_host = self.backend.download(hidden);
+        let hidden_data = hidden_host.as_f32();
         let start = row * hidden_size;
         let row_data = &hidden_data[start..start + hidden_size];
 
-        let row_tensor = DeviceTensor::new(
-            Tensor::new(vec![1, hidden_size], row_data.to_vec()),
+        let row_tensor = self.backend.upload(
+            &Tensor::new(vec![1, hidden_size], row_data.to_vec()),
         );
 
         // Use output_projection if available, otherwise tied embeddings
@@ -310,7 +311,8 @@ impl GenerationEngine {
             .unwrap_or(&self.weights.token_embedding);
 
         let logits_tensor = linear_forward(&row_tensor, proj_weight, None, self.backend.as_ref());
-        logits_tensor.tensor.as_f32().to_vec()
+        let logits_host = self.backend.download(&logits_tensor);
+        logits_host.as_f32().to_vec()
     }
 
     /// The model configuration.

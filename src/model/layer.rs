@@ -155,18 +155,23 @@ fn multi_head_attention(
         (q, k)
     };
 
-    // Step b: GQA - repeat K/V heads if needed
+    // Step b: Download Q, K, V for head extraction (CPU-side operation)
+    let q_host = backend.download(&q_proc);
+    let k_host = backend.download(&k_proc);
+    let v_host = backend.download(&v);
+    let q_data = q_host.as_f32();
+    let k_data_raw = k_host.as_f32();
+    let v_data_raw = v_host.as_f32();
+
+    // GQA - repeat K/V heads if needed
     let (k_expanded_data, v_expanded_data) = if num_kv_heads < num_heads {
-        let k_data = k_proc.tensor.as_f32();
-        let v_data = v.tensor.as_f32();
-        let k_exp = repeat_kv_heads(k_data, seq_len, num_kv_heads, num_heads, head_dim);
-        let v_exp = repeat_kv_heads(v_data, seq_len, num_kv_heads, num_heads, head_dim);
+        let k_exp = repeat_kv_heads(k_data_raw, seq_len, num_kv_heads, num_heads, head_dim);
+        let v_exp = repeat_kv_heads(v_data_raw, seq_len, num_kv_heads, num_heads, head_dim);
         (k_exp, v_exp)
     } else {
-        (k_proc.tensor.as_f32().to_vec(), v.tensor.as_f32().to_vec())
+        (k_data_raw.to_vec(), v_data_raw.to_vec())
     };
 
-    let q_data = q_proc.tensor.as_f32();
     let total_dim = num_heads * head_dim;
 
     // Compute attention scale
@@ -182,9 +187,9 @@ fn multi_head_attention(
         let v_head = extract_head(&v_expanded_data, seq_len, total_dim, h, head_dim);
 
         // Step d: scores = Q @ K^T: [seq_len, head_dim] x [head_dim, seq_len] -> [seq_len, seq_len]
-        let q_dev = DeviceTensor::new(q_head);
-        let k_dev = DeviceTensor::new(k_head);
-        let v_dev = DeviceTensor::new(v_head);
+        let q_dev = backend.upload(&q_head);
+        let k_dev = backend.upload(&k_head);
+        let v_dev = backend.upload(&v_head);
 
         let scores = backend.matmul_transpose(&q_dev, &k_dev);
 
@@ -196,13 +201,7 @@ fn multi_head_attention(
             let cap = config.attn_logit_softcap;
             // scores = cap * tanh(scores / cap)
             let scaled_down = backend.scale(&scores, 1.0 / cap);
-            let tanh_data: Vec<f32> = scaled_down
-                .tensor
-                .as_f32()
-                .iter()
-                .map(|&x| x.tanh())
-                .collect();
-            let tanh_tensor = DeviceTensor::new(Tensor::new(scaled_down.shape().to_vec(), tanh_data));
+            let tanh_tensor = backend.tanh(&scaled_down);
             backend.scale(&tanh_tensor, cap)
         } else {
             scores
@@ -219,7 +218,8 @@ fn multi_head_attention(
             );
             let needs_masking = attention_mask.iter().any(|&m| m == 0.0);
             if needs_masking {
-                let mut scores_data = scores.tensor.as_f32().to_vec();
+                let scores_tensor = backend.download(&scores);
+                let mut scores_data = scores_tensor.as_f32().to_vec();
                 for i in 0..seq_len {
                     for j in 0..seq_len {
                         if attention_mask[j] == 0.0 {
@@ -227,7 +227,7 @@ fn multi_head_attention(
                         }
                     }
                 }
-                DeviceTensor::new(Tensor::new(vec![seq_len, seq_len], scores_data))
+                backend.upload(&Tensor::new(vec![seq_len, seq_len], scores_data))
             } else {
                 scores
             }
@@ -245,12 +245,13 @@ fn multi_head_attention(
 
         // Step i: Weighted sum: output = probs @ V: [seq_len, seq_len] x [seq_len, head_dim] -> [seq_len, head_dim]
         let head_out = backend.matmul(&probs, &v_dev);
-        head_outputs.push(head_out.tensor.as_f32().to_vec());
+        let head_out_host = backend.download(&head_out);
+        head_outputs.push(head_out_host.as_f32().to_vec());
     }
 
     // Step j: Concatenate heads back to [seq_len, num_heads * head_dim]
     let result = assemble_heads(&head_outputs, seq_len, num_heads, head_dim);
-    DeviceTensor::new(result)
+    backend.upload(&result)
 }
 
 /// Single transformer layer forward pass.
@@ -422,6 +423,16 @@ fn ffn_forward(
             let activated = backend.swiglu(&gate, &up);
             linear_forward(&activated, &layer.ffn_down, layer.ffn_down_bias.as_ref(), backend)
         }
+        Activation::GeGLU => {
+            let gate_weight = layer
+                .ffn_gate
+                .as_ref()
+                .expect("GeGLU activation requires ffn_gate weight");
+            let gate = linear_forward(input, gate_weight, None, backend);
+            let up = linear_forward(input, &layer.ffn_up, layer.ffn_up_bias.as_ref(), backend);
+            let activated = backend.geglu(&gate, &up);
+            linear_forward(&activated, &layer.ffn_down, layer.ffn_down_bias.as_ref(), backend)
+        }
         Activation::GELU => {
             let up = linear_forward(input, &layer.ffn_up, layer.ffn_up_bias.as_ref(), backend);
             let activated = backend.gelu(&up);
@@ -548,10 +559,10 @@ fn multi_head_attention_cached(
         (q, k_new)
     };
 
-    // Step b: Append K_new (post-RoPE) and V_new to cache
-    let k_new_data = k_proc.tensor.as_f32();
-    let v_new_data = v_new.tensor.as_f32();
-    cache.append(layer_idx, k_new_data, v_new_data, n_new)?;
+    // Step b: Download K_new and V_new, append to cache
+    let k_host = backend.download(&k_proc);
+    let v_host = backend.download(&v_new);
+    cache.append(layer_idx, k_host.as_f32(), v_host.as_f32(), n_new)?;
 
     // Step c: Read full cached K/V
     let total_len = pos_offset + n_new;
@@ -567,7 +578,8 @@ fn multi_head_attention_cached(
         (k_full_data.to_vec(), v_full_data.to_vec())
     };
 
-    let q_data = q_proc.tensor.as_f32();
+    let q_host = backend.download(&q_proc);
+    let q_data = q_host.as_f32();
     let total_dim = num_heads * head_dim;
 
     let attn_scale = config.attn_scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
@@ -581,9 +593,9 @@ fn multi_head_attention_cached(
         let k_head = extract_head(&k_expanded, total_len, total_dim, h, head_dim);
         let v_head = extract_head(&v_expanded, total_len, total_dim, h, head_dim);
 
-        let q_dev = DeviceTensor::new(q_head);
-        let k_dev = DeviceTensor::new(k_head);
-        let v_dev = DeviceTensor::new(v_head);
+        let q_dev = backend.upload(&q_head);
+        let k_dev = backend.upload(&k_head);
+        let v_dev = backend.upload(&v_head);
 
         // scores = Q @ K^T: [n_new, head_dim] x [head_dim, total_len] -> [n_new, total_len]
         let scores = backend.matmul_transpose(&q_dev, &k_dev);
@@ -593,13 +605,7 @@ fn multi_head_attention_cached(
         let scores = if config.attn_logit_softcap > 0.0 {
             let cap = config.attn_logit_softcap;
             let scaled_down = backend.scale(&scores, 1.0 / cap);
-            let tanh_data: Vec<f32> = scaled_down
-                .tensor
-                .as_f32()
-                .iter()
-                .map(|&x| x.tanh())
-                .collect();
-            let tanh_tensor = DeviceTensor::new(Tensor::new(scaled_down.shape().to_vec(), tanh_data));
+            let tanh_tensor = backend.tanh(&scaled_down);
             backend.scale(&tanh_tensor, cap)
         } else {
             scores
@@ -611,7 +617,8 @@ fn multi_head_attention_cached(
             // Build causal mask for prefill: scores shape is [n_new, total_len]
             // Query position i (absolute: pos_offset + i) can attend to
             // key position j if j <= pos_offset + i
-            let mut scores_data = scores.tensor.as_f32().to_vec();
+            let scores_tensor = backend.download(&scores);
+            let mut scores_data = scores_tensor.as_f32().to_vec();
             for i in 0..n_new {
                 let abs_pos = pos_offset + i;
                 for j in 0..total_len {
@@ -620,7 +627,7 @@ fn multi_head_attention_cached(
                     }
                 }
             }
-            DeviceTensor::new(Tensor::new(vec![n_new, total_len], scores_data))
+            backend.upload(&Tensor::new(vec![n_new, total_len], scores_data))
         } else {
             scores
         };
@@ -630,11 +637,12 @@ fn multi_head_attention_cached(
 
         // Weighted sum: [n_new, total_len] x [total_len, head_dim] -> [n_new, head_dim]
         let head_out = backend.matmul(&probs, &v_dev);
-        head_outputs.push(head_out.tensor.as_f32().to_vec());
+        let head_out_host = backend.download(&head_out);
+        head_outputs.push(head_out_host.as_f32().to_vec());
     }
 
     let result = assemble_heads(&head_outputs, n_new, num_heads, head_dim);
-    Ok(DeviceTensor::new(result))
+    Ok(backend.upload(&result))
 }
 
 /// Cached transformer layer forward pass for autoregressive generation.
@@ -944,7 +952,7 @@ mod tests {
         let weight = identity_weight(4);
         let result = linear_forward(&input, &weight, None, &b);
         assert_eq!(result.shape(), &[2, 4]);
-        let data = result.tensor.as_f32();
+        let data = result.as_tensor().as_f32();
         assert!((data[0] - 1.0).abs() < 1e-5);
         assert!((data[7] - 8.0).abs() < 1e-5);
     }
@@ -956,7 +964,7 @@ mod tests {
         let weight = identity_weight(4);
         let bias = dt(Tensor::new(vec![4], vec![10.0, 20.0, 30.0, 40.0]));
         let result = linear_forward(&input, &weight, Some(&bias), &b);
-        let data = result.tensor.as_f32();
+        let data = result.as_tensor().as_f32();
         assert!((data[0] - 11.0).abs() < 1e-5);
         assert!((data[1] - 20.0).abs() < 1e-5);
         assert!((data[2] - 30.0).abs() < 1e-5);
@@ -977,7 +985,7 @@ mod tests {
         let weight = dt(Tensor::from_quantized(vec![1, 32], TensorDtype::Q8_0, raw));
         let result = linear_forward(&input, &weight, None, &b);
         assert_eq!(result.shape(), &[1, 1]);
-        let val = result.tensor.as_f32()[0];
+        let val = result.as_tensor().as_f32()[0];
         assert!((val - 32.0).abs() < 0.5, "Q8_0 linear_forward: got {}", val);
     }
 
@@ -1060,7 +1068,7 @@ mod tests {
         assert_eq!(output.shape(), &[seq_len, hidden_size]);
 
         // Verify all values are finite
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "Output contains non-finite value: {}", v);
         }
     }
@@ -1083,7 +1091,7 @@ mod tests {
         let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
         assert_eq!(output.shape(), &[seq_len, hidden_size]);
 
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "Output contains non-finite value: {}", v);
         }
     }
@@ -1114,7 +1122,7 @@ mod tests {
         // the same as the normalized input (which then gets added to the original input).
         // The output should be finite and reasonably close to the input
         // (since FFN contributes zero, so output = residual1 + 0 = input + attn_projection(attn_output))
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "Non-finite value in output");
         }
     }
@@ -1135,11 +1143,11 @@ mod tests {
         let (q_rot5, k_rot5) = b.rope(&q, &k, 5, 10000.0, head_dim, head_dim);
 
         // At position 0, cos(0)=1, sin(0)=0, so rotation is identity
-        let q0 = q_rot0.tensor.as_f32();
+        let q0 = q_rot0.as_tensor().as_f32();
         assert!((q0[0] - 1.0).abs() < 1e-5, "RoPE at pos 0 should be identity for Q");
 
         // At position 5, the rotation should be different
-        let q5 = q_rot5.tensor.as_f32();
+        let q5 = q_rot5.as_tensor().as_f32();
         let mut any_different = false;
         for i in 0..head_dim {
             if (q0[i] - q5[i]).abs() > 1e-6 {
@@ -1150,8 +1158,8 @@ mod tests {
         assert!(any_different, "RoPE at different positions should produce different Q vectors");
 
         // Also verify K is rotated differently
-        let k0 = k_rot0.tensor.as_f32();
-        let k5 = k_rot5.tensor.as_f32();
+        let k0 = k_rot0.as_tensor().as_f32();
+        let k5 = k_rot5.as_tensor().as_f32();
         let mut k_different = false;
         for i in 0..head_dim {
             if (k0[i] - k5[i]).abs() > 1e-6 {
@@ -1186,8 +1194,8 @@ mod tests {
         let output_rope = transformer_layer_forward(&input, &layer, &config_rope, &b, 0, &mask);
         let output_no_rope = transformer_layer_forward(&input, &layer, &config_no_rope, &b, 0, &mask);
 
-        let data_r = output_rope.tensor.as_f32();
-        let data_nr = output_no_rope.tensor.as_f32();
+        let data_r = output_rope.as_tensor().as_f32();
+        let data_nr = output_no_rope.as_tensor().as_f32();
 
         let mut any_different = false;
         for i in 0..data_r.len() {
@@ -1225,8 +1233,8 @@ mod tests {
         let output_bidir = transformer_layer_forward(&input, &layer, &config_bidir, &b, 0, &mask);
 
         // Outputs should differ because causal mask restricts attention
-        let data_c = output_causal.tensor.as_f32();
-        let data_b = output_bidir.tensor.as_f32();
+        let data_c = output_causal.as_tensor().as_f32();
+        let data_b = output_bidir.as_tensor().as_f32();
 
         let mut any_different = false;
         for i in 0..data_c.len() {
@@ -1259,7 +1267,7 @@ mod tests {
 
         let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
         assert_eq!(output.shape(), &[1, hidden_size]);
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "GELU FFN path produced non-finite value");
         }
     }
@@ -1286,7 +1294,7 @@ mod tests {
 
         let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
         assert_eq!(output.shape(), &[1, hidden_size]);
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "SwiGLU FFN path produced non-finite value");
         }
     }
@@ -1336,7 +1344,7 @@ mod tests {
 
         let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
         assert_eq!(output.shape(), &[seq_len, hidden_size]);
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "GQA forward pass produced non-finite value: {}", v);
         }
     }
@@ -1372,7 +1380,7 @@ mod tests {
 
         let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
         assert_eq!(output.shape(), &[3, hidden_size]);
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "model_forward produced non-finite value");
         }
     }
@@ -1407,7 +1415,7 @@ mod tests {
 
         let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
         assert_eq!(output.shape(), &[4, hidden_size]);
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "BERT model_forward produced non-finite value");
         }
     }
@@ -1449,7 +1457,7 @@ mod tests {
         assert_eq!(output.shape(), &[1, hidden_size]);
         // With scale=2.0, the embedding is doubled before going through the layers.
         // Just verify the output is finite and the function runs without error.
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "Scaled embedding model_forward produced non-finite value");
         }
     }
@@ -1487,7 +1495,7 @@ mod tests {
 
         let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
         assert_eq!(output.shape(), &[2, hidden_size]);
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "Multi-layer model_forward produced non-finite value");
         }
     }
@@ -1519,7 +1527,7 @@ mod tests {
 
         let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
         assert_eq!(output.shape(), &[1, hidden_size]);
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "Single token model_forward produced non-finite value");
         }
     }
@@ -1550,8 +1558,8 @@ mod tests {
         let output_with_cap = transformer_layer_forward(&input, &layer, &config_with_cap, &b, 0, &mask);
 
         // Softcap should change outputs (unless scores are very small)
-        let data_no = output_no_cap.tensor.as_f32();
-        let data_cap = output_with_cap.tensor.as_f32();
+        let data_no = output_no_cap.as_tensor().as_f32();
+        let data_cap = output_with_cap.as_tensor().as_f32();
         let mut any_diff = false;
         for i in 0..data_no.len() {
             if (data_no[i] - data_cap[i]).abs() > 1e-6 {
@@ -1609,7 +1617,7 @@ mod tests {
         let mask = vec![1.0f32; seq_len];
 
         let output = multi_head_attention(q, k, v, &config, &b, 0, &mask);
-        let data = output.tensor.as_f32();
+        let data = output.as_tensor().as_f32();
 
         // All outputs should be close to val
         for &v_out in data {
@@ -1658,8 +1666,8 @@ mod tests {
         let out_pad = multi_head_attention(q2, k2, v2, &config, &b, 0, &mask_pad);
 
         // The outputs should differ because the masked version excludes the padding token
-        let data_all = out_all.tensor.as_f32();
-        let data_pad = out_pad.tensor.as_f32();
+        let data_all = out_all.as_tensor().as_f32();
+        let data_pad = out_pad.as_tensor().as_f32();
         let mut any_diff = false;
         for i in 0..data_all.len() {
             if (data_all[i] - data_pad[i]).abs() > 1e-4 {
@@ -1738,7 +1746,7 @@ mod tests {
         assert_eq!(output.shape(), &[3, hidden_size]);
         assert_eq!(cache.len(), 3);
 
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "model_forward_step produced non-finite value");
         }
     }
@@ -1776,7 +1784,7 @@ mod tests {
         assert_eq!(output.shape(), &[1, hidden_size]);
         assert_eq!(cache.len(), 4);
 
-        for &v in output.tensor.as_f32() {
+        for &v in output.as_tensor().as_f32() {
             assert!(v.is_finite(), "Single token decode produced non-finite value");
         }
     }
@@ -1815,8 +1823,8 @@ mod tests {
         let mut cache = KvCache::new(&config);
         let cached = model_forward_step(input_ids, &weights, &config, &b, &mut cache).unwrap();
 
-        let uncached_data = uncached.tensor.as_f32();
-        let cached_data = cached.tensor.as_f32();
+        let uncached_data = uncached.as_tensor().as_f32();
+        let cached_data = cached.as_tensor().as_f32();
         assert_eq!(uncached_data.len(), cached_data.len());
         for i in 0..uncached_data.len() {
             assert!(
@@ -1866,7 +1874,7 @@ mod tests {
         assert_eq!(out2.shape(), &[1, hidden_size]);
         assert_eq!(cache.len(), 3);
 
-        for &v in out2.tensor.as_f32() {
+        for &v in out2.as_tensor().as_f32() {
             assert!(v.is_finite());
         }
     }
@@ -1934,7 +1942,7 @@ mod tests {
         assert_eq!(out2.shape(), &[1, hidden_size]);
         assert_eq!(cache.len(), 3);
 
-        for &v in out2.tensor.as_f32() {
+        for &v in out2.as_tensor().as_f32() {
             assert!(v.is_finite(), "GQA cached forward pass produced non-finite value: {}", v);
         }
     }

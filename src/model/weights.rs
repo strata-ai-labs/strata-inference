@@ -1299,7 +1299,7 @@ mod tests {
 
         assert_eq!(dt.dtype(), TensorDtype::F32);
         assert_eq!(dt.shape(), &[4]);
-        assert_eq!(dt.tensor.as_f32(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(dt.as_tensor().as_f32(), &[1.0, 2.0, 3.0, 4.0]);
 
         std::fs::remove_file(&path).ok();
     }

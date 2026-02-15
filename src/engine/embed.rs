@@ -126,7 +126,8 @@ impl EmbeddingEngine {
         // 6. L2 normalize
         let normalized = self.backend.l2_normalize(&pooled);
 
-        let f32_result = normalized.tensor.to_f32();
+        let f32_tensor = self.backend.download(&normalized);
+        let f32_result = f32_tensor.to_f32();
         Ok(f32_result.as_f32().to_vec())
     }
 
@@ -171,20 +172,20 @@ impl EmbeddingEngine {
             }
             PoolingType::Cls => {
                 // Extract row 0 (CLS token position).
-                // Use to_f32() to handle any dtype (F16, quantized, etc.)
-                let f32_tensor = hidden.tensor.to_f32();
+                let host = self.backend.download(hidden);
+                let f32_tensor = host.to_f32();
                 let data = f32_tensor.as_f32();
                 let cls_data = data[..hidden_size].to_vec();
-                DeviceTensor::new(Tensor::new(vec![hidden_size], cls_data))
+                self.backend.upload(&Tensor::new(vec![hidden_size], cls_data))
             }
             PoolingType::Last => {
                 // Extract last row.
-                // Use to_f32() to handle any dtype (F16, quantized, etc.)
-                let f32_tensor = hidden.tensor.to_f32();
+                let host = self.backend.download(hidden);
+                let f32_tensor = host.to_f32();
                 let data = f32_tensor.as_f32();
                 let start = (seq_len - 1) * hidden_size;
                 let last_data = data[start..start + hidden_size].to_vec();
-                DeviceTensor::new(Tensor::new(vec![hidden_size], last_data))
+                self.backend.upload(&Tensor::new(vec![hidden_size], last_data))
             }
         }
     }
@@ -486,7 +487,7 @@ mod tests {
         let cls_engine = build_engine(cls_config);
 
         let pooled = cls_engine.pool(&hidden, &mask);
-        assert_eq!(pooled.tensor.as_f32(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(pooled.as_tensor().as_f32(), &[1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
@@ -506,7 +507,7 @@ mod tests {
         let last_engine = build_engine(last_config);
 
         let pooled = last_engine.pool(&hidden, &mask);
-        assert_eq!(pooled.tensor.as_f32(), &[9.0, 10.0, 11.0, 12.0]);
+        assert_eq!(pooled.as_tensor().as_f32(), &[9.0, 10.0, 11.0, 12.0]);
     }
 
     #[test]
@@ -538,7 +539,7 @@ mod tests {
         let hidden = dt(Tensor::new(vec![0, 4], vec![]));
         let mask: Vec<f32> = vec![];
         let pooled = engine.pool(&hidden, &mask);
-        assert_eq!(pooled.tensor.as_f32(), &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(pooled.as_tensor().as_f32(), &[0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -555,7 +556,7 @@ mod tests {
         ));
         let mask = vec![1.0, 1.0];
         let pooled = engine.pool(&hidden, &mask);
-        let data = pooled.tensor.as_f32();
+        let data = pooled.as_tensor().as_f32();
         // Mean of [2,4,6,8] and [4,6,8,10] = [3,5,7,9]
         assert!((data[0] - 3.0).abs() < 1e-5);
         assert!((data[1] - 5.0).abs() < 1e-5);
