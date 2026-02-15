@@ -1,0 +1,21 @@
+[package]
+name = "strata-inference"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust inference engine for transformer models"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"
+half = { version = "2", features = ["std"] }
+memmap2 = "0.9"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+
+[features]
+default = []
+metal = []
+cuda = []
