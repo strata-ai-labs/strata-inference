@@ -7,3 +7,5 @@ pub mod model;
 pub mod engine;
 
 pub use error::InferenceError;
+pub use engine::EmbeddingEngine;
+pub use tokenizer::create_tokenizer_from_gguf;
