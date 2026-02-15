@@ -367,6 +367,7 @@ mod tests {
             layers: vec![layer],
             output_norm_w: ones_weight(h),
             output_norm_b: None,
+            output_projection: None,
         }
     }
 

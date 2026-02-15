@@ -8,6 +8,8 @@
 pub mod config;
 pub mod weights;
 pub mod layer;
+pub mod cache;
 
 pub use config::{ModelConfig, ModelArch, NormType, Activation, PositionType, PoolingType};
 pub use weights::{ModelWeights, LayerWeights};
+pub use cache::KvCache;

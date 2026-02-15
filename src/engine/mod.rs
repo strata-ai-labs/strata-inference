@@ -1,11 +1,14 @@
 //! High-level inference APIs.
 //!
 //! - [`EmbeddingEngine`]: text → dense vector embedding (M5)
-//! - Generation engine: prompt → text (M6, future)
+//! - [`GenerationEngine`]: prompt → text via autoregressive decoding (M6)
 
 pub mod embed;
+pub mod generate;
+pub mod sampler;
 
 pub use embed::EmbeddingEngine;
+pub use generate::GenerationEngine;
 
 #[cfg(test)]
 mod tests {
@@ -59,30 +62,42 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // M6: GenerationEngine (stretch goal)
+    // M6: GenerationEngine integration tests
+    //
+    // These require a real causal GGUF model file (e.g., Gemma, LLaMA).
+    // Unit tests for GenerationEngine are in generate.rs.
     // ------------------------------------------------------------------
 
     #[test]
     #[ignore]
     fn test_generation_engine_greedy_decode() {
-        todo!("Implement greedy generation (M6)");
+        // End-to-end: load real GGUF, generate with greedy decoding,
+        // verify output is deterministic and coherent.
+        //
+        //   let engine = GenerationEngine::from_gguf("model.gguf", backend).unwrap();
+        //   let result = engine.generate("Once upon a time", &gen_config).unwrap();
+        //   assert!(!result.is_empty());
+        todo!("Requires real causal GGUF model file");
     }
 
     #[test]
     #[ignore]
     fn test_generation_engine_max_tokens() {
-        todo!("Implement max_tokens limit (M6)");
+        // Verify max_tokens limit is respected with real model.
+        todo!("Requires real causal GGUF model file");
     }
 
     #[test]
     #[ignore]
     fn test_generation_engine_stop_at_eos() {
-        todo!("Implement EOS stopping (M6)");
+        // Verify EOS stopping with real model.
+        todo!("Requires real causal GGUF model file");
     }
 
     #[test]
     #[ignore]
-    fn test_generation_engine_kv_cache() {
-        todo!("Implement KV cache test (M6)");
+    fn test_generation_engine_kv_cache_consistency() {
+        // Verify KV cache produces same results as full recomputation.
+        todo!("Requires real causal GGUF model file");
     }
 }

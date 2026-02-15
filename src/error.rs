@@ -47,4 +47,7 @@ pub enum InferenceError {
 
     #[error("Model error: {0}")]
     Model(String),
+
+    #[error("Generation error: {0}")]
+    Generation(String),
 }
