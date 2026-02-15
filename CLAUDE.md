@@ -6,7 +6,7 @@ strata-inference is a **pure Rust inference engine** for transformer models. It 
 
 This is part of the [Strata](https://github.com/strata-ai-labs) project. The primary consumer is `strata-core`'s intelligence crate, which currently uses a hardcoded MiniLM-L6-v2 BERT model. strata-inference replaces that with a general-purpose engine supporting any GGUF model.
 
-**Target model:** EmbeddingGemma-300M-Q8_0 (308M params, 24 layers, 768-dim, Gemma3 architecture, SentencePiece BPE, RoPE, RMSNorm, SwiGLU)
+**Supported model families:** Gemma3, Gemma2, LLaMA, BERT — with expansion targets for Mistral, Phi, and Qwen. Reference model for validation: EmbeddingGemma-300M-Q8_0 (Gemma3 architecture).
 
 ## Guiding Principles
 
@@ -14,6 +14,7 @@ This is part of the [Strata](https://github.com/strata-ai-labs) project. The pri
 2. **Correctness first** — Validate every operation against HuggingFace reference outputs. Cosine similarity > 0.99 for embeddings.
 3. **Fused quantized operations** — Never dequantize full weight matrices to f32. Dequantization happens inside GPU matmul kernels (fused dequant+dot product).
 4. **Architecture-driven** — Model architecture is determined entirely from GGUF metadata at runtime. No hardcoded dimensions, layer counts, or vocab sizes.
+5. **llama.cpp parity** — Match llama.cpp's architecture coverage and correctness for all supported GGUF models.
 
 ## Repository Structure
 
@@ -100,9 +101,9 @@ struct BlockQ8_0 {     // 34 bytes per block of 32 values
 ### Architecture Metadata Keys
 ```
 general.architecture         → "gemma3", "llama", "bert"
-{arch}.embedding_length      → hidden size (768 for Gemma-300M)
-{arch}.block_count           → num layers (24 for Gemma-300M)
-{arch}.attention.head_count  → num heads (16 for Gemma-300M)
+{arch}.embedding_length      → hidden size (768 for Gemma-300M, 4096 for LLaMA-7B, 384 for MiniLM)
+{arch}.block_count           → num layers (24 for Gemma-300M, 32 for LLaMA-7B, 6 for MiniLM)
+{arch}.attention.head_count  → num heads (16 for Gemma-300M, 32 for LLaMA-7B, 12 for MiniLM)
 {arch}.attention.head_count_kv → KV heads (for GQA)
 {arch}.feed_forward_length   → FFN hidden dim
 {arch}.attention.layer_norm_rms_epsilon → RMSNorm ε
@@ -128,15 +129,16 @@ blk.{i}.ffn_down.weight        → down projection
 
 ## Architecture Differences Cheat Sheet
 
-| Feature | BERT | Gemma/LLaMA |
-|---|---|---|
-| Attention | Bidirectional | Causal |
-| Normalization | LayerNorm (w + b) | RMSNorm (w only) |
-| Activation | GELU | SwiGLU (gate × silu(up)) |
-| Position encoding | Learned embeddings | RoPE (rotary) |
-| FFN gate tensor | No (`ffn_gate` absent) | Yes (`ffn_gate.weight`) |
-| Norm bias | Yes | No |
-| Pooling | Mean or CLS | Mean (for embedding) |
+| Feature | BERT | Gemma/LLaMA | Mistral (future) |
+|---|---|---|---|
+| Attention | Bidirectional | Causal | Causal + sliding window |
+| Normalization | LayerNorm (w + b) | RMSNorm (w only) | RMSNorm (w only) |
+| Norm ordering | Post-norm (norm-after) | Pre-norm (norm-before) | Pre-norm |
+| Activation | GELU | SwiGLU (gate × silu(up)) | SwiGLU |
+| Position encoding | Learned embeddings | RoPE (rotary) | RoPE |
+| FFN gate tensor | No (`ffn_gate` absent) | Yes (`ffn_gate.weight`) | Yes |
+| Norm bias | Yes | No | No |
+| Pooling | Mean or CLS | Mean (for embedding) | N/A |
 
 ## Code Conventions
 
@@ -200,3 +202,12 @@ M1 and M3 can progress in parallel. M2 depends on M1 (reads vocab from GGUF). M4
 6. **GQA (Grouped Query Attention):** When `head_count_kv < head_count`, K and V are shared across groups. Repeat K/V heads before computing attention scores.
 7. **Metal kernel threadgroup sizes matter.** Q8_0 uses N_R0=2, N_SG=4 (128 threads). Getting this wrong causes incorrect results, not just slowness.
 8. **Mean pooling must exclude padding tokens.** Multiply hidden states by attention mask before averaging, then divide by the sum of the mask (not sequence length).
+
+## Known Gaps for General-Purpose Support
+
+1. **K-quant formats (Q2K-Q6K)** — Not yet implemented for dequantization. Only Q8_0, Q4_0, F32, and F16 are supported.
+2. **IQ variants** — Importance-quantized formats not yet implemented.
+3. **Q4_0 quantized_matmul** — Fused dequant+dot implemented for CPU only; GPU kernels still needed.
+4. **Tokenizer factory** — `from_gguf()` factory for auto-detecting tokenizer type from GGUF metadata not yet wired up.
+5. **Sliding window attention** — Required for Mistral; not yet implemented.
+6. **Tied embeddings** — Some models share `token_embd.weight` as output projection; not yet handled.

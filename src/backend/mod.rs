@@ -51,9 +51,9 @@ pub trait ComputeBackend: Send + Sync {
     /// Matrix multiply with transposed B: [M, K] x [N, K]^T -> [M, N]
     fn matmul_transpose(&self, a: &DeviceTensor, b: &DeviceTensor) -> DeviceTensor;
 
-    /// Quantized matmul: Q8_0 weights x f32 input -> f32 output.
+    /// Quantized matmul: quantized weights x f32 input -> f32 output.
     ///
-    /// Weights [N, K] in Q8_0 format, input [M, K] in f32.
+    /// Weights [N, K] in Q8_0 or Q4_0 format, input [M, K] in f32.
     /// Produces output [M, N] in f32.
     /// Dequantizes on-the-fly during the dot product (fused dequant).
     fn quantized_matmul(&self, weights: &DeviceTensor, input: &DeviceTensor) -> DeviceTensor;
@@ -97,6 +97,8 @@ pub trait ComputeBackend: Send + Sync {
     /// Apply Rotary Position Embeddings (RoPE) to Q and K tensors.
     ///
     /// q, k: [seq_len, n_heads * head_dim]
+    /// `rope_dim` specifies how many dimensions per head to rotate (the rest pass through).
+    /// When `rope_dim == head_dim`, all dimensions are rotated (the common case).
     /// Returns (q_rotated, k_rotated) with the same shapes.
     fn rope(
         &self,
@@ -105,6 +107,7 @@ pub trait ComputeBackend: Send + Sync {
         pos_offset: usize,
         freq_base: f32,
         head_dim: usize,
+        rope_dim: usize,
     ) -> (DeviceTensor, DeviceTensor);
 
     /// Mean pooling with attention mask.
