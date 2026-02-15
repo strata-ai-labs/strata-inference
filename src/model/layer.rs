@@ -19,7 +19,7 @@ use super::weights::{LayerWeights, ModelWeights};
 /// - For F32/F16: uses `backend.matmul_transpose(input, weight)` since weight is [out, in].
 ///
 /// If bias is provided, adds it to each row of the result.
-fn linear_forward(
+pub(crate) fn linear_forward(
     input: &DeviceTensor,
     weight: &DeviceTensor,
     bias: Option<&DeviceTensor>,
@@ -509,6 +509,275 @@ pub fn model_forward(
     );
 
     // Return hidden states [seq_len, hidden_size]
+    Ok(hidden)
+}
+
+// =========================================================================
+// Cached forward pass for autoregressive generation (M6)
+// =========================================================================
+
+use super::cache::KvCache;
+
+/// Multi-head attention with KV cache for autoregressive generation.
+///
+/// Only new tokens' Q/K/V are computed; previous K/V are read from cache.
+/// RoPE positions are offset by the cache length.
+fn multi_head_attention_cached(
+    q: DeviceTensor,
+    k_new: DeviceTensor,
+    v_new: DeviceTensor,
+    cache: &mut KvCache,
+    layer_idx: usize,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+) -> Result<DeviceTensor, InferenceError> {
+    let n_new = q.shape()[0];
+    let num_heads = config.num_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let pos_offset = cache.len();
+
+    trace!(n_new, pos_offset, layer_idx, "multi_head_attention_cached");
+
+    // Step a: Apply RoPE to Q and K_new with pos_offset
+    let (q_proc, k_proc) = if config.position_type == PositionType::RoPE {
+        backend.rope(
+            &q, &k_new, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
+        )
+    } else {
+        (q, k_new)
+    };
+
+    // Step b: Append K_new (post-RoPE) and V_new to cache
+    let k_new_data = k_proc.tensor.as_f32();
+    let v_new_data = v_new.tensor.as_f32();
+    cache.append(layer_idx, k_new_data, v_new_data, n_new)?;
+
+    // Step c: Read full cached K/V
+    let total_len = pos_offset + n_new;
+    let k_full_data = cache.get_k(layer_idx);
+    let v_full_data = cache.get_v(layer_idx);
+
+    // Step d: Expand K/V for GQA if needed
+    let (k_expanded, v_expanded) = if num_kv_heads < num_heads {
+        let k_exp = repeat_kv_heads(k_full_data, total_len, num_kv_heads, num_heads, head_dim);
+        let v_exp = repeat_kv_heads(v_full_data, total_len, num_kv_heads, num_heads, head_dim);
+        (k_exp, v_exp)
+    } else {
+        (k_full_data.to_vec(), v_full_data.to_vec())
+    };
+
+    let q_data = q_proc.tensor.as_f32();
+    let total_dim = num_heads * head_dim;
+
+    let attn_scale = config.attn_scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
+
+    // Per-head attention
+    let mut head_outputs: Vec<Vec<f32>> = Vec::with_capacity(num_heads);
+
+    for h in 0..num_heads {
+        // Q: [n_new, head_dim], K: [total_len, head_dim], V: [total_len, head_dim]
+        let q_head = extract_head(q_data, n_new, total_dim, h, head_dim);
+        let k_head = extract_head(&k_expanded, total_len, total_dim, h, head_dim);
+        let v_head = extract_head(&v_expanded, total_len, total_dim, h, head_dim);
+
+        let q_dev = DeviceTensor::new(q_head);
+        let k_dev = DeviceTensor::new(k_head);
+        let v_dev = DeviceTensor::new(v_head);
+
+        // scores = Q @ K^T: [n_new, head_dim] x [head_dim, total_len] -> [n_new, total_len]
+        let scores = backend.matmul_transpose(&q_dev, &k_dev);
+        let scores = backend.scale(&scores, attn_scale);
+
+        // Softcap
+        let scores = if config.attn_logit_softcap > 0.0 {
+            let cap = config.attn_logit_softcap;
+            let scaled_down = backend.scale(&scores, 1.0 / cap);
+            let tanh_data: Vec<f32> = scaled_down
+                .tensor
+                .as_f32()
+                .iter()
+                .map(|&x| x.tanh())
+                .collect();
+            let tanh_tensor = DeviceTensor::new(Tensor::new(scaled_down.shape().to_vec(), tanh_data));
+            backend.scale(&tanh_tensor, cap)
+        } else {
+            scores
+        };
+
+        // Causal mask: needed during prefill (n_new > 1)
+        // For decode (n_new == 1), the single query naturally attends to all cached positions
+        let scores = if config.causal && n_new > 1 {
+            // Build causal mask for prefill: scores shape is [n_new, total_len]
+            // Query position i (absolute: pos_offset + i) can attend to
+            // key position j if j <= pos_offset + i
+            let mut scores_data = scores.tensor.as_f32().to_vec();
+            for i in 0..n_new {
+                let abs_pos = pos_offset + i;
+                for j in 0..total_len {
+                    if j > abs_pos {
+                        scores_data[i * total_len + j] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            DeviceTensor::new(Tensor::new(vec![n_new, total_len], scores_data))
+        } else {
+            scores
+        };
+
+        // Softmax
+        let probs = backend.softmax(&scores);
+
+        // Weighted sum: [n_new, total_len] x [total_len, head_dim] -> [n_new, head_dim]
+        let head_out = backend.matmul(&probs, &v_dev);
+        head_outputs.push(head_out.tensor.as_f32().to_vec());
+    }
+
+    let result = assemble_heads(&head_outputs, n_new, num_heads, head_dim);
+    Ok(DeviceTensor::new(result))
+}
+
+/// Cached transformer layer forward pass for autoregressive generation.
+///
+/// Same structure as `pre_norm_layer_forward()` but uses cached attention.
+/// Only supports pre-norm architectures (Gemma/LLaMA) since generation is
+/// only valid for causal models.
+fn transformer_layer_forward_cached(
+    input: &DeviceTensor,
+    layer: &LayerWeights,
+    layer_idx: usize,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+    cache: &mut KvCache,
+) -> Result<DeviceTensor, InferenceError> {
+    trace!(layer = layer_idx, "transformer_layer_forward_cached");
+
+    if config.pre_norm {
+        // Pre-norm path (Gemma/LLaMA)
+        let attn_norm_w = layer.attn_norm_w.as_ref()
+            .expect("pre_norm layer requires attn_norm_w");
+        let normed = normalize(input, attn_norm_w, layer.attn_norm_b.as_ref(), config, backend);
+
+        let q = linear_forward(&normed, &layer.attn_q, layer.attn_q_bias.as_ref(), backend);
+        let k = linear_forward(&normed, &layer.attn_k, layer.attn_k_bias.as_ref(), backend);
+        let v = linear_forward(&normed, &layer.attn_v, layer.attn_v_bias.as_ref(), backend);
+
+        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend)?;
+
+        let projected = linear_forward(
+            &attn_out, &layer.attn_output, layer.attn_output_bias.as_ref(), backend,
+        );
+        let residual = backend.add(input, &projected);
+
+        let ffn_norm_w = layer.ffn_norm_w.as_ref()
+            .expect("pre_norm layer requires ffn_norm_w");
+        let normed2 = normalize(&residual, ffn_norm_w, layer.ffn_norm_b.as_ref(), config, backend);
+        let ffn_out = ffn_forward(&normed2, layer, config, backend);
+
+        Ok(backend.add(&residual, &ffn_out))
+    } else {
+        // Post-norm path (BERT) — shouldn't be used for generation,
+        // but support it for completeness
+        let q = linear_forward(input, &layer.attn_q, layer.attn_q_bias.as_ref(), backend);
+        let k = linear_forward(input, &layer.attn_k, layer.attn_k_bias.as_ref(), backend);
+        let v = linear_forward(input, &layer.attn_v, layer.attn_v_bias.as_ref(), backend);
+
+        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend)?;
+
+        let projected = linear_forward(
+            &attn_out, &layer.attn_output, layer.attn_output_bias.as_ref(), backend,
+        );
+        let mut residual = backend.add(input, &projected);
+
+        if let Some(ref norm_w) = layer.attn_output_norm_w {
+            residual = normalize(&residual, norm_w, layer.attn_output_norm_b.as_ref(), config, backend);
+        }
+
+        let ffn_out = ffn_forward(&residual, layer, config, backend);
+        let mut output = backend.add(&residual, &ffn_out);
+
+        if let Some(ref norm_w) = layer.ffn_output_norm_w {
+            output = normalize(&output, norm_w, layer.ffn_output_norm_b.as_ref(), config, backend);
+        }
+
+        Ok(output)
+    }
+}
+
+/// Model forward pass with KV cache for autoregressive generation.
+///
+/// Same pipeline as `model_forward()` but:
+/// - Uses `cache.len()` as `pos_offset` for learned position embeddings
+/// - Calls `transformer_layer_forward_cached()` per layer
+/// - Calls `cache.advance(n_tokens)` after all layers
+/// - Returns `[n_tokens, hidden_size]`
+pub fn model_forward_step(
+    input_ids: &[u32],
+    weights: &ModelWeights,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+    cache: &mut KvCache,
+) -> Result<DeviceTensor, InferenceError> {
+    let n_tokens = input_ids.len();
+    let pos_offset = cache.len();
+    debug!(n_tokens, pos_offset, "model_forward_step");
+
+    // 1. Validate input_ids
+    for &id in input_ids {
+        if (id as usize) >= config.vocab_size {
+            return Err(InferenceError::Model(format!(
+                "input token ID {} exceeds vocab_size {}",
+                id, config.vocab_size
+            )));
+        }
+    }
+
+    // 2. Embedding lookup
+    let mut hidden = backend.embedding_lookup(&weights.token_embedding, input_ids);
+
+    // 3. Embedding scaling
+    if (config.embedding_scale - 1.0).abs() > f32::EPSILON {
+        hidden = backend.scale(&hidden, config.embedding_scale);
+    }
+
+    // 4. Add position embeddings (Learned, e.g., BERT)
+    if config.position_type == PositionType::Learned {
+        if let Some(ref pos_emb) = weights.position_embedding {
+            let pos_ids: Vec<u32> = (pos_offset..pos_offset + n_tokens)
+                .map(|p| p as u32)
+                .collect();
+            let pos_embeddings = backend.embedding_lookup(pos_emb, &pos_ids);
+            hidden = backend.add(&hidden, &pos_embeddings);
+        }
+    }
+
+    // 5. Embedding normalization (BERT only)
+    if let Some(ref norm_w) = weights.embedding_norm_w {
+        hidden = normalize(
+            &hidden, norm_w, weights.embedding_norm_b.as_ref(), config, backend,
+        );
+    }
+
+    // 6. Run through all transformer layers with cache
+    for (i, layer) in weights.layers.iter().enumerate() {
+        trace!(layer = i, "Running cached layer");
+        hidden = transformer_layer_forward_cached(
+            &hidden, layer, i, config, backend, cache,
+        )?;
+    }
+
+    // 7. Advance cache position after all layers processed
+    cache.advance(n_tokens);
+
+    // 8. Final output normalization
+    hidden = normalize(
+        &hidden,
+        &weights.output_norm_w,
+        weights.output_norm_b.as_ref(),
+        config,
+        backend,
+    );
+
     Ok(hidden)
 }
 
@@ -1095,6 +1364,7 @@ mod tests {
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
             output_norm_w: ones_weight(hidden_size),
             output_norm_b: None,
+            output_projection: None,
         };
 
         let input_ids = &[1u32, 3, 5];
@@ -1129,6 +1399,7 @@ mod tests {
             layers: vec![bert_layer_weights(hidden_size, ffn_hidden)],
             output_norm_w: ones_weight(hidden_size),
             output_norm_b: Some(zeros_bias(hidden_size)),
+            output_projection: None,
         };
 
         let input_ids = &[0u32, 2, 4, 6];
@@ -1168,6 +1439,7 @@ mod tests {
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
             output_norm_w: ones_weight(hidden_size),
             output_norm_b: None,
+            output_projection: None,
         };
 
         let input_ids = &[0u32];
@@ -1207,6 +1479,7 @@ mod tests {
             ],
             output_norm_w: ones_weight(hidden_size),
             output_norm_b: None,
+            output_projection: None,
         };
 
         let input_ids = &[1u32, 5];
@@ -1238,6 +1511,7 @@ mod tests {
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
             output_norm_w: ones_weight(hidden_size),
             output_norm_b: None,
+            output_projection: None,
         };
 
         let input_ids = &[3u32];
@@ -1415,6 +1689,7 @@ mod tests {
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
             output_norm_w: ones_weight(hidden_size),
             output_norm_b: None,
+            output_projection: None,
         };
 
         // Token ID 100 exceeds vocab_size=8 (note: config has vocab_size=16, override)
@@ -1427,5 +1702,240 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("exceeds vocab_size"), "Error: {}", err_msg);
+    }
+
+    // ====================================================================
+    // Cached forward pass tests (model_forward_step)
+    // ====================================================================
+
+    use crate::model::cache::KvCache;
+
+    #[test]
+    fn test_model_forward_step_output_shape() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+        let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let mut cache = KvCache::new(&config);
+        let input_ids = &[1u32, 3, 5];
+        let output = model_forward_step(input_ids, &weights, &config, &b, &mut cache).unwrap();
+        assert_eq!(output.shape(), &[3, hidden_size]);
+        assert_eq!(cache.len(), 3);
+
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "model_forward_step produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_model_forward_step_single_token_decode() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+        let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let mut cache = KvCache::new(&config);
+
+        // Prefill with 3 tokens
+        let _ = model_forward_step(&[1, 3, 5], &weights, &config, &b, &mut cache).unwrap();
+        assert_eq!(cache.len(), 3);
+
+        // Decode 1 token
+        let output = model_forward_step(&[7], &weights, &config, &b, &mut cache).unwrap();
+        assert_eq!(output.shape(), &[1, hidden_size]);
+        assert_eq!(cache.len(), 4);
+
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "Single token decode produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_cached_vs_uncached_prefill_match() {
+        // Full sequence through model_forward() should match
+        // the same sequence through model_forward_step() (prefill).
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+        let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let input_ids = &[1u32, 3, 5];
+        let attention_mask = &[1.0f32, 1.0, 1.0];
+
+        // Uncached
+        let uncached = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
+
+        // Cached (prefill)
+        let mut cache = KvCache::new(&config);
+        let cached = model_forward_step(input_ids, &weights, &config, &b, &mut cache).unwrap();
+
+        let uncached_data = uncached.tensor.as_f32();
+        let cached_data = cached.tensor.as_f32();
+        assert_eq!(uncached_data.len(), cached_data.len());
+        for i in 0..uncached_data.len() {
+            assert!(
+                (uncached_data[i] - cached_data[i]).abs() < 1e-4,
+                "Mismatch at index {}: uncached={} cached={}",
+                i, uncached_data[i], cached_data[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_model_forward_step_multiple_layers() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+
+        let mut config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        config.num_layers = 2;
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![
+                gemma_layer_weights(hidden_size, ffn_hidden),
+                gemma_layer_weights(hidden_size, ffn_hidden),
+            ],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let mut cache = KvCache::new(&config);
+
+        // Prefill
+        let out1 = model_forward_step(&[1, 3], &weights, &config, &b, &mut cache).unwrap();
+        assert_eq!(out1.shape(), &[2, hidden_size]);
+        assert_eq!(cache.len(), 2);
+
+        // Decode
+        let out2 = model_forward_step(&[5], &weights, &config, &b, &mut cache).unwrap();
+        assert_eq!(out2.shape(), &[1, hidden_size]);
+        assert_eq!(cache.len(), 3);
+
+        for &v in out2.tensor.as_f32() {
+            assert!(v.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_model_forward_step_gqa() {
+        // Test cached forward pass with GQA (num_kv_heads < num_heads)
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 2; // 4 heads * 2 dim = 8 = hidden_size
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+
+        let mut config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        config.num_kv_heads = num_kv_heads;
+
+        let kv_dim = num_kv_heads * head_dim; // 4
+        let layer = LayerWeights {
+            attn_norm_w: Some(ones_weight(hidden_size)),
+            attn_norm_b: None,
+            ffn_norm_w: Some(ones_weight(hidden_size)),
+            ffn_norm_b: None,
+            attn_output_norm_w: None,
+            attn_output_norm_b: None,
+            ffn_output_norm_w: None,
+            ffn_output_norm_b: None,
+            attn_q: identity_weight(hidden_size),
+            attn_k: zero_weight(kv_dim, hidden_size),
+            attn_v: zero_weight(kv_dim, hidden_size),
+            attn_output: identity_weight(hidden_size),
+            attn_q_bias: None,
+            attn_k_bias: None,
+            attn_v_bias: None,
+            attn_output_bias: None,
+            ffn_up: zero_weight(ffn_hidden, hidden_size),
+            ffn_down: zero_weight(hidden_size, ffn_hidden),
+            ffn_gate: Some(zero_weight(ffn_hidden, hidden_size)),
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+        };
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![layer],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let mut cache = KvCache::new(&config);
+
+        // Prefill with 2 tokens
+        let out1 = model_forward_step(&[1, 3], &weights, &config, &b, &mut cache).unwrap();
+        assert_eq!(out1.shape(), &[2, hidden_size]);
+        assert_eq!(cache.len(), 2);
+
+        // Decode 1 token
+        let out2 = model_forward_step(&[5], &weights, &config, &b, &mut cache).unwrap();
+        assert_eq!(out2.shape(), &[1, hidden_size]);
+        assert_eq!(cache.len(), 3);
+
+        for &v in out2.tensor.as_f32() {
+            assert!(v.is_finite(), "GQA cached forward pass produced non-finite value: {}", v);
+        }
     }
 }

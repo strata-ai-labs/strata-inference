@@ -67,6 +67,10 @@ pub struct ModelWeights {
     /// Final output normalization weight: [hidden_size]
     pub output_norm_w: DeviceTensor,
     pub output_norm_b: Option<DeviceTensor>,
+
+    /// Output projection (lm_head): [vocab_size, hidden_size]
+    /// When None, generation falls back to tied embeddings (token_embedding).
+    pub output_projection: Option<DeviceTensor>,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,8 +407,12 @@ impl ModelWeights {
             None
         };
 
+        // -- Output projection (lm_head) --
+        let output_projection = load_tensor_optional(gguf, "output.weight", backend)?;
+
         info!(
             num_layers = layers.len(),
+            has_output_projection = output_projection.is_some(),
             "Model weights loaded successfully"
         );
 
@@ -416,6 +424,7 @@ impl ModelWeights {
             layers,
             output_norm_w,
             output_norm_b,
+            output_projection,
         })
     }
 }
