@@ -9,6 +9,11 @@ pub mod wordpiece;
 pub use bpe::BpeTokenizer;
 pub use wordpiece::WordPieceTokenizer;
 
+use tracing::warn;
+
+use crate::error::InferenceError;
+use crate::gguf::{GgufFile, GgufValue};
+
 /// A tokenizer that converts text to token IDs and back.
 ///
 /// All implementations must be thread-safe (`Send + Sync`) for concurrent use
@@ -90,6 +95,109 @@ pub fn pad_sequences(
     }
 
     (padded, masks)
+}
+
+/// Create a tokenizer from GGUF vocabulary metadata.
+///
+/// Reads `tokenizer.ggml.model` to determine the tokenizer type:
+/// - `"llama"`, `"gpt2"`, or other non-`"bert"` values → [`BpeTokenizer`]
+/// - `"bert"` → [`WordPieceTokenizer`]
+///
+/// Requires the `tokenizer.ggml.tokens` string array to be present. Optional
+/// keys (`tokenizer.ggml.scores`, `tokenizer.ggml.merges`, etc.) are read when
+/// available and default to empty/absent otherwise.
+pub fn create_tokenizer_from_gguf(
+    gguf: &GgufFile,
+) -> Result<Box<dyn Tokenizer>, InferenceError> {
+    // Read the token list (required)
+    let tokens: Vec<String> = gguf
+        .get_str_array("tokenizer.ggml.tokens")
+        .ok_or_else(|| {
+            InferenceError::Tokenizer(
+                "missing required key: tokenizer.ggml.tokens".to_string(),
+            )
+        })?
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    if tokens.is_empty() {
+        return Err(InferenceError::Tokenizer(
+            "tokenizer.ggml.tokens is empty".to_string(),
+        ));
+    }
+
+    // Read tokenizer model type (default to "llama" i.e. BPE if absent)
+    let model_type = gguf.get_str("tokenizer.ggml.model").unwrap_or("llama");
+
+    match model_type {
+        "llama" | "gpt2" | "bert" => {}
+        other => {
+            warn!(
+                model_type = other,
+                "Unknown tokenizer model type, falling back to BPE"
+            );
+        }
+    }
+
+    // Read common special token IDs
+    let bos_id = gguf.get_u32("tokenizer.ggml.bos_token_id");
+    let eos_id = gguf.get_u32("tokenizer.ggml.eos_token_id");
+    let pad_id = gguf.get_u32("tokenizer.ggml.padding_token_id");
+
+    if model_type == "bert" {
+        // WordPiece path
+        let cls_id = find_token_id(&tokens, "[CLS]").unwrap_or(101);
+        let sep_id = find_token_id(&tokens, "[SEP]").unwrap_or(102);
+        let unk_id = find_token_id(&tokens, "[UNK]").unwrap_or(100);
+        let wp_pad_id = find_token_id(&tokens, "[PAD]").unwrap_or(pad_id.unwrap_or(0));
+
+        Ok(Box::new(WordPieceTokenizer::new(
+            tokens, cls_id, sep_id, unk_id, wp_pad_id,
+        )))
+    } else {
+        // BPE path (llama, gpt2, and all other model types)
+        let scores = gguf
+            .get_f32_array("tokenizer.ggml.scores")
+            .unwrap_or_default();
+
+        let token_types = match gguf.get("tokenizer.ggml.token_type") {
+            Some(GgufValue::Array(arr)) => arr
+                .iter()
+                .map(|v| match v {
+                    GgufValue::U32(n) => *n,
+                    GgufValue::I32(n) => *n as u32,
+                    _ => 0,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let merges: Vec<String> = gguf
+            .get_str_array("tokenizer.ggml.merges")
+            .map(|v| v.into_iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        let add_bos = gguf.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(true);
+        let add_eos = gguf.get_bool("tokenizer.ggml.add_eos_token").unwrap_or(false);
+
+        Ok(Box::new(BpeTokenizer::new(
+            tokens,
+            scores,
+            token_types,
+            merges,
+            bos_id,
+            eos_id,
+            pad_id,
+            add_bos,
+            add_eos,
+        )))
+    }
+}
+
+/// Find a token's ID by its string value.
+fn find_token_id(tokens: &[String], target: &str) -> Option<u32> {
+    tokens.iter().position(|t| t == target).map(|i| i as u32)
 }
 
 #[cfg(test)]
@@ -368,5 +476,207 @@ mod tests {
         // "unknown" is not in the mock vocab, falls back to id 0 ("<pad>")
         let ids = tok.encode("unknown", false);
         assert_eq!(ids, vec![0]);
+    }
+
+    // ====================================================================
+    // create_tokenizer_from_gguf tests with synthetic GGUF data
+    // ====================================================================
+
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use crate::gguf::GgufFile;
+
+    const GGUF_MAGIC: u32 = 0x4655_4747;
+
+    fn align_offset(offset: u64, alignment: u64) -> u64 {
+        let remainder = offset % alignment;
+        if remainder == 0 { offset } else { offset + (alignment - remainder) }
+    }
+
+    fn build_gguf_bytes(kv_pairs: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // n_tensors
+        buf.extend_from_slice(&(kv_pairs.len() as u64).to_le_bytes());
+        for &(key, value_bytes) in kv_pairs {
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(value_bytes);
+        }
+        let pos = buf.len();
+        let aligned = align_offset(pos as u64, 32) as usize;
+        buf.resize(aligned, 0);
+        buf
+    }
+
+    fn kv_string(val: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        buf.extend_from_slice(val.as_bytes());
+        buf
+    }
+
+    fn kv_u32(val: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&val.to_le_bytes());
+        buf
+    }
+
+    fn kv_bool(val: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&7u32.to_le_bytes());
+        buf.push(if val { 1 } else { 0 });
+        buf
+    }
+
+    fn kv_str_array(vals: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+        buf.extend_from_slice(&8u32.to_le_bytes()); // element type: String
+        buf.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+        for s in vals {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        buf
+    }
+
+    fn kv_f32_array(vals: &[f32]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+        buf.extend_from_slice(&6u32.to_le_bytes()); // element type: F32
+        buf.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+        for v in vals {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf
+    }
+
+    fn write_temp_gguf(bytes: &[u8]) -> NamedTempFile {
+        let mut file = NamedTempFile::new().expect("failed to create temp file");
+        file.write_all(bytes).expect("failed to write temp file");
+        file.flush().expect("failed to flush temp file");
+        file
+    }
+
+    fn open_gguf_from_kv(kv_pairs: &[(&str, Vec<u8>)]) -> (GgufFile, NamedTempFile) {
+        let refs: Vec<(&str, &[u8])> = kv_pairs
+            .iter()
+            .map(|(k, v)| (*k, v.as_slice()))
+            .collect();
+        let bytes = build_gguf_bytes(&refs);
+        let file = write_temp_gguf(&bytes);
+        let gguf = GgufFile::open(file.path()).expect("failed to open temp GGUF");
+        (gguf, file)
+    }
+
+    #[test]
+    fn test_create_tokenizer_from_gguf_bpe() {
+        let kv = vec![
+            ("tokenizer.ggml.model", kv_string("llama")),
+            ("tokenizer.ggml.tokens", kv_str_array(&[
+                "<pad>", "<bos>", "<eos>", "\u{2581}hello", "\u{2581}world",
+            ])),
+            ("tokenizer.ggml.scores", kv_f32_array(&[0.0, 0.0, 0.0, -1.0, -2.0])),
+            ("tokenizer.ggml.bos_token_id", kv_u32(1)),
+            ("tokenizer.ggml.eos_token_id", kv_u32(2)),
+            ("tokenizer.ggml.add_bos_token", kv_bool(true)),
+            ("tokenizer.ggml.add_eos_token", kv_bool(false)),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let tok = create_tokenizer_from_gguf(&gguf).unwrap();
+        assert_eq!(tok.vocab_size(), 5);
+        assert_eq!(tok.bos_token_id(), Some(1));
+        assert_eq!(tok.eos_token_id(), Some(2));
+    }
+
+    #[test]
+    fn test_create_tokenizer_from_gguf_wordpiece() {
+        let kv = vec![
+            ("tokenizer.ggml.model", kv_string("bert")),
+            ("tokenizer.ggml.tokens", kv_str_array(&[
+                "[PAD]", "[UNK]", "[CLS]", "[SEP]", "hello", "world",
+            ])),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let tok = create_tokenizer_from_gguf(&gguf).unwrap();
+        assert_eq!(tok.vocab_size(), 6);
+        // CLS=2, SEP=3 based on token positions in the vocab
+        assert_eq!(tok.bos_token_id(), Some(2)); // WordPiece returns CLS as BOS
+        assert_eq!(tok.eos_token_id(), Some(3)); // WordPiece returns SEP as EOS
+        assert_eq!(tok.pad_token_id(), Some(0));
+    }
+
+    #[test]
+    fn test_create_tokenizer_from_gguf_missing_tokens() {
+        let kv: Vec<(&str, Vec<u8>)> = vec![
+            ("tokenizer.ggml.model", kv_string("llama")),
+            // No tokenizer.ggml.tokens key
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let result = create_tokenizer_from_gguf(&gguf);
+        match result {
+            Err(InferenceError::Tokenizer(msg)) => {
+                assert!(msg.contains("tokenizer.ggml.tokens"), "Error: {}", msg);
+            }
+            Err(e) => panic!("expected Tokenizer error, got {:?}", e),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_create_tokenizer_from_gguf_empty_tokens() {
+        let kv = vec![
+            ("tokenizer.ggml.model", kv_string("llama")),
+            ("tokenizer.ggml.tokens", kv_str_array(&[])),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let result = create_tokenizer_from_gguf(&gguf);
+        match result {
+            Err(InferenceError::Tokenizer(msg)) => {
+                assert!(msg.contains("empty"), "Error: {}", msg);
+            }
+            Err(e) => panic!("expected Tokenizer error for empty tokens, got {:?}", e),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_create_tokenizer_from_gguf_defaults_to_bpe() {
+        // No tokenizer.ggml.model key → defaults to "llama" (BPE)
+        let kv = vec![
+            ("tokenizer.ggml.tokens", kv_str_array(&[
+                "<pad>", "<bos>", "<eos>", "a", "b",
+            ])),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let tok = create_tokenizer_from_gguf(&gguf).unwrap();
+        assert_eq!(tok.vocab_size(), 5);
+        // Default BPE with add_bos=true should add BOS
+        assert_eq!(tok.bos_token_id(), None); // No bos_token_id key in metadata
+    }
+
+    #[test]
+    fn test_create_tokenizer_from_gguf_bert_finds_special_tokens() {
+        // BERT tokens in non-standard positions
+        let kv = vec![
+            ("tokenizer.ggml.model", kv_string("bert")),
+            ("tokenizer.ggml.tokens", kv_str_array(&[
+                "a", "b", "[UNK]", "[PAD]", "[CLS]", "[SEP]", "hello",
+            ])),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let tok = create_tokenizer_from_gguf(&gguf).unwrap();
+        assert_eq!(tok.vocab_size(), 7);
+        assert_eq!(tok.pad_token_id(), Some(3)); // [PAD] is at position 3
     }
 }
