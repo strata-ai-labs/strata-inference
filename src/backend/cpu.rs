@@ -112,7 +112,7 @@ impl ComputeBackend for CpuBackend {
     }
 
     fn quantized_matmul(&self, weights: &DeviceTensor, input: &DeviceTensor) -> DeviceTensor {
-        // Weights: [N, K] in Q8_0 format
+        // Weights: [N, K] in Q8_0 or Q4_0 format
         // Input: [M, K] in F32
         // Output: [M, N] in F32
         // This is equivalent to input x weights^T but with fused dequantization.
@@ -122,11 +122,12 @@ impl ComputeBackend for CpuBackend {
 
         assert_eq!(input_shape.len(), 2, "quantized_matmul: input must be 2D");
         assert_eq!(weight_shape.len(), 2, "quantized_matmul: weights must be 2D");
-        assert_eq!(
-            weights.dtype(),
-            TensorDtype::Q8_0,
-            "quantized_matmul: weights must be Q8_0, got {:?}",
-            weights.dtype()
+
+        let dtype = weights.dtype();
+        assert!(
+            dtype == TensorDtype::Q8_0 || dtype == TensorDtype::Q4_0,
+            "quantized_matmul: weights must be Q8_0 or Q4_0, got {:?}",
+            dtype
         );
 
         let m = input_shape[0];
@@ -139,44 +140,93 @@ impl ComputeBackend for CpuBackend {
             k, weight_shape[1]
         );
 
-        trace!(m, k, n, "CPU quantized_matmul (Q8_0)");
-
         let raw = match weights.tensor.storage() {
             TensorStorage::Quantized(data) => data,
             _ => panic!("quantized_matmul: expected Quantized storage"),
         };
 
-        // Each row of weights has K elements, packed into K/32 Q8_0 blocks
-        // Each block = 34 bytes (2 bytes f16 scale + 32 bytes i8 values)
-        let blocks_per_row = (k + 31) / 32;
-        let bytes_per_row = blocks_per_row * 34;
-
         let mut result = vec![0.0f32; m * n];
 
-        for i in 0..m {
-            let input_row = &input_data[i * k..i * k + k];
-            for j in 0..n {
-                let row_start = j * bytes_per_row;
-                let mut sum = 0.0f32;
+        match dtype {
+            TensorDtype::Q8_0 => {
+                trace!(m, k, n, "CPU quantized_matmul (Q8_0)");
 
-                for block_idx in 0..blocks_per_row {
-                    let block_start = row_start + block_idx * 34;
-                    let scale_bits =
-                        u16::from_le_bytes([raw[block_start], raw[block_start + 1]]);
-                    let scale = half::f16::from_bits(scale_bits).to_f32();
+                // Each block = 34 bytes (2 bytes f16 scale + 32 bytes i8 values)
+                let blocks_per_row = (k + 31) / 32;
+                let bytes_per_row = blocks_per_row * 34;
 
-                    let elem_start = block_idx * 32;
-                    let elem_end = std::cmp::min(elem_start + 32, k);
+                for i in 0..m {
+                    let input_row = &input_data[i * k..i * k + k];
+                    for j in 0..n {
+                        let row_start = j * bytes_per_row;
+                        let mut sum = 0.0f32;
 
-                    // Fused dequant + dot product
-                    for e in elem_start..elem_end {
-                        let qs = raw[block_start + 2 + (e - elem_start)] as i8;
-                        sum += scale * (qs as f32) * input_row[e];
+                        for block_idx in 0..blocks_per_row {
+                            let block_start = row_start + block_idx * 34;
+                            let scale_bits =
+                                u16::from_le_bytes([raw[block_start], raw[block_start + 1]]);
+                            let scale = half::f16::from_bits(scale_bits).to_f32();
+
+                            let elem_start = block_idx * 32;
+                            let elem_end = std::cmp::min(elem_start + 32, k);
+
+                            for e in elem_start..elem_end {
+                                let qs = raw[block_start + 2 + (e - elem_start)] as i8;
+                                sum += scale * (qs as f32) * input_row[e];
+                            }
+                        }
+
+                        result[i * n + j] = sum;
                     }
                 }
-
-                result[i * n + j] = sum;
             }
+            TensorDtype::Q4_0 => {
+                trace!(m, k, n, "CPU quantized_matmul (Q4_0)");
+
+                // Q4_0 block: 18 bytes per 32 elements
+                //   2 bytes f16 scale + 16 bytes (32 nibbles, each 4-bit)
+                // Nibble layout (matches llama.cpp / quant.rs dequantize_q4_0):
+                //   Byte j's low nibble  (& 0x0F) → element j      (indices 0..15)
+                //   Byte j's high nibble (>> 4)   → element j + 16 (indices 16..31)
+                // Values are unsigned 0..15, subtract 8 to get signed -8..7.
+                let blocks_per_row = (k + 31) / 32;
+                let bytes_per_row = blocks_per_row * 18;
+
+                for i in 0..m {
+                    let input_row = &input_data[i * k..i * k + k];
+                    for j in 0..n {
+                        let row_start = j * bytes_per_row;
+                        let mut sum = 0.0f32;
+
+                        for block_idx in 0..blocks_per_row {
+                            let block_start = row_start + block_idx * 18;
+                            let scale_bits =
+                                u16::from_le_bytes([raw[block_start], raw[block_start + 1]]);
+                            let scale = half::f16::from_bits(scale_bits).to_f32();
+
+                            let elem_start = block_idx * 32;
+                            let elem_end = std::cmp::min(elem_start + 32, k);
+
+                            for e in elem_start..elem_end {
+                                let local_idx = e - elem_start;
+                                let nibble = if local_idx < 16 {
+                                    // First 16 elements: low nibble of byte[local_idx]
+                                    raw[block_start + 2 + local_idx] & 0x0F
+                                } else {
+                                    // Last 16 elements: high nibble of byte[local_idx - 16]
+                                    (raw[block_start + 2 + local_idx - 16] >> 4) & 0x0F
+                                };
+                                // Q4_0: subtract 8 to center around 0
+                                let qs = nibble as i32 - 8;
+                                sum += scale * (qs as f32) * input_row[e];
+                            }
+                        }
+
+                        result[i * n + j] = sum;
+                    }
+                }
+            }
+            _ => unreachable!(),
         }
 
         DeviceTensor::new(Tensor::new(vec![m, n], result))
@@ -465,11 +515,16 @@ impl ComputeBackend for CpuBackend {
         pos_offset: usize,
         freq_base: f32,
         head_dim: usize,
+        rope_dim: usize,
     ) -> (DeviceTensor, DeviceTensor) {
+        assert!(head_dim > 0, "rope: head_dim must be > 0");
+        assert!(rope_dim <= head_dim, "rope: rope_dim ({}) must be <= head_dim ({})", rope_dim, head_dim);
         // q, k: [seq_len, total_dim] where total_dim = n_heads * head_dim
         // Apply rotary position embeddings to each head independently.
-        // For dimension pair (2i, 2i+1) within each head:
-        //   freq[i] = 1.0 / (freq_base ^ (2i / head_dim))
+        // Only the first `rope_dim` dimensions of each head are rotated;
+        // dimensions rope_dim..head_dim pass through unchanged.
+        // For dimension pair (2i, 2i+1) within the rotated portion:
+        //   freq[i] = 1.0 / (freq_base ^ (2i / rope_dim))
         //   cos_theta = cos(pos * freq[i])
         //   sin_theta = sin(pos * freq[i])
         //   q_rot[2i]   = q[2i]   * cos_theta - q[2i+1] * sin_theta
@@ -497,8 +552,14 @@ impl ComputeBackend for CpuBackend {
             head_dim
         );
         assert!(
-            head_dim % 2 == 0,
-            "rope: head_dim ({}) must be even",
+            rope_dim % 2 == 0,
+            "rope: rope_dim ({}) must be even",
+            rope_dim
+        );
+        assert!(
+            rope_dim <= head_dim,
+            "rope: rope_dim ({}) must be <= head_dim ({})",
+            rope_dim,
             head_dim
         );
 
@@ -506,17 +567,18 @@ impl ComputeBackend for CpuBackend {
         let k_total_dim = k_shape[1];
         let k_n_heads = k_total_dim / head_dim;
 
-        trace!(seq_len, total_dim, head_dim, n_heads, pos_offset, freq_base, "CPU rope");
+        trace!(seq_len, total_dim, head_dim, rope_dim, n_heads, pos_offset, freq_base, "CPU rope");
 
-        // Precompute frequencies for one head
-        let half_dim = head_dim / 2;
-        let mut freqs = vec![0.0f32; half_dim];
-        for i in 0..half_dim {
-            freqs[i] = 1.0 / freq_base.powf(2.0 * i as f32 / head_dim as f32);
+        // Precompute frequencies for the rotated portion
+        let half_rope_dim = rope_dim / 2;
+        let mut freqs = vec![0.0f32; half_rope_dim];
+        for i in 0..half_rope_dim {
+            freqs[i] = 1.0 / freq_base.powf(2.0 * i as f32 / rope_dim as f32);
         }
 
-        let mut q_rot = vec![0.0f32; q_data.len()];
-        let mut k_rot = vec![0.0f32; k_data.len()];
+        // Clone input data so non-rotated dims pass through unchanged
+        let mut q_rot = q_data.to_vec();
+        let mut k_rot = k_data.to_vec();
 
         for pos in 0..seq_len {
             let abs_pos = (pos + pos_offset) as f32;
@@ -524,7 +586,7 @@ impl ComputeBackend for CpuBackend {
             // Apply to Q
             for head in 0..n_heads {
                 let offset = pos * total_dim + head * head_dim;
-                for i in 0..half_dim {
+                for i in 0..half_rope_dim {
                     let theta = abs_pos * freqs[i];
                     let cos_theta = theta.cos();
                     let sin_theta = theta.sin();
@@ -535,12 +597,13 @@ impl ComputeBackend for CpuBackend {
                     q_rot[offset + 2 * i] = q0 * cos_theta - q1 * sin_theta;
                     q_rot[offset + 2 * i + 1] = q0 * sin_theta + q1 * cos_theta;
                 }
+                // dims rope_dim..head_dim are already correct from the clone
             }
 
             // Apply to K
             for head in 0..k_n_heads {
                 let offset = pos * k_total_dim + head * head_dim;
-                for i in 0..half_dim {
+                for i in 0..half_rope_dim {
                     let theta = abs_pos * freqs[i];
                     let cos_theta = theta.cos();
                     let sin_theta = theta.sin();
@@ -1206,7 +1269,7 @@ mod tests {
         // At position 0, cos(0)=1, sin(0)=0, so RoPE should be identity
         let q = dt(Tensor::new(vec![1, 4], vec![1.0, 2.0, 3.0, 4.0]));
         let k = dt(Tensor::new(vec![1, 4], vec![5.0, 6.0, 7.0, 8.0]));
-        let (q_rot, k_rot) = b.rope(&q, &k, 0, 10000.0, 4);
+        let (q_rot, k_rot) = b.rope(&q, &k, 0, 10000.0, 4, 4);
         assert_close(q_rot.tensor.as_f32(), &[1.0, 2.0, 3.0, 4.0], 1e-5, "rope q at pos 0");
         assert_close(k_rot.tensor.as_f32(), &[5.0, 6.0, 7.0, 8.0], 1e-5, "rope k at pos 0");
     }
@@ -1221,7 +1284,7 @@ mod tests {
         // q_rot[1] = q[0]*sin + q[1]*cos = 1*0.8415 + 0*0.5403 = 0.8415
         let q = dt(Tensor::new(vec![1, 2], vec![1.0, 0.0]));
         let k = dt(Tensor::new(vec![1, 2], vec![1.0, 0.0]));
-        let (q_rot, _k_rot) = b.rope(&q, &k, 1, 1.0, 2);
+        let (q_rot, _k_rot) = b.rope(&q, &k, 1, 1.0, 2, 2);
 
         let cos1 = 1.0f32.cos();
         let sin1 = 1.0f32.sin();
@@ -1236,7 +1299,7 @@ mod tests {
         // RoPE is a rotation, so the L2 norm should be preserved
         let q = dt(Tensor::new(vec![1, 4], vec![1.0, 2.0, 3.0, 4.0]));
         let k = dt(Tensor::new(vec![1, 4], vec![5.0, 6.0, 7.0, 8.0]));
-        let (q_rot, _) = b.rope(&q, &k, 5, 10000.0, 4);
+        let (q_rot, _) = b.rope(&q, &k, 5, 10000.0, 4, 4);
 
         let norm_before: f32 = q.tensor.as_f32().iter().map(|&x| x * x).sum::<f32>().sqrt();
         let norm_after: f32 = q_rot.tensor.as_f32().iter().map(|&x| x * x).sum::<f32>().sqrt();
@@ -1254,7 +1317,7 @@ mod tests {
         // 2 heads, head_dim=2, seq_len=1
         let q = dt(Tensor::new(vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]));
         let k = dt(Tensor::new(vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]));
-        let (q_rot, _) = b.rope(&q, &k, 1, 1.0, 2);
+        let (q_rot, _) = b.rope(&q, &k, 1, 1.0, 2, 2);
         let data = q_rot.tensor.as_f32();
 
         // Head 0: [1,0] rotated by theta=1 -> [cos1, sin1]
@@ -1273,7 +1336,7 @@ mod tests {
         // seq_len=2, head_dim=2
         let q = dt(Tensor::new(vec![2, 2], vec![1.0, 0.0, 1.0, 0.0]));
         let k = dt(Tensor::new(vec![2, 2], vec![1.0, 0.0, 1.0, 0.0]));
-        let (q_rot, _) = b.rope(&q, &k, 0, 1.0, 2);
+        let (q_rot, _) = b.rope(&q, &k, 0, 1.0, 2, 2);
         let data = q_rot.tensor.as_f32();
 
         // Pos 0: theta=0, cos=1, sin=0 -> [1, 0]
@@ -1284,6 +1347,166 @@ mod tests {
         let sin1 = 1.0f32.sin();
         assert!((data[2] - cos1).abs() < 1e-5);
         assert!((data[3] - sin1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_rope_partial_rotation() {
+        let b = backend();
+        // head_dim=8, rope_dim=4: first 4 dims rotated, last 4 unchanged
+        // 1 head, seq_len=1
+        let q = dt(Tensor::new(vec![1, 8], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
+        let k = dt(Tensor::new(vec![1, 8], vec![1.0, 0.0, 1.0, 0.0, 9.0, 10.0, 11.0, 12.0]));
+        let (q_rot, k_rot) = b.rope(&q, &k, 5, 10000.0, 8, 4);
+
+        let q_data = q_rot.tensor.as_f32();
+        let k_data = k_rot.tensor.as_f32();
+
+        // Last 4 dims (indices 4..8) should be unchanged
+        assert!((q_data[4] - 5.0).abs() < 1e-6, "q[4] should be unchanged");
+        assert!((q_data[5] - 6.0).abs() < 1e-6, "q[5] should be unchanged");
+        assert!((q_data[6] - 7.0).abs() < 1e-6, "q[6] should be unchanged");
+        assert!((q_data[7] - 8.0).abs() < 1e-6, "q[7] should be unchanged");
+
+        assert!((k_data[4] - 9.0).abs() < 1e-6, "k[4] should be unchanged");
+        assert!((k_data[5] - 10.0).abs() < 1e-6, "k[5] should be unchanged");
+        assert!((k_data[6] - 11.0).abs() < 1e-6, "k[6] should be unchanged");
+        assert!((k_data[7] - 12.0).abs() < 1e-6, "k[7] should be unchanged");
+
+        // First 4 dims should be rotated (different from input at pos 5)
+        let mut any_rotated = false;
+        for i in 0..4 {
+            if (q_data[i] - [1.0, 2.0, 3.0, 4.0][i]).abs() > 1e-6 {
+                any_rotated = true;
+                break;
+            }
+        }
+        assert!(any_rotated, "First 4 dims of Q should be rotated at pos 5");
+
+        // Norm of the rotated portion should be preserved (rotation is norm-preserving)
+        let orig_norm: f32 = (1.0f32 * 1.0 + 2.0 * 2.0 + 3.0 * 3.0 + 4.0 * 4.0).sqrt();
+        let rot_norm: f32 = q_data[0..4].iter().map(|&x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (orig_norm - rot_norm).abs() < 1e-4,
+            "Partial RoPE should preserve norm: {} vs {}",
+            orig_norm,
+            rot_norm
+        );
+    }
+
+    // ---- quantized_matmul Q4_0 ----
+
+    #[test]
+    fn test_quantized_matmul_q4_0() {
+        let b = backend();
+
+        // Create a 1x32 Q4_0 weight matrix
+        // Q4_0 block: 2 bytes f16 scale + 16 bytes of nibbles (32 4-bit values)
+        let scale = half::f16::from_f32(1.0);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&scale.to_bits().to_le_bytes());
+        // Pack 32 nibble values. Each byte holds 2 values:
+        // Byte j's low nibble  → element j      (indices 0..15)
+        // Byte j's high nibble → element j + 16  (indices 16..31)
+        // We store byte=0x98 (low=8, high=9), so:
+        //   elements 0..15: nibble=8, dequant=(8-8)*1.0=0
+        //   elements 16..31: nibble=9, dequant=(9-8)*1.0=1
+        for _ in 0..16 {
+            raw.push(0x98); // low nibble=8, high nibble=9
+        }
+
+        let weights_q4 = Tensor::from_quantized(vec![1, 32], TensorDtype::Q4_0, raw);
+
+        // Input: [1, 32] all ones
+        let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
+
+        let result = b.quantized_matmul(&dt(weights_q4), &dt(input));
+        assert_eq!(result.shape(), &[1, 1]);
+
+        // Expected: 16 zeros + 16 ones = 16.0
+        let val = result.tensor.as_f32()[0];
+        assert!(
+            (val - 16.0).abs() < 0.5,
+            "Q4_0 quantized_matmul: expected ~16.0, got {}",
+            val
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q4_0_vs_reference() {
+        let b = backend();
+
+        // Create a 2x32 Q4_0 weight matrix with known pattern
+        let scale = half::f16::from_f32(0.5);
+        let mut raw = Vec::new();
+        for _ in 0..2 {
+            raw.extend_from_slice(&scale.to_bits().to_le_bytes());
+            // All nibbles = 12 -> after -8 = 4, dequantized = 0.5 * 4 = 2.0
+            for _ in 0..16 {
+                raw.push(0xCC); // both nibbles = 12
+            }
+        }
+
+        let weights_q4 = Tensor::from_quantized(vec![2, 32], TensorDtype::Q4_0, raw);
+
+        // Input: [1, 32] all ones
+        let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
+
+        let result = b.quantized_matmul(&dt(weights_q4), &dt(input));
+        assert_eq!(result.shape(), &[1, 2]);
+
+        // Each row: 32 elements, each dequantized to 0.5 * 4 = 2.0
+        // Dot with all-ones input: 32 * 2.0 = 64.0
+        let data = result.tensor.as_f32();
+        assert!(
+            (data[0] - 64.0).abs() < 0.5,
+            "Q4_0 row 0: expected ~64.0, got {}",
+            data[0]
+        );
+        assert!(
+            (data[1] - 64.0).abs() < 0.5,
+            "Q4_0 row 1: expected ~64.0, got {}",
+            data[1]
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q4_0_asymmetric_nibbles() {
+        // Verify that quantized_matmul matches dequantize_q4_0 reference
+        // when low and high nibbles differ within each byte.
+        use crate::gguf::quant::{BlockQ4_0, dequantize_q4_0, f32_to_f16};
+
+        let b = backend();
+        let scale_f16 = f32_to_f16(1.0);
+
+        // Byte pattern: low=15(0xF), high=0 → elements 0..15 get nibble 15,
+        // elements 16..31 get nibble 0.
+        let mut qs = [0u8; 16];
+        for j in 0..16 {
+            qs[j] = 0x0F; // low=15, high=0
+        }
+
+        let block = BlockQ4_0 { d: scale_f16, qs };
+        let reference = dequantize_q4_0(&[block]);
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&scale_f16.to_le_bytes());
+        raw.extend_from_slice(&qs);
+
+        let weights = Tensor::from_quantized(vec![1, 32], TensorDtype::Q4_0, raw);
+        let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
+
+        let result = b.quantized_matmul(&dt(weights), &dt(input));
+        let matmul_val = result.tensor.as_f32()[0];
+
+        // Reference: elements 0..15 = (15-8)*1.0 = 7.0, elements 16..31 = (0-8)*1.0 = -8.0
+        // Sum = 16*7 + 16*(-8) = 112 - 128 = -16.0
+        let ref_sum: f32 = reference.iter().sum();
+        assert!(
+            (matmul_val - ref_sum).abs() < 0.5,
+            "Q4_0 asymmetric matmul ({}) must match dequant reference ({})",
+            matmul_val,
+            ref_sum
+        );
     }
 
     // ---- mean_pool ----
@@ -1719,7 +1942,7 @@ mod tests {
         let k_data: Vec<f32> = (0..16).map(|i| i as f32 * 0.2).collect();
         let q = dt(Tensor::new(vec![1, 16], q_data));
         let k = dt(Tensor::new(vec![1, 16], k_data));
-        let (q_rot, k_rot) = b.rope(&q, &k, 3, 10000.0, 8);
+        let (q_rot, k_rot) = b.rope(&q, &k, 3, 10000.0, 8, 8);
 
         // Verify output shapes
         assert_eq!(q_rot.shape(), &[1, 16]);
@@ -1747,7 +1970,7 @@ mod tests {
         // Q has 4 heads, K has 2 heads (GQA), head_dim=2
         let q = dt(Tensor::new(vec![1, 8], vec![1.0; 8])); // 4 heads * 2 dim
         let k = dt(Tensor::new(vec![1, 4], vec![1.0; 4])); // 2 heads * 2 dim
-        let (q_rot, k_rot) = b.rope(&q, &k, 1, 10000.0, 2);
+        let (q_rot, k_rot) = b.rope(&q, &k, 1, 10000.0, 2, 2);
         assert_eq!(q_rot.shape(), &[1, 8]);
         assert_eq!(k_rot.shape(), &[1, 4]);
     }

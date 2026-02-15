@@ -1,0 +1,1431 @@
+// M4.3: Transformer layer forward pass.
+//
+// Implements the forward pass for a single transformer layer and the full model,
+// parameterized by ModelConfig to handle Gemma3, LLaMA, and BERT architectures.
+
+use tracing::{debug, trace};
+
+use crate::backend::{ComputeBackend, DeviceTensor};
+use crate::error::InferenceError;
+use crate::tensor::{Tensor, TensorDtype};
+
+use super::config::{Activation, ModelConfig, NormType, PositionType};
+use super::weights::{LayerWeights, ModelWeights};
+
+/// Linear (matrix multiply) forward pass, dispatching on quantized vs F32 weights.
+///
+/// Weights are stored as [out_features, in_features]:
+/// - For Q8_0/Q4_0: uses `backend.quantized_matmul(weight, input)` which does fused dequant.
+/// - For F32/F16: uses `backend.matmul_transpose(input, weight)` since weight is [out, in].
+///
+/// If bias is provided, adds it to each row of the result.
+fn linear_forward(
+    input: &DeviceTensor,
+    weight: &DeviceTensor,
+    bias: Option<&DeviceTensor>,
+    backend: &dyn ComputeBackend,
+) -> DeviceTensor {
+    let result = match weight.dtype() {
+        TensorDtype::Q8_0 | TensorDtype::Q4_0 => {
+            // quantized_matmul: Q weights [N, K] x f32 input [M, K] -> [M, N]
+            backend.quantized_matmul(weight, input)
+        }
+        TensorDtype::F32 | TensorDtype::F16 => {
+            // matmul_transpose: input [M, K] x weight [N, K]^T -> [M, N]
+            backend.matmul_transpose(input, weight)
+        }
+    };
+
+    match bias {
+        Some(b) => backend.add_bias(&result, b),
+        None => result,
+    }
+}
+
+/// Apply normalization (LayerNorm or RMSNorm) based on config.
+fn normalize(
+    input: &DeviceTensor,
+    weight: &DeviceTensor,
+    bias: Option<&DeviceTensor>,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+) -> DeviceTensor {
+    match config.norm_type {
+        NormType::LayerNorm => {
+            let b = bias.expect("LayerNorm requires a bias tensor");
+            backend.layer_norm(input, weight, b, config.norm_eps)
+        }
+        NormType::RMSNorm => backend.rms_norm(input, weight, config.norm_eps),
+    }
+}
+
+/// Extract a per-head slice from a [seq_len, total_dim] tensor.
+///
+/// Returns a [seq_len, head_dim] tensor for the given head index.
+fn extract_head(data: &[f32], seq_len: usize, total_dim: usize, head: usize, head_dim: usize) -> Tensor {
+    let mut head_data = vec![0.0f32; seq_len * head_dim];
+    for pos in 0..seq_len {
+        let src_offset = pos * total_dim + head * head_dim;
+        let dst_offset = pos * head_dim;
+        head_data[dst_offset..dst_offset + head_dim]
+            .copy_from_slice(&data[src_offset..src_offset + head_dim]);
+    }
+    Tensor::new(vec![seq_len, head_dim], head_data)
+}
+
+/// Reassemble per-head outputs into a single [seq_len, num_heads * head_dim] tensor.
+fn assemble_heads(head_outputs: &[Vec<f32>], seq_len: usize, num_heads: usize, head_dim: usize) -> Tensor {
+    let total_dim = num_heads * head_dim;
+    let mut result = vec![0.0f32; seq_len * total_dim];
+    for head in 0..num_heads {
+        let head_data = &head_outputs[head];
+        for pos in 0..seq_len {
+            let src_offset = pos * head_dim;
+            let dst_offset = pos * total_dim + head * head_dim;
+            result[dst_offset..dst_offset + head_dim]
+                .copy_from_slice(&head_data[src_offset..src_offset + head_dim]);
+        }
+    }
+    Tensor::new(vec![seq_len, total_dim], result)
+}
+
+/// Repeat K/V heads for Grouped Query Attention (GQA).
+///
+/// When num_kv_heads < num_heads, each KV head serves (num_heads / num_kv_heads) Q heads.
+/// This function expands [seq_len, num_kv_heads * head_dim] to [seq_len, num_heads * head_dim]
+/// by repeating each KV head the appropriate number of times.
+fn repeat_kv_heads(
+    data: &[f32],
+    seq_len: usize,
+    num_kv_heads: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let repeats = num_heads / num_kv_heads;
+    let kv_total_dim = num_kv_heads * head_dim;
+    let out_total_dim = num_heads * head_dim;
+    let mut result = vec![0.0f32; seq_len * out_total_dim];
+
+    for pos in 0..seq_len {
+        for kv_head in 0..num_kv_heads {
+            let src_offset = pos * kv_total_dim + kv_head * head_dim;
+            for r in 0..repeats {
+                let out_head = kv_head * repeats + r;
+                let dst_offset = pos * out_total_dim + out_head * head_dim;
+                result[dst_offset..dst_offset + head_dim]
+                    .copy_from_slice(&data[src_offset..src_offset + head_dim]);
+            }
+        }
+    }
+
+    result
+}
+
+/// Multi-head attention mechanism.
+///
+/// Handles:
+/// - RoPE (if config.position_type == RoPE)
+/// - Grouped Query Attention (GQA) when num_kv_heads < num_heads
+/// - Attention mask (padding exclusion)
+/// - Per-head score computation, scaling, optional softcap, optional causal mask, softmax
+/// - Weighted sum of values and head concatenation
+fn multi_head_attention(
+    q: DeviceTensor,
+    k: DeviceTensor,
+    v: DeviceTensor,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+    pos_offset: usize,
+    attention_mask: &[f32],
+) -> DeviceTensor {
+    let seq_len = q.shape()[0];
+    let num_heads = config.num_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+
+    trace!(seq_len, num_heads, num_kv_heads, head_dim, "multi_head_attention");
+
+    // Step a: Apply RoPE if configured (RoPE applies to Q and K only, not V)
+    let (q_proc, k_proc) = if config.position_type == PositionType::RoPE {
+        let (q_rot, k_rot) = backend.rope(
+            &q, &k, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
+        );
+        (q_rot, k_rot)
+    } else {
+        (q, k)
+    };
+
+    // Step b: GQA - repeat K/V heads if needed
+    let (k_expanded_data, v_expanded_data) = if num_kv_heads < num_heads {
+        let k_data = k_proc.tensor.as_f32();
+        let v_data = v.tensor.as_f32();
+        let k_exp = repeat_kv_heads(k_data, seq_len, num_kv_heads, num_heads, head_dim);
+        let v_exp = repeat_kv_heads(v_data, seq_len, num_kv_heads, num_heads, head_dim);
+        (k_exp, v_exp)
+    } else {
+        (k_proc.tensor.as_f32().to_vec(), v.tensor.as_f32().to_vec())
+    };
+
+    let q_data = q_proc.tensor.as_f32();
+    let total_dim = num_heads * head_dim;
+
+    // Compute attention scale
+    let attn_scale = config.attn_scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
+
+    // Step c-j: Per-head attention computation
+    let mut head_outputs: Vec<Vec<f32>> = Vec::with_capacity(num_heads);
+
+    for h in 0..num_heads {
+        // Extract per-head Q, K, V: [seq_len, head_dim]
+        let q_head = extract_head(q_data, seq_len, total_dim, h, head_dim);
+        let k_head = extract_head(&k_expanded_data, seq_len, total_dim, h, head_dim);
+        let v_head = extract_head(&v_expanded_data, seq_len, total_dim, h, head_dim);
+
+        // Step d: scores = Q @ K^T: [seq_len, head_dim] x [head_dim, seq_len] -> [seq_len, seq_len]
+        let q_dev = DeviceTensor::new(q_head);
+        let k_dev = DeviceTensor::new(k_head);
+        let v_dev = DeviceTensor::new(v_head);
+
+        let scores = backend.matmul_transpose(&q_dev, &k_dev);
+
+        // Step e: Scale
+        let scores = backend.scale(&scores, attn_scale);
+
+        // Step f: Softcap (if attn_logit_softcap > 0)
+        let scores = if config.attn_logit_softcap > 0.0 {
+            let cap = config.attn_logit_softcap;
+            // scores = cap * tanh(scores / cap)
+            let scaled_down = backend.scale(&scores, 1.0 / cap);
+            let tanh_data: Vec<f32> = scaled_down
+                .tensor
+                .as_f32()
+                .iter()
+                .map(|&x| x.tanh())
+                .collect();
+            let tanh_tensor = DeviceTensor::new(Tensor::new(scaled_down.shape().to_vec(), tanh_data));
+            backend.scale(&tanh_tensor, cap)
+        } else {
+            scores
+        };
+
+        // Step g1: Apply attention mask — where mask[j] == 0, set scores[i][j] = -inf
+        let scores = {
+            assert_eq!(
+                attention_mask.len(),
+                seq_len,
+                "attention_mask length ({}) must equal seq_len ({})",
+                attention_mask.len(),
+                seq_len,
+            );
+            let needs_masking = attention_mask.iter().any(|&m| m == 0.0);
+            if needs_masking {
+                let mut scores_data = scores.tensor.as_f32().to_vec();
+                for i in 0..seq_len {
+                    for j in 0..seq_len {
+                        if attention_mask[j] == 0.0 {
+                            scores_data[i * seq_len + j] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+                DeviceTensor::new(Tensor::new(vec![seq_len, seq_len], scores_data))
+            } else {
+                scores
+            }
+        };
+
+        // Step g2: Apply causal mask if configured
+        let scores = if config.causal {
+            backend.apply_causal_mask(&scores, seq_len)
+        } else {
+            scores
+        };
+
+        // Step h: Softmax
+        let probs = backend.softmax(&scores);
+
+        // Step i: Weighted sum: output = probs @ V: [seq_len, seq_len] x [seq_len, head_dim] -> [seq_len, head_dim]
+        let head_out = backend.matmul(&probs, &v_dev);
+        head_outputs.push(head_out.tensor.as_f32().to_vec());
+    }
+
+    // Step j: Concatenate heads back to [seq_len, num_heads * head_dim]
+    let result = assemble_heads(&head_outputs, seq_len, num_heads, head_dim);
+    DeviceTensor::new(result)
+}
+
+/// Single transformer layer forward pass.
+///
+/// Dispatches between pre-norm (Gemma/LLaMA) and post-norm (BERT) architectures
+/// based on `config.pre_norm`.
+pub fn transformer_layer_forward(
+    input: &DeviceTensor,
+    layer: &LayerWeights,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+    pos_offset: usize,
+    attention_mask: &[f32],
+) -> DeviceTensor {
+    trace!(pos_offset, pre_norm = config.pre_norm, "transformer_layer_forward");
+
+    if config.pre_norm {
+        pre_norm_layer_forward(input, layer, config, backend, pos_offset, attention_mask)
+    } else {
+        post_norm_layer_forward(input, layer, config, backend, pos_offset, attention_mask)
+    }
+}
+
+/// Pre-norm layer forward pass (Gemma/LLaMA — matches llama.cpp).
+///
+/// 1. normed = rms_norm(input, attn_norm_w)
+/// 2. q, k, v = project(normed)
+/// 3. attn_out = multi_head_attention(q, k, v, mask)
+/// 4. projected = output_project(attn_out)
+/// 5. residual = input + projected
+/// 6. normed2 = rms_norm(residual, ffn_norm_w)
+/// 7. ffn_out = swiglu_ffn(normed2)
+/// 8. output = residual + ffn_out
+fn pre_norm_layer_forward(
+    input: &DeviceTensor,
+    layer: &LayerWeights,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+    pos_offset: usize,
+    attention_mask: &[f32],
+) -> DeviceTensor {
+    // 1. Pre-attention normalization
+    let attn_norm_w = layer.attn_norm_w.as_ref()
+        .expect("pre_norm layer requires attn_norm_w");
+    let normed = normalize(
+        input,
+        attn_norm_w,
+        layer.attn_norm_b.as_ref(),
+        config,
+        backend,
+    );
+
+    // 2. QKV projections
+    let q = linear_forward(&normed, &layer.attn_q, layer.attn_q_bias.as_ref(), backend);
+    let k = linear_forward(&normed, &layer.attn_k, layer.attn_k_bias.as_ref(), backend);
+    let v = linear_forward(&normed, &layer.attn_v, layer.attn_v_bias.as_ref(), backend);
+
+    // 3. Multi-head attention
+    let attn_out = multi_head_attention(q, k, v, config, backend, pos_offset, attention_mask);
+
+    // 4. Output projection + residual
+    let projected = linear_forward(
+        &attn_out,
+        &layer.attn_output,
+        layer.attn_output_bias.as_ref(),
+        backend,
+    );
+    let residual = backend.add(input, &projected);
+
+    // 5. Pre-FFN normalization
+    let ffn_norm_w = layer.ffn_norm_w.as_ref()
+        .expect("pre_norm layer requires ffn_norm_w");
+    let normed2 = normalize(
+        &residual,
+        ffn_norm_w,
+        layer.ffn_norm_b.as_ref(),
+        config,
+        backend,
+    );
+
+    // 6. FFN (SwiGLU path)
+    let ffn_out = ffn_forward(&normed2, layer, config, backend);
+
+    // 7. Residual connection
+    backend.add(&residual, &ffn_out)
+}
+
+/// Post-norm layer forward pass (BERT — matches llama.cpp bert.cpp).
+///
+/// 1. q, k, v = project(input)              // NO pre-norm
+/// 2. attn_out = multi_head_attention(q, k, v, mask)
+/// 3. projected = output_project(attn_out)
+/// 4. residual = input + projected
+/// 5. residual = layer_norm(residual, attn_output_norm_w, b)  // POST-norm
+/// 6. ffn_out = gelu_ffn(residual)           // NO pre-FFN norm
+/// 7. output = residual + ffn_out
+/// 8. output = layer_norm(output, ffn_output_norm_w, b)       // POST-norm
+fn post_norm_layer_forward(
+    input: &DeviceTensor,
+    layer: &LayerWeights,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+    pos_offset: usize,
+    attention_mask: &[f32],
+) -> DeviceTensor {
+    // 1. QKV projections (NO pre-norm)
+    let q = linear_forward(input, &layer.attn_q, layer.attn_q_bias.as_ref(), backend);
+    let k = linear_forward(input, &layer.attn_k, layer.attn_k_bias.as_ref(), backend);
+    let v = linear_forward(input, &layer.attn_v, layer.attn_v_bias.as_ref(), backend);
+
+    // 2. Multi-head attention
+    let attn_out = multi_head_attention(q, k, v, config, backend, pos_offset, attention_mask);
+
+    // 3. Output projection + residual
+    let projected = linear_forward(
+        &attn_out,
+        &layer.attn_output,
+        layer.attn_output_bias.as_ref(),
+        backend,
+    );
+    let mut residual = backend.add(input, &projected);
+
+    // 4. Post-attention norm
+    if let Some(ref norm_w) = layer.attn_output_norm_w {
+        residual = normalize(
+            &residual,
+            norm_w,
+            layer.attn_output_norm_b.as_ref(),
+            config,
+            backend,
+        );
+    }
+
+    // 5. FFN (NO pre-FFN norm)
+    let ffn_out = ffn_forward(&residual, layer, config, backend);
+
+    // 6. Residual connection
+    let mut output = backend.add(&residual, &ffn_out);
+
+    // 7. Post-FFN norm
+    if let Some(ref norm_w) = layer.ffn_output_norm_w {
+        output = normalize(
+            &output,
+            norm_w,
+            layer.ffn_output_norm_b.as_ref(),
+            config,
+            backend,
+        );
+    }
+
+    output
+}
+
+/// FFN forward pass, dispatching on activation type.
+fn ffn_forward(
+    input: &DeviceTensor,
+    layer: &LayerWeights,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+) -> DeviceTensor {
+    match config.activation {
+        Activation::SwiGLU => {
+            let gate_weight = layer
+                .ffn_gate
+                .as_ref()
+                .expect("SwiGLU activation requires ffn_gate weight");
+            let gate = linear_forward(input, gate_weight, None, backend);
+            let up = linear_forward(input, &layer.ffn_up, layer.ffn_up_bias.as_ref(), backend);
+            let activated = backend.swiglu(&gate, &up);
+            linear_forward(&activated, &layer.ffn_down, layer.ffn_down_bias.as_ref(), backend)
+        }
+        Activation::GELU => {
+            let up = linear_forward(input, &layer.ffn_up, layer.ffn_up_bias.as_ref(), backend);
+            let activated = backend.gelu(&up);
+            linear_forward(&activated, &layer.ffn_down, layer.ffn_down_bias.as_ref(), backend)
+        }
+    }
+}
+
+/// Full model forward pass.
+///
+/// Steps:
+/// 1. Validate input_ids
+/// 2. Embedding lookup
+/// 3. Embedding scaling (if embedding_scale != 1.0)
+/// 4. Add position embeddings (if Learned position type)
+/// 5. Embedding normalization (BERT only)
+/// 6. Run through all transformer layers
+/// 7. Final output normalization
+/// 8. Return hidden states [seq_len, hidden_size]
+pub fn model_forward(
+    input_ids: &[u32],
+    attention_mask: &[f32],
+    weights: &ModelWeights,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+    pos_offset: usize,
+) -> Result<DeviceTensor, InferenceError> {
+    let seq_len = input_ids.len();
+    debug!(seq_len, num_layers = config.num_layers, pos_offset, "model_forward");
+
+    // 1. Validate input_ids against vocab_size
+    for &id in input_ids {
+        if (id as usize) >= config.vocab_size {
+            return Err(InferenceError::Model(format!(
+                "input token ID {} exceeds vocab_size {}",
+                id, config.vocab_size
+            )));
+        }
+    }
+
+    // 2. Embedding lookup: [seq_len, hidden_size]
+    let mut hidden = backend.embedding_lookup(&weights.token_embedding, input_ids);
+
+    // 3. Embedding scaling
+    if (config.embedding_scale - 1.0).abs() > f32::EPSILON {
+        hidden = backend.scale(&hidden, config.embedding_scale);
+    }
+
+    // 4. Add position embeddings (Learned, e.g., BERT)
+    if config.position_type == PositionType::Learned {
+        if let Some(ref pos_emb) = weights.position_embedding {
+            // Create position IDs [0, 1, 2, ..., seq_len-1]
+            let pos_ids: Vec<u32> = (0..seq_len as u32).collect();
+            let pos_embeddings = backend.embedding_lookup(pos_emb, &pos_ids);
+            hidden = backend.add(&hidden, &pos_embeddings);
+        }
+    }
+
+    // 5. Embedding normalization (BERT only)
+    if let Some(ref norm_w) = weights.embedding_norm_w {
+        hidden = normalize(
+            &hidden,
+            norm_w,
+            weights.embedding_norm_b.as_ref(),
+            config,
+            backend,
+        );
+    }
+
+    // 6. Run through all transformer layers
+    for (i, layer) in weights.layers.iter().enumerate() {
+        trace!(layer = i, "Running layer");
+        hidden = transformer_layer_forward(
+            &hidden, layer, config, backend, pos_offset, attention_mask,
+        );
+    }
+
+    // 7. Final output normalization
+    hidden = normalize(
+        &hidden,
+        &weights.output_norm_w,
+        weights.output_norm_b.as_ref(),
+        config,
+        backend,
+    );
+
+    // Return hidden states [seq_len, hidden_size]
+    Ok(hidden)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::cpu::CpuBackend;
+    use crate::model::config::*;
+
+    fn cpu() -> CpuBackend {
+        CpuBackend::default()
+    }
+
+    fn dt(tensor: Tensor) -> DeviceTensor {
+        DeviceTensor::new(tensor)
+    }
+
+    /// Create a Gemma-style config for testing.
+    fn gemma_config(hidden_size: usize, num_heads: usize, head_dim: usize, ffn_hidden: usize) -> ModelConfig {
+        ModelConfig {
+            arch: ModelArch::Gemma3,
+            arch_name: "gemma3".to_string(),
+            hidden_size,
+            num_layers: 1,
+            num_heads,
+            num_kv_heads: num_heads, // MHA by default
+            head_dim,
+            ffn_hidden,
+            vocab_size: 16,
+            max_seq_len: 128,
+            norm_type: NormType::RMSNorm,
+            norm_eps: 1e-6,
+            activation: Activation::SwiGLU,
+            position_type: PositionType::RoPE,
+            rope_freq_base: 10000.0,
+            rope_dim: head_dim,
+            causal: true,
+            attn_logit_softcap: 0.0,
+            attn_scale: None,
+            embedding_scale: 1.0,
+            pooling_type: PoolingType::None,
+            has_ffn_gate: true,
+            has_bias: false,
+            pre_norm: true,
+        }
+    }
+
+    /// Create a BERT-style config for testing.
+    fn bert_config(hidden_size: usize, num_heads: usize, head_dim: usize, ffn_hidden: usize) -> ModelConfig {
+        ModelConfig {
+            arch: ModelArch::Bert,
+            arch_name: "bert".to_string(),
+            hidden_size,
+            num_layers: 1,
+            num_heads,
+            num_kv_heads: num_heads,
+            head_dim,
+            ffn_hidden,
+            vocab_size: 16,
+            max_seq_len: 128,
+            norm_type: NormType::LayerNorm,
+            norm_eps: 1e-12,
+            activation: Activation::GELU,
+            position_type: PositionType::Learned,
+            rope_freq_base: 10000.0,
+            rope_dim: head_dim,
+            causal: false,
+            attn_logit_softcap: 0.0,
+            attn_scale: None,
+            embedding_scale: 1.0,
+            pooling_type: PoolingType::Mean,
+            has_ffn_gate: false,
+            has_bias: true,
+            pre_norm: false,
+        }
+    }
+
+    /// Create identity-like weight matrix [out, in] for F32.
+    fn identity_weight(size: usize) -> DeviceTensor {
+        let mut data = vec![0.0f32; size * size];
+        for i in 0..size {
+            data[i * size + i] = 1.0;
+        }
+        dt(Tensor::new(vec![size, size], data))
+    }
+
+    /// Create a zero weight matrix [out, in].
+    fn zero_weight(out_dim: usize, in_dim: usize) -> DeviceTensor {
+        dt(Tensor::new(vec![out_dim, in_dim], vec![0.0f32; out_dim * in_dim]))
+    }
+
+    /// Create a ones weight vector [dim].
+    fn ones_weight(dim: usize) -> DeviceTensor {
+        dt(Tensor::new(vec![dim], vec![1.0f32; dim]))
+    }
+
+    /// Create a zeros bias vector [dim].
+    fn zeros_bias(dim: usize) -> DeviceTensor {
+        dt(Tensor::new(vec![dim], vec![0.0f32; dim]))
+    }
+
+    /// Create minimal LayerWeights for a Gemma-style (SwiGLU, RMSNorm, pre-norm) layer.
+    fn gemma_layer_weights(hidden_size: usize, ffn_hidden: usize) -> LayerWeights {
+        LayerWeights {
+            attn_norm_w: Some(ones_weight(hidden_size)),
+            attn_norm_b: None,
+            ffn_norm_w: Some(ones_weight(hidden_size)),
+            ffn_norm_b: None,
+            attn_output_norm_w: None,
+            attn_output_norm_b: None,
+            ffn_output_norm_w: None,
+            ffn_output_norm_b: None,
+            attn_q: identity_weight(hidden_size),
+            attn_k: identity_weight(hidden_size),
+            attn_v: identity_weight(hidden_size),
+            attn_output: identity_weight(hidden_size),
+            attn_q_bias: None,
+            attn_k_bias: None,
+            attn_v_bias: None,
+            attn_output_bias: None,
+            ffn_up: zero_weight(ffn_hidden, hidden_size),
+            ffn_down: zero_weight(hidden_size, ffn_hidden),
+            ffn_gate: Some(zero_weight(ffn_hidden, hidden_size)),
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+        }
+    }
+
+    /// Create minimal LayerWeights for a BERT-style (GELU, LayerNorm, post-norm) layer.
+    fn bert_layer_weights(hidden_size: usize, ffn_hidden: usize) -> LayerWeights {
+        LayerWeights {
+            attn_norm_w: None,
+            attn_norm_b: None,
+            ffn_norm_w: None,
+            ffn_norm_b: None,
+            attn_output_norm_w: Some(ones_weight(hidden_size)),
+            attn_output_norm_b: Some(zeros_bias(hidden_size)),
+            ffn_output_norm_w: Some(ones_weight(hidden_size)),
+            ffn_output_norm_b: Some(zeros_bias(hidden_size)),
+            attn_q: identity_weight(hidden_size),
+            attn_k: identity_weight(hidden_size),
+            attn_v: identity_weight(hidden_size),
+            attn_output: identity_weight(hidden_size),
+            attn_q_bias: Some(zeros_bias(hidden_size)),
+            attn_k_bias: Some(zeros_bias(hidden_size)),
+            attn_v_bias: Some(zeros_bias(hidden_size)),
+            attn_output_bias: Some(zeros_bias(hidden_size)),
+            ffn_up: zero_weight(ffn_hidden, hidden_size),
+            ffn_down: zero_weight(hidden_size, ffn_hidden),
+            ffn_gate: None,
+            ffn_up_bias: Some(zeros_bias(ffn_hidden)),
+            ffn_down_bias: Some(zeros_bias(hidden_size)),
+        }
+    }
+
+    // ====================================================================
+    // linear_forward tests
+    // ====================================================================
+
+    #[test]
+    fn test_linear_forward_f32_identity() {
+        let b = cpu();
+        let input = dt(Tensor::new(vec![2, 4], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
+        let weight = identity_weight(4);
+        let result = linear_forward(&input, &weight, None, &b);
+        assert_eq!(result.shape(), &[2, 4]);
+        let data = result.tensor.as_f32();
+        assert!((data[0] - 1.0).abs() < 1e-5);
+        assert!((data[7] - 8.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_linear_forward_with_bias() {
+        let b = cpu();
+        let input = dt(Tensor::new(vec![1, 4], vec![1.0, 0.0, 0.0, 0.0]));
+        let weight = identity_weight(4);
+        let bias = dt(Tensor::new(vec![4], vec![10.0, 20.0, 30.0, 40.0]));
+        let result = linear_forward(&input, &weight, Some(&bias), &b);
+        let data = result.tensor.as_f32();
+        assert!((data[0] - 11.0).abs() < 1e-5);
+        assert!((data[1] - 20.0).abs() < 1e-5);
+        assert!((data[2] - 30.0).abs() < 1e-5);
+        assert!((data[3] - 40.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_linear_forward_quantized() {
+        let b = cpu();
+        // Create a 1x32 input and 1x32 Q8_0 weight
+        let input = dt(Tensor::new(vec![1, 32], vec![1.0f32; 32]));
+        let scale = half::f16::from_f32(1.0 / 127.0);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&scale.to_bits().to_le_bytes());
+        for _ in 0..32 {
+            raw.push(127u8);
+        }
+        let weight = dt(Tensor::from_quantized(vec![1, 32], TensorDtype::Q8_0, raw));
+        let result = linear_forward(&input, &weight, None, &b);
+        assert_eq!(result.shape(), &[1, 1]);
+        let val = result.tensor.as_f32()[0];
+        assert!((val - 32.0).abs() < 0.5, "Q8_0 linear_forward: got {}", val);
+    }
+
+    // ====================================================================
+    // extract_head and assemble_heads tests
+    // ====================================================================
+
+    #[test]
+    fn test_extract_and_assemble_heads() {
+        // seq_len=2, num_heads=2, head_dim=3, total_dim=6
+        let data: Vec<f32> = (1..=12).map(|i| i as f32).collect();
+        // [1, 2, 3, 4, 5, 6,   7, 8, 9, 10, 11, 12]
+        // pos 0: head0=[1,2,3] head1=[4,5,6]
+        // pos 1: head0=[7,8,9] head1=[10,11,12]
+
+        let head0 = extract_head(&data, 2, 6, 0, 3);
+        assert_eq!(head0.as_f32(), &[1.0, 2.0, 3.0, 7.0, 8.0, 9.0]);
+
+        let head1 = extract_head(&data, 2, 6, 1, 3);
+        assert_eq!(head1.as_f32(), &[4.0, 5.0, 6.0, 10.0, 11.0, 12.0]);
+
+        let head_outputs = vec![
+            head0.as_f32().to_vec(),
+            head1.as_f32().to_vec(),
+        ];
+        let assembled = assemble_heads(&head_outputs, 2, 2, 3);
+        assert_eq!(assembled.as_f32(), &data[..]);
+    }
+
+    // ====================================================================
+    // repeat_kv_heads tests
+    // ====================================================================
+
+    #[test]
+    fn test_repeat_kv_heads() {
+        // 1 KV head -> 2 Q heads, head_dim=2, seq_len=1
+        let data = vec![1.0, 2.0]; // [seq_len=1, kv_heads=1 * head_dim=2]
+        let expanded = repeat_kv_heads(&data, 1, 1, 2, 2);
+        // Should be [1.0, 2.0, 1.0, 2.0]
+        assert_eq!(expanded, vec![1.0, 2.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_repeat_kv_heads_2_to_4() {
+        // 2 KV heads -> 4 Q heads, head_dim=2, seq_len=1
+        let data = vec![1.0, 2.0, 3.0, 4.0]; // kv0=[1,2], kv1=[3,4]
+        let expanded = repeat_kv_heads(&data, 1, 2, 4, 2);
+        // kv0 -> q0, q1: [1,2,1,2], kv1 -> q2, q3: [3,4,3,4]
+        assert_eq!(expanded, vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_repeat_kv_heads_noop() {
+        // Same number of KV heads as Q heads -> no change
+        let data = vec![1.0, 2.0, 3.0, 4.0];
+        let expanded = repeat_kv_heads(&data, 1, 2, 2, 2);
+        assert_eq!(expanded, data);
+    }
+
+    // ====================================================================
+    // transformer_layer_forward tests
+    // ====================================================================
+
+    #[test]
+    fn test_transformer_layer_output_shape_gemma() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        let layer = gemma_layer_weights(hidden_size, ffn_hidden);
+
+        let seq_len = 3;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[seq_len, hidden_size]);
+
+        // Verify all values are finite
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "Output contains non-finite value: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_transformer_layer_output_shape_bert() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let config = bert_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        let layer = bert_layer_weights(hidden_size, ffn_hidden);
+
+        let seq_len = 3;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[seq_len, hidden_size]);
+
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "Output contains non-finite value: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_residual_with_zero_ffn() {
+        // With zero FFN weights and identity attention weights, the residual
+        // connections should dominate the output.
+        let b = cpu();
+        let hidden_size = 4;
+        let num_heads = 1;
+        let head_dim = 4;
+        let ffn_hidden = 8;
+
+        let mut config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        config.causal = false; // bidirectional for simpler testing
+
+        let layer = gemma_layer_weights(hidden_size, ffn_hidden);
+
+        let input_data = vec![1.0, 2.0, 3.0, 4.0]; // seq_len=1
+        let input = dt(Tensor::new(vec![1, hidden_size], input_data.clone()));
+        let mask = vec![1.0f32; 1];
+
+        let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[1, hidden_size]);
+
+        // With identity attention weights and zero FFN, the attention output should be
+        // the same as the normalized input (which then gets added to the original input).
+        // The output should be finite and reasonably close to the input
+        // (since FFN contributes zero, so output = residual1 + 0 = input + attn_projection(attn_output))
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "Non-finite value in output");
+        }
+    }
+
+    #[test]
+    fn test_rope_changes_qk_at_different_positions() {
+        // RoPE is designed so attention scores depend only on relative positions,
+        // meaning a uniform pos_offset change won't alter scores. Instead, we
+        // verify that RoPE actually rotates Q and K differently at different positions
+        // by directly testing the rope function.
+        let b = cpu();
+        let head_dim = 4;
+
+        let q = dt(Tensor::new(vec![1, 4], vec![1.0, 2.0, 3.0, 4.0]));
+        let k = dt(Tensor::new(vec![1, 4], vec![5.0, 6.0, 7.0, 8.0]));
+
+        let (q_rot0, k_rot0) = b.rope(&q, &k, 0, 10000.0, head_dim, head_dim);
+        let (q_rot5, k_rot5) = b.rope(&q, &k, 5, 10000.0, head_dim, head_dim);
+
+        // At position 0, cos(0)=1, sin(0)=0, so rotation is identity
+        let q0 = q_rot0.tensor.as_f32();
+        assert!((q0[0] - 1.0).abs() < 1e-5, "RoPE at pos 0 should be identity for Q");
+
+        // At position 5, the rotation should be different
+        let q5 = q_rot5.tensor.as_f32();
+        let mut any_different = false;
+        for i in 0..head_dim {
+            if (q0[i] - q5[i]).abs() > 1e-6 {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "RoPE at different positions should produce different Q vectors");
+
+        // Also verify K is rotated differently
+        let k0 = k_rot0.tensor.as_f32();
+        let k5 = k_rot5.tensor.as_f32();
+        let mut k_different = false;
+        for i in 0..head_dim {
+            if (k0[i] - k5[i]).abs() > 1e-6 {
+                k_different = true;
+                break;
+            }
+        }
+        assert!(k_different, "RoPE at different positions should produce different K vectors");
+    }
+
+    #[test]
+    fn test_rope_vs_no_rope_produces_different_outputs() {
+        // Verify that enabling RoPE vs using learned positions (no rotation)
+        // produces different attention outputs for the same input.
+        let b = cpu();
+        let hidden_size = 4;
+        let num_heads = 1;
+        let head_dim = 4;
+        let ffn_hidden = 8;
+
+        let config_rope = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        let mut config_no_rope = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        config_no_rope.position_type = PositionType::Learned;
+
+        let layer = gemma_layer_weights(hidden_size, ffn_hidden);
+
+        let seq_len = 2;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output_rope = transformer_layer_forward(&input, &layer, &config_rope, &b, 0, &mask);
+        let output_no_rope = transformer_layer_forward(&input, &layer, &config_no_rope, &b, 0, &mask);
+
+        let data_r = output_rope.tensor.as_f32();
+        let data_nr = output_no_rope.tensor.as_f32();
+
+        let mut any_different = false;
+        for i in 0..data_r.len() {
+            if (data_r[i] - data_nr[i]).abs() > 1e-6 {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "RoPE should change outputs compared to no-RoPE");
+    }
+
+    #[test]
+    fn test_causal_mask_prevents_future_attention() {
+        let b = cpu();
+        let hidden_size = 4;
+        let num_heads = 1;
+        let head_dim = 4;
+        let ffn_hidden = 8;
+
+        // Causal config
+        let config_causal = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        // Non-causal config
+        let mut config_bidir = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        config_bidir.causal = false;
+
+        let layer = gemma_layer_weights(hidden_size, ffn_hidden);
+
+        let seq_len = 3;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output_causal = transformer_layer_forward(&input, &layer, &config_causal, &b, 0, &mask);
+        let output_bidir = transformer_layer_forward(&input, &layer, &config_bidir, &b, 0, &mask);
+
+        // Outputs should differ because causal mask restricts attention
+        let data_c = output_causal.tensor.as_f32();
+        let data_b = output_bidir.tensor.as_f32();
+
+        let mut any_different = false;
+        for i in 0..data_c.len() {
+            if (data_c[i] - data_b[i]).abs() > 1e-6 {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "Causal and bidirectional should produce different outputs for seq_len > 1");
+    }
+
+    #[test]
+    fn test_gelu_ffn_path() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let config = bert_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        // Create layer with non-zero FFN weights to exercise the GELU path
+        let mut layer = bert_layer_weights(hidden_size, ffn_hidden);
+        // Set ffn_up to have some non-zero values
+        let up_data: Vec<f32> = (0..ffn_hidden * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        layer.ffn_up = dt(Tensor::new(vec![ffn_hidden, hidden_size], up_data));
+
+        let input_data: Vec<f32> = (0..hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let input = dt(Tensor::new(vec![1, hidden_size], input_data));
+        let mask = vec![1.0f32; 1];
+
+        let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[1, hidden_size]);
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "GELU FFN path produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_swiglu_ffn_path() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        // Create layer with non-zero FFN weights to exercise the SwiGLU path
+        let mut layer = gemma_layer_weights(hidden_size, ffn_hidden);
+        let gate_data: Vec<f32> = (0..ffn_hidden * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let up_data: Vec<f32> = (0..ffn_hidden * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        layer.ffn_gate = Some(dt(Tensor::new(vec![ffn_hidden, hidden_size], gate_data)));
+        layer.ffn_up = dt(Tensor::new(vec![ffn_hidden, hidden_size], up_data));
+
+        let input_data: Vec<f32> = (0..hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let input = dt(Tensor::new(vec![1, hidden_size], input_data));
+        let mask = vec![1.0f32; 1];
+
+        let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[1, hidden_size]);
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "SwiGLU FFN path produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_gqa_layer_forward() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 2;
+        let ffn_hidden = 16;
+
+        let mut config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        config.num_kv_heads = num_kv_heads;
+
+        // Need K and V projection weights with correct output dim for kv_heads
+        let kv_dim = num_kv_heads * head_dim; // 4
+        let layer = LayerWeights {
+            attn_norm_w: Some(ones_weight(hidden_size)),
+            attn_norm_b: None,
+            ffn_norm_w: Some(ones_weight(hidden_size)),
+            ffn_norm_b: None,
+            attn_output_norm_w: None,
+            attn_output_norm_b: None,
+            ffn_output_norm_w: None,
+            ffn_output_norm_b: None,
+            attn_q: identity_weight(hidden_size), // [8, 8] -> outputs [seq, 8]
+            attn_k: zero_weight(kv_dim, hidden_size), // [4, 8] -> outputs [seq, 4]
+            attn_v: zero_weight(kv_dim, hidden_size), // [4, 8] -> outputs [seq, 4]
+            attn_output: identity_weight(hidden_size),
+            attn_q_bias: None,
+            attn_k_bias: None,
+            attn_v_bias: None,
+            attn_output_bias: None,
+            ffn_up: zero_weight(ffn_hidden, hidden_size),
+            ffn_down: zero_weight(hidden_size, ffn_hidden),
+            ffn_gate: Some(zero_weight(ffn_hidden, hidden_size)),
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+        };
+
+        let seq_len = 2;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[seq_len, hidden_size]);
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "GQA forward pass produced non-finite value: {}", v);
+        }
+    }
+
+    // ====================================================================
+    // model_forward tests
+    // ====================================================================
+
+    #[test]
+    fn test_model_forward_output_shape_gemma() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+        let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: None,
+        };
+
+        let input_ids = &[1u32, 3, 5];
+        let attention_mask = &[1.0f32, 1.0, 1.0];
+
+        let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
+        assert_eq!(output.shape(), &[3, hidden_size]);
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "model_forward produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_model_forward_output_shape_bert() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+        let max_seq_len = 128;
+        let config = bert_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let pos_emb_data: Vec<f32> = (0..max_seq_len * hidden_size).map(|i| (i as f32) * 0.001).collect();
+
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: Some(dt(Tensor::new(vec![max_seq_len, hidden_size], pos_emb_data))),
+            embedding_norm_w: Some(ones_weight(hidden_size)),
+            embedding_norm_b: Some(zeros_bias(hidden_size)),
+            layers: vec![bert_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: Some(zeros_bias(hidden_size)),
+        };
+
+        let input_ids = &[0u32, 2, 4, 6];
+        let attention_mask = &[1.0f32, 1.0, 1.0, 1.0];
+
+        let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
+        assert_eq!(output.shape(), &[4, hidden_size]);
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "BERT model_forward produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_model_forward_embedding_scale() {
+        let b = cpu();
+        let hidden_size = 4;
+        let num_heads = 1;
+        let head_dim = 4;
+        let ffn_hidden = 8;
+        let vocab_size = 4;
+
+        let mut config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        config.embedding_scale = 2.0;
+        config.vocab_size = vocab_size;
+
+        let embedding_data = vec![
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: None,
+        };
+
+        let input_ids = &[0u32];
+        let attention_mask = &[1.0f32];
+
+        let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
+        assert_eq!(output.shape(), &[1, hidden_size]);
+        // With scale=2.0, the embedding is doubled before going through the layers.
+        // Just verify the output is finite and the function runs without error.
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "Scaled embedding model_forward produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_model_forward_multiple_layers() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+
+        let mut config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        config.num_layers = 3;
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![
+                gemma_layer_weights(hidden_size, ffn_hidden),
+                gemma_layer_weights(hidden_size, ffn_hidden),
+                gemma_layer_weights(hidden_size, ffn_hidden),
+            ],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: None,
+        };
+
+        let input_ids = &[1u32, 5];
+        let attention_mask = &[1.0f32, 1.0];
+
+        let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
+        assert_eq!(output.shape(), &[2, hidden_size]);
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "Multi-layer model_forward produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_model_forward_single_token() {
+        let b = cpu();
+        let hidden_size = 4;
+        let num_heads = 1;
+        let head_dim = 4;
+        let ffn_hidden = 8;
+        let vocab_size = 8;
+        let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: None,
+        };
+
+        let input_ids = &[3u32];
+        let attention_mask = &[1.0f32];
+
+        let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
+        assert_eq!(output.shape(), &[1, hidden_size]);
+        for &v in output.tensor.as_f32() {
+            assert!(v.is_finite(), "Single token model_forward produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_softcap_changes_output() {
+        let b = cpu();
+        let hidden_size = 4;
+        let num_heads = 1;
+        let head_dim = 4;
+        let ffn_hidden = 8;
+
+        let mut config_no_cap = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        config_no_cap.attn_logit_softcap = 0.0;
+        config_no_cap.causal = false;
+
+        let mut config_with_cap = config_no_cap.clone();
+        config_with_cap.attn_logit_softcap = 50.0;
+
+        let layer = gemma_layer_weights(hidden_size, ffn_hidden);
+
+        let seq_len = 2;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 5.0).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output_no_cap = transformer_layer_forward(&input, &layer, &config_no_cap, &b, 0, &mask);
+        let output_with_cap = transformer_layer_forward(&input, &layer, &config_with_cap, &b, 0, &mask);
+
+        // Softcap should change outputs (unless scores are very small)
+        let data_no = output_no_cap.tensor.as_f32();
+        let data_cap = output_with_cap.tensor.as_f32();
+        let mut any_diff = false;
+        for i in 0..data_no.len() {
+            if (data_no[i] - data_cap[i]).abs() > 1e-6 {
+                any_diff = true;
+                break;
+            }
+        }
+        assert!(any_diff, "Softcap should change transformer outputs");
+    }
+
+    // ====================================================================
+    // multi_head_attention direct tests
+    // ====================================================================
+
+    #[test]
+    fn test_multi_head_attention_output_shape() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+
+        let mut config = gemma_config(hidden_size, num_heads, head_dim, 16);
+        config.causal = false;
+        config.position_type = PositionType::Learned; // skip RoPE for this test
+
+        let seq_len = 3;
+        let q = dt(Tensor::new(vec![seq_len, hidden_size], vec![0.1; seq_len * hidden_size]));
+        let k = dt(Tensor::new(vec![seq_len, hidden_size], vec![0.1; seq_len * hidden_size]));
+        let v = dt(Tensor::new(vec![seq_len, hidden_size], vec![0.1; seq_len * hidden_size]));
+        let mask = vec![1.0f32; seq_len];
+
+        let output = multi_head_attention(q, k, v, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[seq_len, hidden_size]);
+    }
+
+    #[test]
+    fn test_multi_head_attention_uniform_produces_uniform() {
+        // When Q, K, V are all the same uniform value, all attention probs
+        // should be equal (1/seq_len), and the output should equal the
+        // average of V (which is the same uniform value).
+        let b = cpu();
+        let hidden_size = 4;
+        let num_heads = 1;
+        let head_dim = 4;
+
+        let mut config = gemma_config(hidden_size, num_heads, head_dim, 8);
+        config.causal = false;
+        config.position_type = PositionType::Learned;
+
+        let seq_len = 3;
+        let val = 0.5f32;
+        let q = dt(Tensor::new(vec![seq_len, hidden_size], vec![val; seq_len * hidden_size]));
+        let k = dt(Tensor::new(vec![seq_len, hidden_size], vec![val; seq_len * hidden_size]));
+        let v = dt(Tensor::new(vec![seq_len, hidden_size], vec![val; seq_len * hidden_size]));
+        let mask = vec![1.0f32; seq_len];
+
+        let output = multi_head_attention(q, k, v, &config, &b, 0, &mask);
+        let data = output.tensor.as_f32();
+
+        // All outputs should be close to val
+        for &v_out in data {
+            assert!(
+                (v_out - val).abs() < 1e-4,
+                "Uniform attention should produce uniform output, got {}",
+                v_out
+            );
+        }
+    }
+
+    #[test]
+    fn test_attention_mask_excludes_padding() {
+        // Verify that masked positions (mask=0) get zero attention weight.
+        let b = cpu();
+        let hidden_size = 4;
+        let num_heads = 1;
+        let head_dim = 4;
+
+        let mut config = gemma_config(hidden_size, num_heads, head_dim, 8);
+        config.causal = false;
+        config.position_type = PositionType::Learned;
+
+        // seq_len = 3, but last token is padding
+        let seq_len = 3;
+        let mask_all = vec![1.0f32; seq_len];
+        let mask_pad = vec![1.0f32, 1.0, 0.0]; // last token is padding
+
+        // Use distinct V values so the output differs when padding is excluded
+        let q_data: Vec<f32> = vec![0.1; seq_len * hidden_size];
+        let k_data: Vec<f32> = vec![0.1; seq_len * hidden_size];
+        let mut v_data = vec![1.0f32; seq_len * hidden_size];
+        // Make the padding token's V values large and distinct
+        for i in 0..hidden_size {
+            v_data[2 * hidden_size + i] = 100.0;
+        }
+
+        let q1 = dt(Tensor::new(vec![seq_len, hidden_size], q_data.clone()));
+        let k1 = dt(Tensor::new(vec![seq_len, hidden_size], k_data.clone()));
+        let v1 = dt(Tensor::new(vec![seq_len, hidden_size], v_data.clone()));
+        let out_all = multi_head_attention(q1, k1, v1, &config, &b, 0, &mask_all);
+
+        let q2 = dt(Tensor::new(vec![seq_len, hidden_size], q_data));
+        let k2 = dt(Tensor::new(vec![seq_len, hidden_size], k_data));
+        let v2 = dt(Tensor::new(vec![seq_len, hidden_size], v_data));
+        let out_pad = multi_head_attention(q2, k2, v2, &config, &b, 0, &mask_pad);
+
+        // The outputs should differ because the masked version excludes the padding token
+        let data_all = out_all.tensor.as_f32();
+        let data_pad = out_pad.tensor.as_f32();
+        let mut any_diff = false;
+        for i in 0..data_all.len() {
+            if (data_all[i] - data_pad[i]).abs() > 1e-4 {
+                any_diff = true;
+                break;
+            }
+        }
+        assert!(any_diff, "Attention mask should change outputs when padding token has different V values");
+    }
+
+    #[test]
+    fn test_model_forward_input_id_out_of_range() {
+        let b = cpu();
+        let hidden_size = 4;
+        let num_heads = 1;
+        let head_dim = 4;
+        let ffn_hidden = 8;
+        let vocab_size = 8;
+        let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: ones_weight(hidden_size),
+            output_norm_b: None,
+        };
+
+        // Token ID 100 exceeds vocab_size=8 (note: config has vocab_size=16, override)
+        let mut config = config;
+        config.vocab_size = vocab_size;
+        let input_ids = &[100u32]; // out of range
+        let attention_mask = &[1.0f32];
+
+        let result = model_forward(input_ids, attention_mask, &weights, &config, &b, 0);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("exceeds vocab_size"), "Error: {}", err_msg);
+    }
+}

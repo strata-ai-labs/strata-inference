@@ -22,8 +22,8 @@ use super::Tokenizer;
 /// The continuation prefix for WordPiece subwords.
 const CONTINUATION_PREFIX: &str = "##";
 
-/// Maximum sequence length (including special tokens).
-const MAX_SEQ_LEN: usize = 512;
+/// Default maximum sequence length (including special tokens).
+const DEFAULT_MAX_SEQ_LEN: usize = 512;
 
 /// WordPiece tokenizer compatible with BERT-family vocabularies.
 ///
@@ -44,6 +44,8 @@ pub struct WordPieceTokenizer {
     unk_id: u32,
     /// [PAD] token ID (padding).
     pad_id: u32,
+    /// Maximum sequence length (including special tokens).
+    max_seq_len: usize,
 }
 
 impl WordPieceTokenizer {
@@ -85,7 +87,17 @@ impl WordPieceTokenizer {
             sep_id,
             unk_id,
             pad_id,
+            max_seq_len: DEFAULT_MAX_SEQ_LEN,
         }
+    }
+
+    /// Set the maximum sequence length (including special tokens).
+    ///
+    /// Defaults to 512. Can be overridden by the model's context_length from
+    /// GGUF metadata.
+    pub fn with_max_seq_len(mut self, max_seq_len: usize) -> Self {
+        self.max_seq_len = max_seq_len;
+        self
     }
 
     /// Convenience constructor from a `vocab.txt` file content (one token per line).
@@ -219,9 +231,10 @@ impl Tokenizer for WordPieceTokenizer {
         let words = self.basic_tokenize(&normalized);
 
         let max_content_len = if add_special_tokens {
-            MAX_SEQ_LEN - 2 // Reserve space for [CLS] and [SEP]
+            // Reserve space for [CLS] and [SEP]; need at least 2 for special tokens
+            self.max_seq_len.saturating_sub(2)
         } else {
-            MAX_SEQ_LEN
+            self.max_seq_len
         };
 
         let mut tokens = Vec::new();
@@ -961,7 +974,7 @@ mod tests {
         let input: String = (0..600).map(|_| "a").collect::<Vec<_>>().join(" ");
         let ids = tok.encode(&input, true);
 
-        assert!(ids.len() <= MAX_SEQ_LEN);
+        assert!(ids.len() <= DEFAULT_MAX_SEQ_LEN);
         assert_eq!(ids[0], 101); // CLS
         assert_eq!(*ids.last().unwrap(), 102); // SEP
     }
@@ -1124,5 +1137,64 @@ mod tests {
         assert!(unicode_general_category_p(0x00BF)); // inverted question mark
         assert!(unicode_general_category_p(0x2014)); // em dash
         assert!(!unicode_general_category_p(0x0041)); // 'A'
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom max_seq_len
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_wordpiece_custom_max_seq_len() {
+        // Build a vocab with single-letter tokens.
+        let mut tokens: Vec<String> = (0..101).map(|_| "[PAD]".to_string()).collect();
+        tokens[0] = "[PAD]".to_string();
+        tokens[100] = "[UNK]".to_string();
+        tokens.push("[CLS]".to_string()); // 101
+        tokens.push("[SEP]".to_string()); // 102
+        for c in b'a'..=b'z' {
+            tokens.push(String::from(c as char));
+        }
+        let tok = WordPieceTokenizer::new(tokens, 101, 102, 100, 0)
+            .with_max_seq_len(10);
+
+        // Create input with many words
+        let input: String = (0..100).map(|_| "a").collect::<Vec<_>>().join(" ");
+        let ids = tok.encode(&input, true);
+
+        // Should be truncated to max_seq_len=10 (including CLS + SEP)
+        assert!(ids.len() <= 10, "Expected <= 10 tokens, got {}", ids.len());
+        assert_eq!(ids[0], 101); // CLS
+        assert_eq!(*ids.last().unwrap(), 102); // SEP
+    }
+
+    #[test]
+    fn test_wordpiece_default_max_seq_len() {
+        let tok = make_tokenizer();
+        // Default max_seq_len should be 512
+        // We can't directly access the field, but we can verify behavior:
+        // encoding a very long input should truncate to 512
+        // (already tested in test_max_sequence_length)
+        // Just verify the tokenizer works at all
+        let ids = tok.encode("hello", true);
+        assert_eq!(ids, vec![101, 103, 102]);
+    }
+
+    #[test]
+    fn test_wordpiece_max_seq_len_underflow() {
+        // max_seq_len=1 with add_special_tokens=true would underflow
+        // if we used subtraction instead of saturating_sub.
+        let tok = make_tokenizer().with_max_seq_len(1);
+        let ids = tok.encode("hello", true);
+        // With max_content_len=0, no content tokens, just [CLS] + [SEP]
+        assert_eq!(ids, vec![101, 102]);
+    }
+
+    #[test]
+    fn test_wordpiece_max_seq_len_zero() {
+        // max_seq_len=0 should not panic
+        let tok = make_tokenizer().with_max_seq_len(0);
+        let ids = tok.encode("hello", true);
+        // saturating_sub(2) = 0, no content, just [CLS] + [SEP]
+        assert_eq!(ids, vec![101, 102]);
     }
 }
