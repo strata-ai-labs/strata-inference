@@ -192,6 +192,10 @@ pub fn create_tokenizer_from_gguf(
             .get_bool("tokenizer.ggml.add_space_prefix")
             .unwrap_or(true);
 
+        // Read the pre-tokenizer type (determines regex pattern for rank-based BPE).
+        // SentencePiece models typically don't have this key.
+        let pre_type = gguf.get_str("tokenizer.ggml.pre");
+
         Ok(Box::new(BpeTokenizer::new(
             tokens,
             scores,
@@ -203,6 +207,7 @@ pub fn create_tokenizer_from_gguf(
             add_bos,
             add_eos,
             add_space_prefix,
+            pre_type,
         )))
     }
 }
