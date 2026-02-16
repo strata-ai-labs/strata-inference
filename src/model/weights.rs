@@ -78,15 +78,18 @@ pub struct ModelWeights {
 // ---------------------------------------------------------------------------
 
 /// Map a GGUF tensor type to our internal TensorDtype.
-///
-/// Only F32, F16, Q8_0, and Q4_0 are supported for inference. Other types
-/// produce an error.
 fn gguf_dtype_to_tensor_dtype(dtype: GgufTensorType) -> Result<TensorDtype, InferenceError> {
     match dtype {
         GgufTensorType::F32 => Ok(TensorDtype::F32),
         GgufTensorType::F16 => Ok(TensorDtype::F16),
         GgufTensorType::Q8_0 => Ok(TensorDtype::Q8_0),
         GgufTensorType::Q4_0 => Ok(TensorDtype::Q4_0),
+        GgufTensorType::Q4_1 => Ok(TensorDtype::Q4_1),
+        GgufTensorType::Q5_0 => Ok(TensorDtype::Q5_0),
+        GgufTensorType::Q5_1 => Ok(TensorDtype::Q5_1),
+        GgufTensorType::Q4K => Ok(TensorDtype::Q4_K),
+        GgufTensorType::Q5K => Ok(TensorDtype::Q5_K),
+        GgufTensorType::Q6K => Ok(TensorDtype::Q6_K),
         other => Err(InferenceError::Model(format!(
             "unsupported tensor dtype for inference: {}",
             other
@@ -142,7 +145,8 @@ fn load_tensor(
             }
             Tensor::from_f16(shape, u16_data)
         }
-        TensorDtype::Q8_0 | TensorDtype::Q4_0 => {
+        _ => {
+            // All remaining types are quantized (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K)
             Tensor::from_quantized(shape, tensor_dtype, gguf_tensor.data.to_vec())
         }
     };
@@ -731,9 +735,16 @@ mod tests {
         assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::F16).unwrap(), TensorDtype::F16);
         assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q8_0).unwrap(), TensorDtype::Q8_0);
         assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q4_0).unwrap(), TensorDtype::Q4_0);
-        // Unsupported types should error
-        assert!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q4_1).is_err());
+        // New K-quant and non-K types should be supported
+        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q4_1).unwrap(), TensorDtype::Q4_1);
+        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q5_0).unwrap(), TensorDtype::Q5_0);
+        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q5_1).unwrap(), TensorDtype::Q5_1);
+        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q4K).unwrap(), TensorDtype::Q4_K);
+        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q5K).unwrap(), TensorDtype::Q5_K);
+        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q6K).unwrap(), TensorDtype::Q6_K);
+        // Truly unsupported types should error
         assert!(gguf_dtype_to_tensor_dtype(GgufTensorType::BF16).is_err());
+        assert!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q2K).is_err());
     }
 
     #[test]
@@ -1399,21 +1410,40 @@ mod tests {
 
     #[test]
     fn test_unsupported_gguf_dtype_returns_error() {
-        // Q4_1 (dtype_id=3) is not supported for inference.
-        // Q4_1 block: 20 bytes per 32 elements
-        let data = vec![0u8; 20]; // 1 Q4_1 block
+        // BF16 (dtype_id=30) is not supported for inference.
+        // BF16: 2 bytes per element, block_size=1
+        let data = vec![0u8; 64]; // 32 BF16 elements
         let gguf_bytes = build_gguf_with_tensors(&[
-            ("q4_1.weight", &[32], 3, &data),
+            ("bf16.weight", &[32], 30, &data),
         ]);
         let path = write_temp_gguf("unsupported_dtype", &gguf_bytes);
 
         let gguf = GgufFile::open(&path).unwrap();
         let backend = CpuBackend::new();
-        let result = load_tensor(&gguf, "q4_1.weight", &backend);
+        let result = load_tensor(&gguf, "bf16.weight", &backend);
 
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("unsupported"), "Error: {}", err_msg);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_load_q4_1_tensor() {
+        // Q4_1 (dtype_id=3) is now supported. 20 bytes per block of 32 elements.
+        let data = vec![0u8; 20]; // 1 Q4_1 block
+        let gguf_bytes = build_gguf_with_tensors(&[
+            ("q4_1.weight", &[32], 3, &data),
+        ]);
+        let path = write_temp_gguf("q4_1_load", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let dt = load_tensor(&gguf, "q4_1.weight", &backend).unwrap();
+
+        assert_eq!(dt.dtype(), TensorDtype::Q4_1);
+        assert_eq!(dt.shape(), &[32]);
 
         std::fs::remove_file(&path).ok();
     }

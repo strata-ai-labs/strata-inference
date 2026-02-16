@@ -753,6 +753,17 @@ impl ComputeBackend for CudaBackend {
                 trace!(m, k, n, "CUDA quantized_matmul Q4_0");
                 self.fn_quantized_matmul_q4_0
             }
+            _ if dtype.is_quantized() => {
+                // K-quant and other types without native CUDA kernels: dequant fallback.
+                tracing::debug!(
+                    ?dtype,
+                    "CUDA quantized_matmul: no native kernel for {:?}, using dequant fallback",
+                    dtype
+                );
+                let weights_f32 = weights.as_tensor().to_f32();
+                let weights_f32_dev = self.upload(&weights_f32);
+                return self.matmul_transpose(input, &weights_f32_dev);
+            }
             _ => panic!("quantized_matmul: unsupported dtype {:?}", dtype),
         };
 

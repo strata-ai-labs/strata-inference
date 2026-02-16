@@ -26,13 +26,13 @@ pub(crate) fn linear_forward(
     backend: &dyn ComputeBackend,
 ) -> DeviceTensor {
     let result = match weight.dtype() {
-        TensorDtype::Q8_0 | TensorDtype::Q4_0 => {
-            // quantized_matmul: Q weights [N, K] x f32 input [M, K] -> [M, N]
-            backend.quantized_matmul(weight, input)
-        }
         TensorDtype::F32 | TensorDtype::F16 => {
             // matmul_transpose: input [M, K] x weight [N, K]^T -> [M, N]
             backend.matmul_transpose(input, weight)
+        }
+        _ => {
+            // quantized_matmul: Q weights [N, K] x f32 input [M, K] -> [M, N]
+            backend.quantized_matmul(weight, input)
         }
     };
 
