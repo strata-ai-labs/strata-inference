@@ -627,10 +627,17 @@ pub fn model_forward(
 
     // 4b. Add token type embeddings (BERT only — hardcoded type 0 = "Sentence A")
     if let Some(ref type_emb) = weights.token_type_embedding {
-        // Look up row 0 for every token (all same type)
-        let type_ids = vec![0u32; seq_len];
-        let type_embeddings = backend.embedding_lookup(type_emb, &type_ids);
-        hidden = backend.add(&hidden, &type_embeddings);
+        let type_shape = type_emb.shape();
+        if type_shape.len() == 1 {
+            // 1D tensor (e.g., BGE-M3 with token_type_count=1): broadcast-add
+            // the single vector to every position via add_bias [M,N] + [N].
+            hidden = backend.add_bias(&hidden, type_emb);
+        } else {
+            // 2D tensor: look up row 0 for every token (all same type)
+            let type_ids = vec![0u32; seq_len];
+            let type_embeddings = backend.embedding_lookup(type_emb, &type_ids);
+            hidden = backend.add(&hidden, &type_embeddings);
+        }
     }
 
     // 5. Embedding normalization (BERT only)
