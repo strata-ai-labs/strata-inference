@@ -358,6 +358,10 @@ mod tests {
             ffn_gate: Some(zero_weight(ffn, h)),
             ffn_up_bias: None,
             ffn_down_bias: None,
+            attn_q_norm_w: None,
+            attn_k_norm_w: None,
+            attn_post_norm_w: None,
+            ffn_post_norm_w: None,
         };
 
         ModelWeights {
@@ -366,7 +370,7 @@ mod tests {
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![layer],
-            output_norm_w: ones_weight(h),
+            output_norm_w: Some(ones_weight(h)),
             output_norm_b: None,
             output_projection: None,
         }

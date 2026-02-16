@@ -8,8 +8,7 @@ use crate::gguf::GgufFile;
 use crate::gguf::quant::GgufTensorType;
 use crate::gguf::tensor::load_tensor_by_name;
 use crate::tensor::{Tensor, TensorDtype};
-use super::config::ModelConfig;
-use super::config::PositionType;
+use super::config::{ModelArch, ModelConfig, PositionType};
 
 /// Weights for a single transformer layer.
 #[derive(Debug, Clone)]
@@ -46,6 +45,14 @@ pub struct LayerWeights {
     // FFN biases (BERT only)
     pub ffn_up_bias: Option<DeviceTensor>,
     pub ffn_down_bias: Option<DeviceTensor>,
+
+    // Per-head Q/K normalization (GemmaEmbedding only)
+    pub attn_q_norm_w: Option<DeviceTensor>,
+    pub attn_k_norm_w: Option<DeviceTensor>,
+
+    // Post-projection norms applied BEFORE residual (GemmaEmbedding only)
+    pub attn_post_norm_w: Option<DeviceTensor>,
+    pub ffn_post_norm_w: Option<DeviceTensor>,
 }
 
 /// All model weights loaded from a GGUF file.
@@ -65,7 +72,8 @@ pub struct ModelWeights {
     pub layers: Vec<LayerWeights>,
 
     /// Final output normalization weight: [hidden_size]
-    pub output_norm_w: DeviceTensor,
+    /// `None` for BERT (which does per-layer post-norm instead of a global final norm).
+    pub output_norm_w: Option<DeviceTensor>,
     pub output_norm_b: Option<DeviceTensor>,
 
     /// Output projection (lm_head): [vocab_size, hidden_size]
@@ -377,6 +385,34 @@ impl ModelWeights {
                 None
             };
 
+            // GemmaEmbedding-specific per-layer tensors
+            let (attn_q_norm_w, attn_k_norm_w, attn_post_norm_w, ffn_post_norm_w) =
+                if config.arch == ModelArch::GemmaEmbedding {
+                    let qn = load_tensor_optional(
+                        gguf,
+                        &format!("{}.attn_q_norm.weight", prefix),
+                        backend,
+                    )?;
+                    let kn = load_tensor_optional(
+                        gguf,
+                        &format!("{}.attn_k_norm.weight", prefix),
+                        backend,
+                    )?;
+                    let apn = load_tensor_optional(
+                        gguf,
+                        &format!("{}.post_attention_norm.weight", prefix),
+                        backend,
+                    )?;
+                    let fpn = load_tensor_optional(
+                        gguf,
+                        &format!("{}.post_ffw_norm.weight", prefix),
+                        backend,
+                    )?;
+                    (qn, kn, apn, fpn)
+                } else {
+                    (None, None, None, None)
+                };
+
             layers.push(LayerWeights {
                 attn_norm_w,
                 attn_norm_b,
@@ -399,12 +435,16 @@ impl ModelWeights {
                 ffn_gate,
                 ffn_up_bias,
                 ffn_down_bias,
+                attn_q_norm_w,
+                attn_k_norm_w,
+                attn_post_norm_w,
+                ffn_post_norm_w,
             });
         }
 
         // -- Output normalization --
 
-        let output_norm_w = load_tensor(gguf, "output_norm.weight", backend)?;
+        let output_norm_w = load_tensor_optional(gguf, "output_norm.weight", backend)?;
         let output_norm_b = if config.has_bias {
             load_tensor_optional(gguf, "output_norm.bias", backend)?
         } else {
@@ -791,7 +831,7 @@ mod tests {
         assert_eq!(weights.token_embedding.shape(), &[64, 32]);
 
         // Verify output norm shape: [hidden_size]
-        assert_eq!(weights.output_norm_w.shape(), &[32]);
+        assert_eq!(weights.output_norm_w.as_ref().unwrap().shape(), &[32]);
 
         // Verify attention weight shapes: [hidden_size, hidden_size]
         assert_eq!(layer.attn_q.shape(), &[32, 32]);
@@ -1212,7 +1252,7 @@ mod tests {
         let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
 
         // F16 tensors should be loaded as F16
-        assert_eq!(weights.output_norm_w.dtype(), TensorDtype::F16);
+        assert_eq!(weights.output_norm_w.as_ref().unwrap().dtype(), TensorDtype::F16);
         assert_eq!(weights.layers[0].attn_norm_w.as_ref().unwrap().dtype(), TensorDtype::F16);
         assert_eq!(weights.layers[0].ffn_norm_w.as_ref().unwrap().dtype(), TensorDtype::F16);
 
@@ -1444,6 +1484,52 @@ mod tests {
 
         assert_eq!(dt.dtype(), TensorDtype::Q4_1);
         assert_eq!(dt.shape(), &[32]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_bert_output_norm_w_is_none_when_absent() {
+        // Build a BERT model where output_norm.weight is NOT in the GGUF.
+        // Since output_norm_w is now optional, this should succeed with None.
+        let config = bert_config(1, 32);
+        let h = config.hidden_size;
+        let ffn = config.ffn_hidden;
+        let v = config.vocab_size;
+        let max_seq = config.max_seq_len;
+
+        let mut tensor_specs: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+
+        tensor_specs.push(("token_embd.weight".to_string(), vec![h as u64, v as u64], 0, f32_tensor_data(&vec![0.1f32; v * h])));
+        tensor_specs.push(("position_embd.weight".to_string(), vec![h as u64, max_seq as u64], 0, f32_tensor_data(&vec![0.01f32; max_seq * h])));
+        // NO output_norm.weight
+
+        let prefix = "blk.0";
+        for name in &["attn_q", "attn_k", "attn_v", "attn_output"] {
+            tensor_specs.push((format!("{}.{}.weight", prefix, name), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
+        }
+        tensor_specs.push((format!("{}.attn_output_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensor_specs.push((format!("{}.attn_output_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((format!("{}.ffn_up.weight", prefix), vec![h as u64, ffn as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
+        tensor_specs.push((format!("{}.ffn_down.weight", prefix), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
+        tensor_specs.push((format!("{}.layer_output_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensor_specs.push((format!("{}.layer_output_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("bert_no_output_norm", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        // output_norm_w should be None for BERT when the tensor is absent
+        assert!(weights.output_norm_w.is_none());
+        assert!(weights.output_norm_b.is_none());
 
         std::fs::remove_file(&path).ok();
     }
