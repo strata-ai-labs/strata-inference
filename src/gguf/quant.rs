@@ -182,6 +182,16 @@ impl std::fmt::Display for GgufTensorType {
 }
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Number of elements per K-quant super-block.
+pub const QK_K: usize = 256;
+
+/// Size of the packed scale/min array in Q4_K and Q5_K blocks.
+pub const K_SCALE_SIZE: usize = 12;
+
+// ---------------------------------------------------------------------------
 // Q8_0 quantization block: 34 bytes per block of 32 values
 // ---------------------------------------------------------------------------
 
@@ -226,6 +236,129 @@ const _: () = assert!(std::mem::size_of::<BlockQ4_0>() == 18);
 
 /// Number of elements per Q4_0 block.
 pub const QK4_0: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Q4_1 quantization block: 20 bytes per block of 32 values
+// ---------------------------------------------------------------------------
+
+/// Q4_1 block: 4-bit quantization with f16 scale (d) and f16 minimum (m).
+///
+/// Layout: `d: f16 (2 bytes) | m: f16 (2 bytes) | qs: [u8; 16] (16 bytes)` = 20 bytes.
+/// Dequantization: `y[j] = (low_nibble) * d + m`
+///                 `y[j+16] = (high_nibble) * d + m`
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ4_1 {
+    pub d: u16,
+    pub m: u16,
+    pub qs: [u8; 16],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockQ4_1>() == 20);
+
+/// Number of elements per Q4_1 block.
+pub const QK4_1: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Q5_0 quantization block: 22 bytes per block of 32 values
+// ---------------------------------------------------------------------------
+
+/// Q5_0 block: 5-bit quantization with f16 scale (d), no minimum.
+///
+/// Layout: `d: f16 (2 bytes) | qh: [u8; 4] (4 bytes) | qs: [u8; 16] (16 bytes)` = 22 bytes.
+/// The 5th bit for each value is stored in qh (as a 32-bit mask).
+/// Dequantization: `y[j] = ((nibble | high_bit) - 16) * d`
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ5_0 {
+    pub d: u16,
+    pub qh: [u8; 4],
+    pub qs: [u8; 16],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockQ5_0>() == 22);
+
+/// Number of elements per Q5_0 block.
+pub const QK5_0: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Q5_1 quantization block: 24 bytes per block of 32 values
+// ---------------------------------------------------------------------------
+
+/// Q5_1 block: 5-bit quantization with f16 scale (d) and f16 minimum (m).
+///
+/// Layout: `d: f16 (2 bytes) | m: f16 (2 bytes) | qh: [u8; 4] (4 bytes) | qs: [u8; 16] (16 bytes)` = 24 bytes.
+/// Dequantization: `y[j] = (nibble | high_bit) * d + m`
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ5_1 {
+    pub d: u16,
+    pub m: u16,
+    pub qh: [u8; 4],
+    pub qs: [u8; 16],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockQ5_1>() == 24);
+
+/// Number of elements per Q5_1 block.
+pub const QK5_1: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Q4_K quantization block: 144 bytes per super-block of 256 values
+// ---------------------------------------------------------------------------
+
+/// Q4_K block: 4-bit K-quant with 6-bit packed scales and mins.
+///
+/// 8 sub-blocks of 32 values each. Scales and mins are quantized with 6 bits
+/// and packed into 12 bytes.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ4K {
+    pub d: u16,
+    pub dmin: u16,
+    pub scales: [u8; K_SCALE_SIZE],
+    pub qs: [u8; QK_K / 2],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockQ4K>() == 144);
+
+// ---------------------------------------------------------------------------
+// Q5_K quantization block: 176 bytes per super-block of 256 values
+// ---------------------------------------------------------------------------
+
+/// Q5_K block: 5-bit K-quant with 6-bit packed scales and mins.
+///
+/// Same scale structure as Q4_K, but with an extra qh array for the 5th bit.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ5K {
+    pub d: u16,
+    pub dmin: u16,
+    pub scales: [u8; K_SCALE_SIZE],
+    pub qh: [u8; QK_K / 8],
+    pub qs: [u8; QK_K / 2],
+}
+
+const _: () = assert!(std::mem::size_of::<BlockQ5K>() == 176);
+
+// ---------------------------------------------------------------------------
+// Q6_K quantization block: 210 bytes per super-block of 256 values
+// ---------------------------------------------------------------------------
+
+/// Q6_K block: 6-bit K-quant with 8-bit signed scales, no mins.
+///
+/// 16 sub-blocks of 16 values each. Each value is 6 bits: 4 bits in ql,
+/// 2 bits in qh. Scales are direct 8-bit signed integers.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ6K {
+    pub ql: [u8; QK_K / 2],
+    pub qh: [u8; QK_K / 4],
+    pub scales: [i8; QK_K / 16],
+    pub d: u16,
+}
+
+const _: () = assert!(std::mem::size_of::<BlockQ6K>() == 210);
 
 // ---------------------------------------------------------------------------
 // IEEE 754 half-precision (f16) conversion
@@ -297,6 +430,304 @@ pub fn dequantize_q4_0(blocks: &[BlockQ4_0]) -> Vec<f32> {
         output.extend_from_slice(&tmp);
     }
     output
+}
+
+// ---------------------------------------------------------------------------
+// K-quant scale extraction helper
+// ---------------------------------------------------------------------------
+
+/// Extract 6-bit scale and min values from the packed Q4_K / Q5_K scales array.
+///
+/// Ported from llama.cpp's `get_scale_min_k4()`. The 12-byte scales array packs
+/// 8 pairs of (scale, min) values using 6 bits each.
+#[inline]
+pub fn get_scale_min_k4(j: usize, scales: &[u8; K_SCALE_SIZE]) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        (
+            (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4),
+            (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-K dequantization functions
+// ---------------------------------------------------------------------------
+
+/// Dequantize a slice of Q4_1 blocks into f32 values.
+///
+/// Like Q4_0 but unsigned with a minimum offset: `y = nibble * d + m`
+pub fn dequantize_q4_1(blocks: &[BlockQ4_1]) -> Vec<f32> {
+    let mut output = Vec::with_capacity(blocks.len() * QK4_1);
+    for block in blocks {
+        let d = f16_to_f32(block.d);
+        let m = f16_to_f32(block.m);
+        let mut tmp = [0.0f32; QK4_1];
+        for j in 0..QK4_1 / 2 {
+            let x0 = (block.qs[j] & 0x0F) as f32;
+            let x1 = (block.qs[j] >> 4) as f32;
+            tmp[j] = x0 * d + m;
+            tmp[j + QK4_1 / 2] = x1 * d + m;
+        }
+        output.extend_from_slice(&tmp);
+    }
+    output
+}
+
+/// Dequantize a slice of Q5_0 blocks into f32 values.
+///
+/// 5-bit signed quantization: `y = ((nibble | high_bit) - 16) * d`
+pub fn dequantize_q5_0(blocks: &[BlockQ5_0]) -> Vec<f32> {
+    let mut output = Vec::with_capacity(blocks.len() * QK5_0);
+    for block in blocks {
+        let d = f16_to_f32(block.d);
+        let qh = u32::from_le_bytes(block.qh);
+        let mut tmp = [0.0f32; QK5_0];
+        for j in 0..QK5_0 / 2 {
+            let xh_0 = ((qh >> (j as u32)) << 4) & 0x10;
+            let xh_1 = ((qh >> (j as u32 + 12))) & 0x10;
+            let x0 = ((block.qs[j] & 0x0F) as u32 | xh_0) as i32 - 16;
+            let x1 = ((block.qs[j] >> 4) as u32 | xh_1) as i32 - 16;
+            tmp[j] = x0 as f32 * d;
+            tmp[j + QK5_0 / 2] = x1 as f32 * d;
+        }
+        output.extend_from_slice(&tmp);
+    }
+    output
+}
+
+/// Dequantize a slice of Q5_1 blocks into f32 values.
+///
+/// 5-bit unsigned with minimum: `y = (nibble | high_bit) * d + m`
+pub fn dequantize_q5_1(blocks: &[BlockQ5_1]) -> Vec<f32> {
+    let mut output = Vec::with_capacity(blocks.len() * QK5_1);
+    for block in blocks {
+        let d = f16_to_f32(block.d);
+        let m = f16_to_f32(block.m);
+        let qh = u32::from_le_bytes(block.qh);
+        let mut tmp = [0.0f32; QK5_1];
+        for j in 0..QK5_1 / 2 {
+            let xh_0 = ((qh >> (j as u32)) << 4) & 0x10;
+            let xh_1 = ((qh >> (j as u32 + 12))) & 0x10;
+            let x0 = (block.qs[j] & 0x0F) as u32 | xh_0;
+            let x1 = (block.qs[j] >> 4) as u32 | xh_1;
+            tmp[j] = x0 as f32 * d + m;
+            tmp[j + QK5_1 / 2] = x1 as f32 * d + m;
+        }
+        output.extend_from_slice(&tmp);
+    }
+    output
+}
+
+// ---------------------------------------------------------------------------
+// K-quant dequantization functions
+// ---------------------------------------------------------------------------
+
+/// Dequantize a slice of Q4_K blocks into f32 values.
+///
+/// 8 sub-blocks of 32 values each, 4-bit quants with 6-bit packed scales/mins.
+/// `y = d * scale * (q & 0xF) - dmin * min_val`
+pub fn dequantize_q4_k(blocks: &[BlockQ4K]) -> Vec<f32> {
+    let mut output = Vec::with_capacity(blocks.len() * QK_K);
+    for block in blocks {
+        let d = f16_to_f32(block.d);
+        let dmin = f16_to_f32(block.dmin);
+        let q = &block.qs;
+
+        let mut is = 0usize;
+        let mut q_offset = 0usize;
+        for _j in 0..4 {
+            // 64 values per iteration (two sub-blocks of 32)
+            let (sc1, m1) = get_scale_min_k4(is, &block.scales);
+            let d1 = d * sc1 as f32;
+            let m1 = dmin * m1 as f32;
+            let (sc2, m2) = get_scale_min_k4(is + 1, &block.scales);
+            let d2 = d * sc2 as f32;
+            let m2 = dmin * m2 as f32;
+
+            for l in 0..32 {
+                output.push(d1 * (q[q_offset + l] & 0xF) as f32 - m1);
+            }
+            for l in 0..32 {
+                output.push(d2 * (q[q_offset + l] >> 4) as f32 - m2);
+            }
+            q_offset += 32;
+            is += 2;
+        }
+    }
+    output
+}
+
+/// Dequantize a slice of Q5_K blocks into f32 values.
+///
+/// Same scale structure as Q4_K but 5-bit quants (4 bits in qs + 1 bit in qh).
+pub fn dequantize_q5_k(blocks: &[BlockQ5K]) -> Vec<f32> {
+    let mut output = Vec::with_capacity(blocks.len() * QK_K);
+    for block in blocks {
+        let d = f16_to_f32(block.d);
+        let dmin = f16_to_f32(block.dmin);
+        let ql = &block.qs;
+        let qh = &block.qh;
+
+        let mut is = 0usize;
+        let mut ql_offset = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for _j in 0..4 {
+            let (sc1, m1) = get_scale_min_k4(is, &block.scales);
+            let d1 = d * sc1 as f32;
+            let m1 = dmin * m1 as f32;
+            let (sc2, m2) = get_scale_min_k4(is + 1, &block.scales);
+            let d2 = d * sc2 as f32;
+            let m2 = dmin * m2 as f32;
+
+            for l in 0..32 {
+                let high = if qh[l] & u1 != 0 { 16 } else { 0 };
+                output.push(d1 * ((ql[ql_offset + l] & 0xF) as f32 + high as f32) - m1);
+            }
+            for l in 0..32 {
+                let high = if qh[l] & u2 != 0 { 16 } else { 0 };
+                output.push(d2 * ((ql[ql_offset + l] >> 4) as f32 + high as f32) - m2);
+            }
+            ql_offset += 32;
+            is += 2;
+            u1 = u1.wrapping_shl(2);
+            u2 = u2.wrapping_shl(2);
+        }
+    }
+    output
+}
+
+/// Dequantize a slice of Q6_K blocks into f32 values.
+///
+/// 6-bit quants with 8-bit signed scales. No mins.
+/// `y = d * scale * (q_6bit - 32)`
+pub fn dequantize_q6_k(blocks: &[BlockQ6K]) -> Vec<f32> {
+    let mut output = Vec::with_capacity(blocks.len() * QK_K);
+    for block in blocks {
+        let d = f16_to_f32(block.d);
+        let ql = &block.ql;
+        let qh = &block.qh;
+        let sc = &block.scales;
+
+        let mut buf = [0.0f32; QK_K];
+        let mut ql_offset = 0usize;
+        let mut qh_offset = 0usize;
+        let mut sc_offset = 0usize;
+        let mut out_offset = 0usize;
+
+        for _n in 0..2 {
+            // 128 values per iteration
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[ql_offset + l] & 0xF) | (((qh[qh_offset + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[ql_offset + l + 32] & 0xF) | (((qh[qh_offset + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_offset + l] >> 4) | (((qh[qh_offset + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[ql_offset + l + 32] >> 4) | (((qh[qh_offset + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                buf[out_offset + l] = d * sc[sc_offset + is] as f32 * q1 as f32;
+                buf[out_offset + l + 32] = d * sc[sc_offset + is + 2] as f32 * q2 as f32;
+                buf[out_offset + l + 64] = d * sc[sc_offset + is + 4] as f32 * q3 as f32;
+                buf[out_offset + l + 96] = d * sc[sc_offset + is + 6] as f32 * q4 as f32;
+            }
+            ql_offset += 64;
+            qh_offset += 32;
+            sc_offset += 8;
+            out_offset += 128;
+        }
+        output.extend_from_slice(&buf);
+    }
+    output
+}
+
+// ---------------------------------------------------------------------------
+// Helpers to reinterpret raw bytes as new block slices
+// ---------------------------------------------------------------------------
+
+/// Interpret a byte slice as a slice of `BlockQ4_1` blocks.
+pub fn bytes_as_q4_1_blocks(data: &[u8]) -> Result<&[BlockQ4_1], InferenceError> {
+    let block_size = std::mem::size_of::<BlockQ4_1>();
+    if data.len() % block_size != 0 {
+        return Err(InferenceError::GgufParse(format!(
+            "Q4_1 data length {} is not a multiple of block size {}",
+            data.len(), block_size
+        )));
+    }
+    let n_blocks = data.len() / block_size;
+    let blocks = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const BlockQ4_1, n_blocks) };
+    Ok(blocks)
+}
+
+/// Interpret a byte slice as a slice of `BlockQ5_0` blocks.
+pub fn bytes_as_q5_0_blocks(data: &[u8]) -> Result<&[BlockQ5_0], InferenceError> {
+    let block_size = std::mem::size_of::<BlockQ5_0>();
+    if data.len() % block_size != 0 {
+        return Err(InferenceError::GgufParse(format!(
+            "Q5_0 data length {} is not a multiple of block size {}",
+            data.len(), block_size
+        )));
+    }
+    let n_blocks = data.len() / block_size;
+    let blocks = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const BlockQ5_0, n_blocks) };
+    Ok(blocks)
+}
+
+/// Interpret a byte slice as a slice of `BlockQ5_1` blocks.
+pub fn bytes_as_q5_1_blocks(data: &[u8]) -> Result<&[BlockQ5_1], InferenceError> {
+    let block_size = std::mem::size_of::<BlockQ5_1>();
+    if data.len() % block_size != 0 {
+        return Err(InferenceError::GgufParse(format!(
+            "Q5_1 data length {} is not a multiple of block size {}",
+            data.len(), block_size
+        )));
+    }
+    let n_blocks = data.len() / block_size;
+    let blocks = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const BlockQ5_1, n_blocks) };
+    Ok(blocks)
+}
+
+/// Interpret a byte slice as a slice of `BlockQ4K` blocks.
+pub fn bytes_as_q4_k_blocks(data: &[u8]) -> Result<&[BlockQ4K], InferenceError> {
+    let block_size = std::mem::size_of::<BlockQ4K>();
+    if data.len() % block_size != 0 {
+        return Err(InferenceError::GgufParse(format!(
+            "Q4_K data length {} is not a multiple of block size {}",
+            data.len(), block_size
+        )));
+    }
+    let n_blocks = data.len() / block_size;
+    let blocks = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const BlockQ4K, n_blocks) };
+    Ok(blocks)
+}
+
+/// Interpret a byte slice as a slice of `BlockQ5K` blocks.
+pub fn bytes_as_q5_k_blocks(data: &[u8]) -> Result<&[BlockQ5K], InferenceError> {
+    let block_size = std::mem::size_of::<BlockQ5K>();
+    if data.len() % block_size != 0 {
+        return Err(InferenceError::GgufParse(format!(
+            "Q5_K data length {} is not a multiple of block size {}",
+            data.len(), block_size
+        )));
+    }
+    let n_blocks = data.len() / block_size;
+    let blocks = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const BlockQ5K, n_blocks) };
+    Ok(blocks)
+}
+
+/// Interpret a byte slice as a slice of `BlockQ6K` blocks.
+pub fn bytes_as_q6_k_blocks(data: &[u8]) -> Result<&[BlockQ6K], InferenceError> {
+    let block_size = std::mem::size_of::<BlockQ6K>();
+    if data.len() % block_size != 0 {
+        return Err(InferenceError::GgufParse(format!(
+            "Q6_K data length {} is not a multiple of block size {}",
+            data.len(), block_size
+        )));
+    }
+    let n_blocks = data.len() / block_size;
+    let blocks = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const BlockQ6K, n_blocks) };
+    Ok(blocks)
 }
 
 /// Compute the number of bytes needed to store `n_elements` values of the
@@ -944,5 +1375,604 @@ mod tests {
                 i, result_from_bytes[i], result_direct[i]
             );
         }
+    }
+
+    // ====================================================================
+    // K-quant and non-K block struct size assertions
+    // ====================================================================
+
+    #[test]
+    fn test_block_q4_1_size() {
+        assert_eq!(std::mem::size_of::<BlockQ4_1>(), 20);
+    }
+
+    #[test]
+    fn test_block_q5_0_size() {
+        assert_eq!(std::mem::size_of::<BlockQ5_0>(), 22);
+    }
+
+    #[test]
+    fn test_block_q5_1_size() {
+        assert_eq!(std::mem::size_of::<BlockQ5_1>(), 24);
+    }
+
+    #[test]
+    fn test_block_q4_k_size() {
+        assert_eq!(std::mem::size_of::<BlockQ4K>(), 144);
+    }
+
+    #[test]
+    fn test_block_q5_k_size() {
+        assert_eq!(std::mem::size_of::<BlockQ5K>(), 176);
+    }
+
+    #[test]
+    fn test_block_q6_k_size() {
+        assert_eq!(std::mem::size_of::<BlockQ6K>(), 210);
+    }
+
+    // ====================================================================
+    // get_scale_min_k4 tests
+    // ====================================================================
+
+    #[test]
+    fn test_get_scale_min_k4_low_indices() {
+        // For j < 4: scale = scales[j] & 63, min = scales[j+4] & 63
+        let scales: [u8; 12] = [10, 20, 30, 40, 50, 60, 63, 0, 0, 0, 0, 0];
+        let (sc, m) = get_scale_min_k4(0, &scales);
+        assert_eq!(sc, 10);
+        assert_eq!(m, 50);
+        let (sc, m) = get_scale_min_k4(1, &scales);
+        assert_eq!(sc, 20);
+        assert_eq!(m, 60);
+        let (sc, m) = get_scale_min_k4(3, &scales);
+        assert_eq!(sc, 40);
+        assert_eq!(m, 0);
+    }
+
+    #[test]
+    fn test_get_scale_min_k4_high_indices() {
+        // For j >= 4: more complex bit packing
+        let mut scales = [0u8; 12];
+        // Set up so we can test the high-index extraction.
+        // j=4: sc = (scales[8] & 0xF) | ((scales[0] >> 6) << 4)
+        //      m  = (scales[8] >> 4)   | ((scales[4] >> 6) << 4)
+        scales[0] = 0b1100_0000; // >> 6 = 3, << 4 = 48
+        scales[4] = 0b1000_0000; // >> 6 = 2, << 4 = 32
+        scales[8] = 0b0101_0011; // & 0xF = 3, >> 4 = 5
+        let (sc, m) = get_scale_min_k4(4, &scales);
+        assert_eq!(sc, 3 | (3 << 4)); // 3 + 48 = 51
+        assert_eq!(m, 5 | (2 << 4));  // 5 + 32 = 37
+    }
+
+    // ====================================================================
+    // Q4_1 dequantization tests
+    // ====================================================================
+
+    #[test]
+    fn test_dequantize_q4_1_basic() {
+        // All nibbles = 0 => y = 0 * d + m = m for all elements
+        let block = BlockQ4_1 {
+            d: f32_to_f16(1.0),
+            m: f32_to_f16(0.5),
+            qs: [0; 16], // low=0, high=0
+        };
+        let result = dequantize_q4_1(&[block]);
+        assert_eq!(result.len(), 32);
+        for &v in &result {
+            assert!((v - 0.5).abs() < 1e-3, "expected 0.5, got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q4_1_max_nibble() {
+        // All nibbles = 15 => y = 15 * d + m
+        let block = BlockQ4_1 {
+            d: f32_to_f16(1.0),
+            m: f32_to_f16(0.0),
+            qs: [0xFF; 16],
+        };
+        let result = dequantize_q4_1(&[block]);
+        for &v in &result {
+            assert!((v - 15.0).abs() < 1e-3, "expected 15.0, got {}", v);
+        }
+    }
+
+    // ====================================================================
+    // Q5_0 dequantization tests
+    // ====================================================================
+
+    #[test]
+    fn test_dequantize_q5_0_zero() {
+        // With all qs = 0 and qh = 0, values = (0 | 0) - 16 = -16, y = -16 * d
+        let block = BlockQ5_0 {
+            d: f32_to_f16(1.0),
+            qh: [0; 4],
+            qs: [0; 16],
+        };
+        let result = dequantize_q5_0(&[block]);
+        assert_eq!(result.len(), 32);
+        // All nibbles = 0, no high bit => (0 - 16) * 1.0 = -16.0
+        for &v in &result {
+            assert!((v - (-16.0)).abs() < 1e-3, "expected -16.0, got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q5_0_with_high_bits() {
+        // nibble = 0, high_bit = 1 (for first element) => (0 | 16) - 16 = 0
+        let block = BlockQ5_0 {
+            d: f32_to_f16(1.0),
+            qh: [0x01, 0, 0, 0], // bit 0 is set for element 0
+            qs: [0; 16],
+        };
+        let result = dequantize_q5_0(&[block]);
+        // Element 0: nibble=0, high_bit from qh bit 0 => xh_0 = ((1 >> 0) << 4) & 0x10 = 0x10
+        // val = (0 | 0x10) - 16 = 0
+        assert!((result[0] - 0.0).abs() < 1e-3, "expected 0.0, got {}", result[0]);
+    }
+
+    // ====================================================================
+    // Q5_1 dequantization tests
+    // ====================================================================
+
+    #[test]
+    fn test_dequantize_q5_1_basic() {
+        // All nibbles = 0, no high bits => y = 0 * d + m = m
+        let block = BlockQ5_1 {
+            d: f32_to_f16(1.0),
+            m: f32_to_f16(2.0),
+            qh: [0; 4],
+            qs: [0; 16],
+        };
+        let result = dequantize_q5_1(&[block]);
+        assert_eq!(result.len(), 32);
+        for &v in &result {
+            assert!((v - 2.0).abs() < 1e-3, "expected 2.0, got {}", v);
+        }
+    }
+
+    // ====================================================================
+    // Q4_K dequantization tests
+    // ====================================================================
+
+    #[test]
+    fn test_dequantize_q4_k_zeros() {
+        // All zeros except d=1.0 and dmin=0.0 => all output should be 0
+        let block = BlockQ4K {
+            d: f32_to_f16(1.0),
+            dmin: f32_to_f16(0.0),
+            scales: [0; 12],
+            qs: [0; 128],
+        };
+        let result = dequantize_q4_k(&[block]);
+        assert_eq!(result.len(), 256);
+        for &v in &result {
+            assert!(v.abs() < 1e-6, "expected 0.0, got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q4_k_basic() {
+        // Set d=1.0, dmin=0.0, scale[0]=1 (first 6 bits), all qs nibbles = 5
+        // y = d * 1 * 5 - dmin * 0 = 5.0
+        let mut block = BlockQ4K {
+            d: f32_to_f16(1.0),
+            dmin: f32_to_f16(0.0),
+            scales: [0; 12],
+            qs: [0x55; 128], // low=5, high=5
+        };
+        block.scales[0] = 1; // scale for sub-block 0 = 1
+        block.scales[1] = 1; // scale for sub-block 1 = 1
+
+        let result = dequantize_q4_k(&[block]);
+        // First 32 elements use sub-block 0 (low nibbles): d*1*5 = 5.0
+        for i in 0..32 {
+            assert!((result[i] - 5.0).abs() < 1e-3, "elem {}: expected 5.0, got {}", i, result[i]);
+        }
+    }
+
+    // ====================================================================
+    // Q6_K dequantization tests
+    // ====================================================================
+
+    #[test]
+    fn test_dequantize_q6_k_zeros() {
+        // With d=1.0, all ql/qh=0, scales=0 => output = d * 0 * (0 - 32) = 0
+        let block = BlockQ6K {
+            ql: [0; 128],
+            qh: [0; 64],
+            scales: [0; 16],
+            d: f32_to_f16(1.0),
+        };
+        let result = dequantize_q6_k(&[block]);
+        assert_eq!(result.len(), 256);
+        for &v in &result {
+            assert!(v.abs() < 1e-6, "expected 0.0, got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q6_k_known_value() {
+        // Set scale[0] = 1, d = 1.0
+        // ql[0] = 0x21 (low nibble = 1), qh[0] = 0b00000001 (bits 0,1 = 01 for first element)
+        // q1 = (1 | (1 << 4)) - 32 = (1 | 16) - 32 = 17 - 32 = -15
+        // y = 1.0 * 1 * (-15) = -15.0
+        let mut block = BlockQ6K {
+            ql: [0; 128],
+            qh: [0; 64],
+            scales: [0; 16],
+            d: f32_to_f16(1.0),
+        };
+        block.scales[0] = 1;
+        block.ql[0] = 0x01; // low nibble = 1
+        block.qh[0] = 0x01; // bits 0,1 for element 0 = 01
+
+        let result = dequantize_q6_k(&[block]);
+        // q1 = (1 | (1 << 4)) - 32 = 17 - 32 = -15
+        assert!(
+            (result[0] - (-15.0)).abs() < 1e-3,
+            "expected -15.0, got {}", result[0]
+        );
+    }
+
+    // ====================================================================
+    // bytes_as_*_blocks tests for new types
+    // ====================================================================
+
+    #[test]
+    fn test_bytes_as_q4_1_blocks() {
+        let data = vec![0u8; 20 * 3];
+        let blocks = bytes_as_q4_1_blocks(&data).unwrap();
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn test_bytes_as_q4_1_blocks_invalid() {
+        assert!(bytes_as_q4_1_blocks(&vec![0u8; 21]).is_err());
+    }
+
+    #[test]
+    fn test_bytes_as_q5_0_blocks() {
+        let data = vec![0u8; 22 * 2];
+        let blocks = bytes_as_q5_0_blocks(&data).unwrap();
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_bytes_as_q5_1_blocks() {
+        let data = vec![0u8; 24 * 2];
+        let blocks = bytes_as_q5_1_blocks(&data).unwrap();
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_bytes_as_q4_k_blocks() {
+        let data = vec![0u8; 144 * 2];
+        let blocks = bytes_as_q4_k_blocks(&data).unwrap();
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_bytes_as_q5_k_blocks() {
+        let data = vec![0u8; 176];
+        let blocks = bytes_as_q5_k_blocks(&data).unwrap();
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_bytes_as_q6_k_blocks() {
+        let data = vec![0u8; 210];
+        let blocks = bytes_as_q6_k_blocks(&data).unwrap();
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_bytes_as_q6_k_blocks_invalid() {
+        assert!(bytes_as_q6_k_blocks(&vec![0u8; 211]).is_err());
+    }
+
+    // ====================================================================
+    // Empty blocks produce empty output
+    // ====================================================================
+
+    #[test]
+    fn test_dequantize_empty_new_types() {
+        assert!(dequantize_q4_1(&[]).is_empty());
+        assert!(dequantize_q5_0(&[]).is_empty());
+        assert!(dequantize_q5_1(&[]).is_empty());
+        assert!(dequantize_q4_k(&[]).is_empty());
+        assert!(dequantize_q5_k(&[]).is_empty());
+        assert!(dequantize_q6_k(&[]).is_empty());
+    }
+
+    // ====================================================================
+    // Output length correctness
+    // ====================================================================
+
+    #[test]
+    fn test_dequantize_output_lengths() {
+        // Non-K types: 32 elements per block
+        let q4_1 = BlockQ4_1 { d: 0, m: 0, qs: [0; 16] };
+        assert_eq!(dequantize_q4_1(&[q4_1, q4_1]).len(), 64);
+
+        let q5_0 = BlockQ5_0 { d: 0, qh: [0; 4], qs: [0; 16] };
+        assert_eq!(dequantize_q5_0(&[q5_0]).len(), 32);
+
+        let q5_1 = BlockQ5_1 { d: 0, m: 0, qh: [0; 4], qs: [0; 16] };
+        assert_eq!(dequantize_q5_1(&[q5_1]).len(), 32);
+
+        // K-quant types: 256 elements per block
+        let q4_k = BlockQ4K { d: 0, dmin: 0, scales: [0; 12], qs: [0; 128] };
+        assert_eq!(dequantize_q4_k(&[q4_k]).len(), 256);
+
+        let q5_k = BlockQ5K { d: 0, dmin: 0, scales: [0; 12], qh: [0; 32], qs: [0; 128] };
+        assert_eq!(dequantize_q5_k(&[q5_k]).len(), 256);
+
+        let q6_k = BlockQ6K { ql: [0; 128], qh: [0; 64], scales: [0; 16], d: 0 };
+        assert_eq!(dequantize_q6_k(&[q6_k]).len(), 256);
+    }
+
+    // ====================================================================
+    // Deep dequantization tests with non-trivial data
+    // ====================================================================
+
+    #[test]
+    fn test_dequantize_q4_1_varied_nibbles() {
+        // d=0.5, m=1.0, qs: byte i has low=i%16, high=(15-i)%16
+        let block = BlockQ4_1 {
+            d: f32_to_f16(0.5),
+            m: f32_to_f16(1.0),
+            qs: {
+                let mut qs = [0u8; 16];
+                for j in 0..16 {
+                    let lo = (j % 16) as u8;
+                    let hi = ((15 - j) % 16) as u8;
+                    qs[j] = lo | (hi << 4);
+                }
+                qs
+            },
+        };
+        let result = dequantize_q4_1(&[block]);
+        assert_eq!(result.len(), 32);
+        // Verify a few specific values: y = nibble * d + m
+        // Element 0: low nibble of qs[0] = 0 => 0 * 0.5 + 1.0 = 1.0
+        assert!((result[0] - 1.0).abs() < 1e-2, "elem 0: got {}", result[0]);
+        // Element 5: low nibble of qs[5] = 5 => 5 * 0.5 + 1.0 = 3.5
+        assert!((result[5] - 3.5).abs() < 1e-2, "elem 5: got {}", result[5]);
+        // Element 16: high nibble of qs[0] = 15 => 15 * 0.5 + 1.0 = 8.5
+        assert!((result[16] - 8.5).abs() < 1e-2, "elem 16: got {}", result[16]);
+        // Element 31: high nibble of qs[15] = 0 => 0 * 0.5 + 1.0 = 1.0
+        assert!((result[31] - 1.0).abs() < 1e-2, "elem 31: got {}", result[31]);
+    }
+
+    #[test]
+    fn test_dequantize_q5_0_all_high_bits_set() {
+        // d=1.0, all qs nibbles = 0, all qh bits set
+        // For element j (j<16): xh_0 = ((0xFFFFFFFF >> j) << 4) & 0x10 = 0x10
+        //   val = (0 | 16) - 16 = 0 => y = 0.0
+        let block = BlockQ5_0 {
+            d: f32_to_f16(1.0),
+            qh: [0xFF; 4], // all bits set
+            qs: [0; 16],
+        };
+        let result = dequantize_q5_0(&[block]);
+        assert_eq!(result.len(), 32);
+        // All elements: (0 | 16) - 16 = 0 for both halves
+        for i in 0..32 {
+            assert!((result[i] - 0.0).abs() < 1e-3, "elem {}: expected 0.0, got {}", i, result[i]);
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q5_0_mixed_bits() {
+        // d=2.0, qs[0] = 0x31 (low=1, high=3), qh bit 0 set, bit 12 clear
+        // Element 0: xh_0 = ((qh>>0)<<4) & 0x10 = 0x10; x0 = (1|16) - 16 = 1; y=2.0
+        // Element 16: xh_1 = ((qh>>12)) & 0x10 = (qh>>12)&0x10; for qh=0x01: (1>>12)=0, so 0
+        //   x1 = (3|0) - 16 = -13; y=-26.0
+        let block = BlockQ5_0 {
+            d: f32_to_f16(2.0),
+            qh: [0x01, 0, 0, 0], // only bit 0 set
+            qs: {
+                let mut qs = [0x88u8; 16]; // nibbles = 8 => (8|0)-16=-8 or (8|16)-16=8
+                qs[0] = 0x31; // low=1, high=3
+                qs
+            },
+        };
+        let result = dequantize_q5_0(&[block]);
+        // Element 0: xh_0 = 16 (bit 0 set), x0 = (1|16)-16 = 1, y = 2.0
+        assert!((result[0] - 2.0).abs() < 1e-2, "elem 0: expected 2.0, got {}", result[0]);
+        // Element 16: xh_1 = 0 (bit 12 not set), x1 = (3|0)-16 = -13, y = -26.0
+        assert!((result[16] - (-26.0)).abs() < 1e-2, "elem 16: expected -26.0, got {}", result[16]);
+    }
+
+    #[test]
+    fn test_dequantize_q5_1_with_high_bits_and_min() {
+        // d=0.5, m=2.0, qs[0] = 0xF0 (low=0, high=15)
+        // For element j=0: xh_0 = ((qh >> 0) << 4) & 0x10 — needs qh bit 0
+        // For element 16 (j=0 high half): xh_1 = ((qh >> 12)) & 0x10 — needs qh bit 16
+        let block = BlockQ5_1 {
+            d: f32_to_f16(0.5),
+            m: f32_to_f16(2.0),
+            qh: {
+                let val: u32 = (1 << 0) | (1 << 16); // bit 0 for elem 0, bit 16 for elem 16
+                val.to_le_bytes()
+            },
+            qs: {
+                let mut qs = [0u8; 16];
+                qs[0] = 0xF0; // low=0, high=15
+                qs
+            },
+        };
+        let result = dequantize_q5_1(&[block]);
+        // Element 0: x0 = (0|16) = 16, y = 16*0.5 + 2.0 = 10.0
+        assert!((result[0] - 10.0).abs() < 1e-2, "elem 0: expected 10.0, got {}", result[0]);
+        // Element 16: x1 = (15|16) = 31, y = 31*0.5 + 2.0 = 17.5
+        assert!((result[16] - 17.5).abs() < 1e-2, "elem 16: expected 17.5, got {}", result[16]);
+    }
+
+    #[test]
+    fn test_dequantize_q4_k_with_mins_and_high_scale_indices() {
+        // Exercise scale indices 4-7 (the high-index path in get_scale_min_k4)
+        // d=1.0, dmin=0.5
+        // Set scales so that sub-blocks 4-7 have non-trivial scale and min values
+        // qs = 0x33 (low=3, high=3) throughout
+        let mut block = BlockQ4K {
+            d: f32_to_f16(1.0),
+            dmin: f32_to_f16(0.5),
+            scales: [0; 12],
+            qs: [0x33; 128], // all nibbles = 3
+        };
+        // Set low-index scales (0-3): scale=5, min=2
+        for i in 0..4 {
+            block.scales[i] = 5;     // scale for sub-block i
+            block.scales[i + 4] = 2; // min for sub-block i
+        }
+        // For high indices (4-7), we need the packed format:
+        // scales[8] = (sc4 & 0xF) | (m4 & 0xF) << 4
+        // sc4 = (scales[8] & 0xF) | ((scales[0] >> 6) << 4)
+        // We want sc4=3, m4=1:
+        // scales[8] = (3 & 0xF) | (1 << 4) = 3 | 16 = 19
+        // scales[0] bits 6-7 must be 0 (already 5 = 0b00000101, ok)
+        // scales[4] bits 6-7 for m4 must be 0 (already 2 = 0b00000010, ok)
+        block.scales[8] = 19; // sc4=3, m4=1 (lower 4 bits of each)
+        block.scales[9] = 19; // sc5=3, m5=1
+        block.scales[10] = 19; // sc6=3, m6=1
+        block.scales[11] = 19; // sc7=3, m7=1
+
+        let result = dequantize_q4_k(&[block]);
+        assert_eq!(result.len(), 256);
+
+        // Sub-block 0 (elements 0-31, low nibbles of qs[0..32]):
+        // y = d * scale * (q & 0xF) - dmin * min = 1.0 * 5 * 3 - 0.5 * 2 = 15.0 - 1.0 = 14.0
+        for i in 0..32 {
+            assert!((result[i] - 14.0).abs() < 1e-2, "sub-block 0, elem {}: expected 14.0, got {}", i, result[i]);
+        }
+
+        // Sub-block 4 (elements 128-159):
+        // sc4=3, m4=1, y = 1.0 * 3 * 3 - 0.5 * 1 = 9.0 - 0.5 = 8.5
+        for i in 128..160 {
+            assert!((result[i] - 8.5).abs() < 1e-2, "sub-block 4, elem {}: expected 8.5, got {}", i, result[i]);
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q5_k_with_high_bits() {
+        // Exercise the u1/u2 rotation through all 4 iterations (the wrapping_shl fix)
+        // d=1.0, dmin=0.0. Set all 8 sub-block scales to 1 so we can verify values
+        // across all iterations, including iteration 3 (the overflow iteration).
+        let mut block = BlockQ5K {
+            d: f32_to_f16(1.0),
+            dmin: f32_to_f16(0.0),
+            scales: [0; 12],
+            qh: [0; 32],
+            qs: [0; 128], // all nibbles = 0
+        };
+        // Set low-index scales (sub-blocks 0-3): scale=1, min=0
+        for i in 0..4 {
+            block.scales[i] = 1;
+        }
+        // Set high-index scales (sub-blocks 4-7): sc=1, min=0
+        // get_scale_min_k4(4): sc = (scales[8] & 0xF) | ((scales[0] >> 6) << 4)
+        // We want sc=1: scales[8] & 0xF = 1, scales[0] bits 6-7 = 0 (already true since scales[0]=1)
+        // min=0: (scales[8] >> 4) | ((scales[4] >> 6) << 4) = 0, so scales[8] >> 4 = 0
+        // scales[8] = 1 (low 4 bits = 1, high 4 bits = 0)
+        block.scales[8] = 1;   // sub-block 4: sc=1, m=0
+        block.scales[9] = 1;   // sub-block 5: sc=1, m=0
+        block.scales[10] = 1;  // sub-block 6: sc=1, m=0
+        block.scales[11] = 1;  // sub-block 7: sc=1, m=0
+
+        // Set qh[0] = 0xFF: bits 0-7 all set
+        // Iteration 0: u1=1, u2=2 => qh[0]&1=1 (high=16), qh[0]&2=1 (high=16)
+        // Iteration 1: u1=4, u2=8 => qh[0]&4=1 (high=16), qh[0]&8=1 (high=16)
+        // Iteration 2: u1=16, u2=32 => qh[0]&16=1 (high=16), qh[0]&32=1 (high=16)
+        // Iteration 3: u1=64, u2=128 => qh[0]&64=1 (high=16), qh[0]&128=1 (high=16)
+        block.qh[0] = 0xFF;
+
+        let result = dequantize_q5_k(&[block]);
+        assert_eq!(result.len(), 256);
+
+        // Element 0 (iteration 0, l=0): high=16, q=0+16=16, y=1.0*1*16=16.0
+        assert!((result[0] - 16.0).abs() < 1e-2, "elem 0: expected 16.0, got {}", result[0]);
+
+        // Element 32 (iteration 0, second inner loop, l=0): high=16, y=16.0
+        assert!((result[32] - 16.0).abs() < 1e-2, "elem 32: expected 16.0, got {}", result[32]);
+
+        // Element 64 (iteration 1, l=0): u1=4, qh[0]&4!=0 => high=16, y=16.0
+        assert!((result[64] - 16.0).abs() < 1e-2, "elem 64: expected 16.0, got {}", result[64]);
+
+        // Element 192 (iteration 3, l=0): u1=64, qh[0]&64!=0 => high=16
+        // This is the iteration that used to overflow (u1 <<= 2 on u8=64)
+        // With wrapping_shl, it completes without panic. Sub-block 6 has sc=1.
+        assert!((result[192] - 16.0).abs() < 1e-2, "elem 192 (overflow iter): expected 16.0, got {}", result[192]);
+    }
+
+    #[test]
+    fn test_dequantize_q5_k_no_high_bits() {
+        // Same as above but qh=0, so no high bits
+        let mut block = BlockQ5K {
+            d: f32_to_f16(1.0),
+            dmin: f32_to_f16(0.5),
+            scales: [0; 12],
+            qh: [0; 32],
+            qs: [0x55; 128], // all nibbles = 5
+        };
+        block.scales[0] = 2; // scale for sub-block 0
+        block.scales[4] = 1; // min for sub-block 0
+
+        let result = dequantize_q5_k(&[block]);
+        // Sub-block 0, first 32 elements:
+        // q = (5 & 0xF) + 0 = 5 (no high bit)
+        // y = 1.0 * 2 * 5 - 0.5 * 1 = 10.0 - 0.5 = 9.5
+        for i in 0..32 {
+            assert!((result[i] - 9.5).abs() < 1e-2, "elem {}: expected 9.5, got {}", i, result[i]);
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q6_k_all_sub_blocks() {
+        // Set scale[i]=i+1 for i=0..16, d=0.5
+        // ql all = 0x21 (low nibble=1 for first half, =2 for second half)
+        // qh all = 0, so q6 = ql nibble only
+        let mut block = BlockQ6K {
+            ql: [0x21; 128],
+            qh: [0; 64],
+            scales: [0; 16],
+            d: f32_to_f16(0.5),
+        };
+        for i in 0..16 {
+            block.scales[i] = (i + 1) as i8;
+        }
+        let result = dequantize_q6_k(&[block]);
+        assert_eq!(result.len(), 256);
+
+        // Sub-block 0 (first 16 elements): scale=1
+        // q = (ql & 0xF) | ((qh & 3) << 4) = 1 | 0 = 1, q-32 = -31
+        // y = 0.5 * 1 * (-31) = -15.5
+        assert!((result[0] - (-15.5)).abs() < 1e-2, "elem 0: expected -15.5, got {}", result[0]);
+
+        // Sub-block 1 (elements 16-31): scale=2
+        // Same ql pattern, q=1, y = 0.5 * 2 * (-31) = -31.0
+        assert!((result[16] - (-31.0)).abs() < 1e-2, "elem 16: expected -31.0, got {}", result[16]);
+    }
+
+    #[test]
+    fn test_dequantize_q6_k_with_qh_bits() {
+        // Verify that qh bits correctly contribute to the 6-bit value
+        let mut block = BlockQ6K {
+            ql: [0; 128],   // all nibbles = 0
+            qh: [0; 64],
+            scales: [0; 16],
+            d: f32_to_f16(1.0),
+        };
+        block.scales[0] = 1;
+        // qh[0] bits 0,1 correspond to element 0's upper 2 bits
+        // For the first 32 elements: qh_val = ((qh[j] >> 0) & 3) << 4
+        block.qh[0] = 0x03; // bits 0,1 = 11 for element 0 => qh_val = 3<<4 = 48
+        // q = (0 | 48) - 32 = 16
+        // y = 1.0 * 1 * 16 = 16.0
+
+        let result = dequantize_q6_k(&[block]);
+        assert!((result[0] - 16.0).abs() < 1e-2, "elem 0: expected 16.0, got {}", result[0]);
     }
 }

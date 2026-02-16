@@ -1,27 +1,40 @@
 //! N-dimensional tensor type with mixed dtype support including quantized formats.
 //!
 //! Provides the core [`Tensor`] type used throughout strata-inference. Supports F32, F16,
-//! and quantized (Q8_0, Q4_0) storage formats with dequantization to F32.
+//! and quantized (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K) storage formats
+//! with dequantization to F32.
 
 use tracing::debug;
 
+use crate::gguf::quant;
+
 /// Data type of tensor elements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
 pub enum TensorDtype {
     F32,
     F16,
     Q8_0,
     Q4_0,
+    // Non-K quantized types (block_size = 32)
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    // K-quant types (block_size = 256)
+    Q4_K,
+    Q5_K,
+    Q6_K,
 }
 
 impl TensorDtype {
-    /// Number of values per quantization block (32 for Q8_0 and Q4_0).
+    /// Number of values per quantization block.
     pub fn block_size(&self) -> usize {
         match self {
             TensorDtype::F32 => 1,
             TensorDtype::F16 => 1,
-            TensorDtype::Q8_0 => 32,
-            TensorDtype::Q4_0 => 32,
+            TensorDtype::Q8_0 | TensorDtype::Q4_0 => 32,
+            TensorDtype::Q4_1 | TensorDtype::Q5_0 | TensorDtype::Q5_1 => 32,
+            TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => 256,
         }
     }
 
@@ -30,9 +43,20 @@ impl TensorDtype {
         match self {
             TensorDtype::F32 => 4,
             TensorDtype::F16 => 2,
-            TensorDtype::Q8_0 => 34, // 2 bytes f16 scale + 32 bytes i8 values
-            TensorDtype::Q4_0 => 18, // 2 bytes f16 scale + 16 bytes (32 nibbles)
+            TensorDtype::Q8_0 => 34,  // 2 bytes f16 scale + 32 bytes i8 values
+            TensorDtype::Q4_0 => 18,  // 2 bytes f16 scale + 16 bytes (32 nibbles)
+            TensorDtype::Q4_1 => 20,  // 2*f16 + 16 bytes
+            TensorDtype::Q5_0 => 22,  // f16 + 4 + 16 bytes
+            TensorDtype::Q5_1 => 24,  // 2*f16 + 4 + 16 bytes
+            TensorDtype::Q4_K => 144, // 2*f16 + 12 + 128 bytes
+            TensorDtype::Q5_K => 176, // 2*f16 + 12 + 32 + 128 bytes
+            TensorDtype::Q6_K => 210, // f16 + 16 + 64 + 128 bytes
         }
+    }
+
+    /// Returns true if this is a quantized type (not F32 or F16).
+    pub fn is_quantized(&self) -> bool {
+        !matches!(self, TensorDtype::F32 | TensorDtype::F16)
     }
 }
 
@@ -134,12 +158,12 @@ impl Tensor {
     /// Create a quantized tensor from shape, dtype, and raw block data.
     ///
     /// # Panics
-    /// Panics if `dtype` is not a quantized type (Q8_0 or Q4_0), or if the data length
+    /// Panics if `dtype` is not a quantized type, or if the data length
     /// doesn't match the expected number of blocks.
     pub fn from_quantized(shape: Vec<usize>, dtype: TensorDtype, data: Vec<u8>) -> Self {
         assert!(
-            dtype == TensorDtype::Q8_0 || dtype == TensorDtype::Q4_0,
-            "from_quantized requires Q8_0 or Q4_0 dtype, got {:?}",
+            dtype.is_quantized(),
+            "from_quantized requires a quantized dtype, got {:?}",
             dtype
         );
         let n_elements: usize = shape.iter().product();
@@ -216,10 +240,7 @@ impl Tensor {
 
     /// Convert the tensor to F32, dequantizing if necessary.
     ///
-    /// - F32 tensors are cloned as-is.
-    /// - F16 tensors are converted element-wise using the `half` crate.
-    /// - Q8_0 tensors are dequantized: `y[i] = scale * qs[i]`
-    /// - Q4_0 tensors are dequantized: `y[i] = (nibble - 8) * scale`
+    /// Supports F32, F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K.
     pub fn to_f32(&self) -> Tensor {
         match self.dtype {
             TensorDtype::F32 => self.clone(),
@@ -310,6 +331,47 @@ impl Tensor {
                     strides: self.strides.clone(),
                     dtype: TensorDtype::F32,
                     storage: TensorStorage::F32(output),
+                }
+            }
+            TensorDtype::Q4_1 | TensorDtype::Q5_0 | TensorDtype::Q5_1
+            | TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => {
+                let raw = match &self.storage {
+                    TensorStorage::Quantized(data) => data,
+                    _ => unreachable!("{:?} dtype must have Quantized storage", self.dtype),
+                };
+                let data = match self.dtype {
+                    TensorDtype::Q4_1 => {
+                        let blocks = quant::bytes_as_q4_1_blocks(raw).expect("invalid Q4_1 data");
+                        quant::dequantize_q4_1(blocks)
+                    }
+                    TensorDtype::Q5_0 => {
+                        let blocks = quant::bytes_as_q5_0_blocks(raw).expect("invalid Q5_0 data");
+                        quant::dequantize_q5_0(blocks)
+                    }
+                    TensorDtype::Q5_1 => {
+                        let blocks = quant::bytes_as_q5_1_blocks(raw).expect("invalid Q5_1 data");
+                        quant::dequantize_q5_1(blocks)
+                    }
+                    TensorDtype::Q4_K => {
+                        let blocks = quant::bytes_as_q4_k_blocks(raw).expect("invalid Q4_K data");
+                        quant::dequantize_q4_k(blocks)
+                    }
+                    TensorDtype::Q5_K => {
+                        let blocks = quant::bytes_as_q5_k_blocks(raw).expect("invalid Q5_K data");
+                        quant::dequantize_q5_k(blocks)
+                    }
+                    TensorDtype::Q6_K => {
+                        let blocks = quant::bytes_as_q6_k_blocks(raw).expect("invalid Q6_K data");
+                        quant::dequantize_q6_k(blocks)
+                    }
+                    _ => unreachable!(),
+                };
+                let n_elements = self.n_elements();
+                Tensor {
+                    shape: self.shape.clone(),
+                    strides: self.strides.clone(),
+                    dtype: TensorDtype::F32,
+                    storage: TensorStorage::F32(data[..n_elements].to_vec()),
                 }
             }
         }
@@ -724,7 +786,7 @@ mod tests {
     // -- from_quantized panics --
 
     #[test]
-    #[should_panic(expected = "from_quantized requires Q8_0 or Q4_0")]
+    #[should_panic(expected = "from_quantized requires a quantized dtype")]
     fn test_from_quantized_wrong_dtype() {
         Tensor::from_quantized(vec![4], TensorDtype::F32, vec![0u8; 16]);
     }

@@ -763,9 +763,7 @@ impl ComputeBackend for MetalBackend {
     }
 
     fn quantized_matmul(&self, weights: &DeviceTensor, input: &DeviceTensor) -> DeviceTensor {
-        // Weights: [N, K] in Q8_0 or Q4_0, Input: [M, K] in F32 → Output: [M, N] in F32
-        // The GPU kernel handles one input row at a time (matrix-vector).
-        // For M > 1, we dispatch per row.
+        // Weights: [N, K] in quantized format, Input: [M, K] in F32 → Output: [M, N] in F32
         let input_shape = input.shape();
         let weight_shape = weights.shape();
         let dtype = weights.dtype();
@@ -780,6 +778,19 @@ impl ComputeBackend for MetalBackend {
             k, weight_shape[1]
         );
 
+        // For K-quant and other types without native GPU kernels, fall back to
+        // dequantizing on CPU and using regular F32 matmul_transpose.
+        if dtype != TensorDtype::Q8_0 && dtype != TensorDtype::Q4_0 {
+            tracing::debug!(
+                ?dtype,
+                "Metal quantized_matmul: no native kernel for {:?}, using dequant fallback",
+                dtype
+            );
+            let weights_f32 = weights.as_tensor().to_f32();
+            let weights_f32_dev = self.upload(&weights_f32);
+            return self.matmul_transpose(input, &weights_f32_dev);
+        }
+
         let out_count = m * n;
         let out_bytes = out_count * std::mem::size_of::<f32>();
 
@@ -787,28 +798,11 @@ impl ComputeBackend for MetalBackend {
             let out_buf = self.create_buffer_empty(out_bytes);
             let weight_buf_id = Self::buf_id(weights);
 
-            // For each row of input, dispatch the quantized kernel.
-            // The kernel computes output[row_offset + i] = dot(dequant(weights[i]), input_row)
-            // for all i in 0..N.
-            //
-            // Since the kernel is a matrix-vector multiply (one input row at a time),
-            // we need to handle M > 1 by dispatching M times with different input offsets.
-            // However, the kernel expects the full input pointer, so we need to create
-            // temporary single-row buffers or adjust the kernel to accept an offset.
-            //
-            // For simplicity, if M == 1 we dispatch directly. For M > 1, we use a loop.
-            // Each iteration dispatches the kernel for one row of input.
-
             for row in 0..m {
-                // Create a temporary buffer for this input row
                 let input_row_data = if let Some(tensor) = input.try_as_tensor() {
                     let f32_data = tensor.as_f32();
                     &f32_data[row * k..(row + 1) * k]
                 } else {
-                    // GPU tensor — read back the full data to extract a row.
-                    // This is suboptimal for multi-row GPU inputs but keeps the kernel simple.
-                    // In practice, quantized_matmul is called with M=1 (single token) or
-                    // with CPU-uploaded input.
                     self.flush();
                     let mb = Self::metal_buffer(input);
                     let ptr = msg_send_ptr(mb.buffer, self.sels.contents) as *const f32;
@@ -824,14 +818,6 @@ impl ComputeBackend for MetalBackend {
 
                         self.set_buffer(enc, weight_buf_id, 0);
                         self.set_buffer(enc, input_row_buf.buffer, 1);
-                        // We need to write to the correct offset in the output buffer.
-                        // Since the kernel always writes to output[0..N], we create a
-                        // temporary output buffer per row and copy later.
-                        // OR, we can offset the output pointer. Metal doesn't support
-                        // buffer offsets in setBuffer at dispatch time easily, but
-                        // we can set the offset parameter.
-                        // Actually, setBuffer:offset:atIndex: supports byte offset.
-                        // So we can offset into the output buffer.
                         msg_send_set_buffer(
                             enc,
                             self.sels.set_buffer,
@@ -842,8 +828,7 @@ impl ComputeBackend for MetalBackend {
                         self.set_u32(enc, n as u32, 3);
                         self.set_u32(enc, k as u32, 4);
 
-                        // N_R0_Q8=2, N_SG_Q8=4 → 8 rows per threadgroup, 128 threads
-                        let threadgroups = (n + 7) / 8; // ceil(N / (N_R0*N_SG))
+                        let threadgroups = (n + 7) / 8;
                         msg_send_dispatch(
                             enc,
                             self.sels.dispatch_threadgroups,
@@ -866,7 +851,6 @@ impl ComputeBackend for MetalBackend {
                         self.set_u32(enc, n as u32, 3);
                         self.set_u32(enc, k as u32, 4);
 
-                        // N_R0_Q4=4, N_SG_Q4=2 → 8 rows per threadgroup, 64 threads
                         let threadgroups = (n + 7) / 8;
                         msg_send_dispatch(
                             enc,
@@ -875,13 +859,9 @@ impl ComputeBackend for MetalBackend {
                             64, 1, 1,
                         );
                     }
-                    _ => panic!(
-                        "quantized_matmul: weights must be Q8_0 or Q4_0, got {:?}",
-                        dtype
-                    ),
+                    _ => unreachable!("handled by fallback above"),
                 }
 
-                // Drop the temporary input row buffer
                 drop(input_row_buf);
             }
 

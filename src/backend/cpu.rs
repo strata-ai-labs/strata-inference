@@ -112,7 +112,7 @@ impl ComputeBackend for CpuBackend {
     }
 
     fn quantized_matmul(&self, weights: &DeviceTensor, input: &DeviceTensor) -> DeviceTensor {
-        // Weights: [N, K] in Q8_0 or Q4_0 format
+        // Weights: [N, K] in quantized format
         // Input: [M, K] in F32
         // Output: [M, N] in F32
         // This is equivalent to input x weights^T but with fused dequantization.
@@ -125,8 +125,8 @@ impl ComputeBackend for CpuBackend {
 
         let dtype = weights.dtype();
         assert!(
-            dtype == TensorDtype::Q8_0 || dtype == TensorDtype::Q4_0,
-            "quantized_matmul: weights must be Q8_0 or Q4_0, got {:?}",
+            dtype.is_quantized(),
+            "quantized_matmul: weights must be quantized, got {:?}",
             dtype
         );
 
@@ -145,15 +145,16 @@ impl ComputeBackend for CpuBackend {
             _ => panic!("quantized_matmul: expected Quantized storage"),
         };
 
+        let block_size = dtype.block_size();
+        let block_byte_size = dtype.block_byte_size();
+        let blocks_per_row = (k + block_size - 1) / block_size;
+        let bytes_per_row = blocks_per_row * block_byte_size;
+
         let mut result = vec![0.0f32; m * n];
 
         match dtype {
             TensorDtype::Q8_0 => {
                 trace!(m, k, n, "CPU quantized_matmul (Q8_0)");
-
-                // Each block = 34 bytes (2 bytes f16 scale + 32 bytes i8 values)
-                let blocks_per_row = (k + 31) / 32;
-                let bytes_per_row = blocks_per_row * 34;
 
                 for i in 0..m {
                     let input_row = &input_data[i * k..i * k + k];
@@ -183,15 +184,6 @@ impl ComputeBackend for CpuBackend {
             TensorDtype::Q4_0 => {
                 trace!(m, k, n, "CPU quantized_matmul (Q4_0)");
 
-                // Q4_0 block: 18 bytes per 32 elements
-                //   2 bytes f16 scale + 16 bytes (32 nibbles, each 4-bit)
-                // Nibble layout (matches llama.cpp / quant.rs dequantize_q4_0):
-                //   Byte j's low nibble  (& 0x0F) → element j      (indices 0..15)
-                //   Byte j's high nibble (>> 4)   → element j + 16 (indices 16..31)
-                // Values are unsigned 0..15, subtract 8 to get signed -8..7.
-                let blocks_per_row = (k + 31) / 32;
-                let bytes_per_row = blocks_per_row * 18;
-
                 for i in 0..m {
                     let input_row = &input_data[i * k..i * k + k];
                     for j in 0..n {
@@ -210,13 +202,10 @@ impl ComputeBackend for CpuBackend {
                             for e in elem_start..elem_end {
                                 let local_idx = e - elem_start;
                                 let nibble = if local_idx < 16 {
-                                    // First 16 elements: low nibble of byte[local_idx]
                                     raw[block_start + 2 + local_idx] & 0x0F
                                 } else {
-                                    // Last 16 elements: high nibble of byte[local_idx - 16]
                                     (raw[block_start + 2 + local_idx - 16] >> 4) & 0x0F
                                 };
-                                // Q4_0: subtract 8 to center around 0
                                 let qs = nibble as i32 - 8;
                                 sum += scale * (qs as f32) * input_row[e];
                             }
@@ -226,7 +215,322 @@ impl ComputeBackend for CpuBackend {
                     }
                 }
             }
-            _ => unreachable!(),
+            TensorDtype::Q4_1 => {
+                trace!(m, k, n, "CPU quantized_matmul (Q4_1)");
+
+                for i in 0..m {
+                    let input_row = &input_data[i * k..i * k + k];
+                    for j in 0..n {
+                        let row_start = j * bytes_per_row;
+                        let mut sum = 0.0f32;
+
+                        for block_idx in 0..blocks_per_row {
+                            let bs = row_start + block_idx * 20;
+                            let d = half::f16::from_bits(
+                                u16::from_le_bytes([raw[bs], raw[bs + 1]])
+                            ).to_f32();
+                            let m_val = half::f16::from_bits(
+                                u16::from_le_bytes([raw[bs + 2], raw[bs + 3]])
+                            ).to_f32();
+
+                            let elem_start = block_idx * 32;
+                            let elem_end = std::cmp::min(elem_start + 32, k);
+
+                            for e in elem_start..elem_end {
+                                let local_idx = e - elem_start;
+                                let nibble = if local_idx < 16 {
+                                    raw[bs + 4 + local_idx] & 0x0F
+                                } else {
+                                    (raw[bs + 4 + local_idx - 16] >> 4) & 0x0F
+                                };
+                                let dequant = nibble as f32 * d + m_val;
+                                sum += dequant * input_row[e];
+                            }
+                        }
+
+                        result[i * n + j] = sum;
+                    }
+                }
+            }
+            TensorDtype::Q5_0 => {
+                trace!(m, k, n, "CPU quantized_matmul (Q5_0)");
+
+                for i in 0..m {
+                    let input_row = &input_data[i * k..i * k + k];
+                    for j in 0..n {
+                        let row_start = j * bytes_per_row;
+                        let mut sum = 0.0f32;
+
+                        for block_idx in 0..blocks_per_row {
+                            let bs = row_start + block_idx * 22;
+                            let d = half::f16::from_bits(
+                                u16::from_le_bytes([raw[bs], raw[bs + 1]])
+                            ).to_f32();
+                            let qh = u32::from_le_bytes([
+                                raw[bs + 2], raw[bs + 3], raw[bs + 4], raw[bs + 5],
+                            ]);
+
+                            let elem_start = block_idx * 32;
+                            let elem_end = std::cmp::min(elem_start + 32, k);
+
+                            for e in elem_start..elem_end {
+                                let local_idx = e - elem_start;
+                                let (nibble, high_bit) = if local_idx < 16 {
+                                    let n = raw[bs + 6 + local_idx] & 0x0F;
+                                    let h = ((qh >> (local_idx as u32)) << 4) & 0x10;
+                                    (n as u32, h)
+                                } else {
+                                    let li = local_idx - 16;
+                                    let n = (raw[bs + 6 + li] >> 4) & 0x0F;
+                                    let h = ((qh >> (li as u32 + 12))) & 0x10;
+                                    (n as u32, h)
+                                };
+                                let qs = (nibble | high_bit) as i32 - 16;
+                                sum += d * qs as f32 * input_row[e];
+                            }
+                        }
+
+                        result[i * n + j] = sum;
+                    }
+                }
+            }
+            TensorDtype::Q5_1 => {
+                trace!(m, k, n, "CPU quantized_matmul (Q5_1)");
+
+                for i in 0..m {
+                    let input_row = &input_data[i * k..i * k + k];
+                    for j in 0..n {
+                        let row_start = j * bytes_per_row;
+                        let mut sum = 0.0f32;
+
+                        for block_idx in 0..blocks_per_row {
+                            let bs = row_start + block_idx * 24;
+                            let d = half::f16::from_bits(
+                                u16::from_le_bytes([raw[bs], raw[bs + 1]])
+                            ).to_f32();
+                            let m_val = half::f16::from_bits(
+                                u16::from_le_bytes([raw[bs + 2], raw[bs + 3]])
+                            ).to_f32();
+                            let qh = u32::from_le_bytes([
+                                raw[bs + 4], raw[bs + 5], raw[bs + 6], raw[bs + 7],
+                            ]);
+
+                            let elem_start = block_idx * 32;
+                            let elem_end = std::cmp::min(elem_start + 32, k);
+
+                            for e in elem_start..elem_end {
+                                let local_idx = e - elem_start;
+                                let (nibble, high_bit) = if local_idx < 16 {
+                                    let n = raw[bs + 8 + local_idx] & 0x0F;
+                                    let h = ((qh >> (local_idx as u32)) << 4) & 0x10;
+                                    (n as u32, h)
+                                } else {
+                                    let li = local_idx - 16;
+                                    let n = (raw[bs + 8 + li] >> 4) & 0x0F;
+                                    let h = ((qh >> (li as u32 + 12))) & 0x10;
+                                    (n as u32, h)
+                                };
+                                let val = (nibble | high_bit) as f32 * d + m_val;
+                                sum += val * input_row[e];
+                            }
+                        }
+
+                        result[i * n + j] = sum;
+                    }
+                }
+            }
+            TensorDtype::Q4_K => {
+                trace!(m, k, n, "CPU quantized_matmul (Q4_K)");
+                use crate::gguf::quant::get_scale_min_k4;
+
+                for i in 0..m {
+                    let input_row = &input_data[i * k..i * k + k];
+                    for j in 0..n {
+                        let row_start = j * bytes_per_row;
+                        let mut sum = 0.0f32;
+
+                        for block_idx in 0..blocks_per_row {
+                            let bs = row_start + block_idx * 144;
+                            let d_val = half::f16::from_bits(
+                                u16::from_le_bytes([raw[bs], raw[bs + 1]])
+                            ).to_f32();
+                            let dmin = half::f16::from_bits(
+                                u16::from_le_bytes([raw[bs + 2], raw[bs + 3]])
+                            ).to_f32();
+                            let scales: [u8; 12] = raw[bs + 4..bs + 16].try_into().unwrap();
+                            let qs_start = bs + 16; // qs[128]
+
+                            let elem_start = block_idx * 256;
+                            let mut is = 0usize;
+                            let mut q_off = 0usize;
+
+                            for _chunk in 0..4 {
+                                let (sc1, m1) = get_scale_min_k4(is, &scales);
+                                let d1 = d_val * sc1 as f32;
+                                let m1 = dmin * m1 as f32;
+                                let (sc2, m2) = get_scale_min_k4(is + 1, &scales);
+                                let d2 = d_val * sc2 as f32;
+                                let m2 = dmin * m2 as f32;
+
+                                // First 32: low nibbles
+                                for l in 0..32 {
+                                    let e = elem_start + is / 2 * 64 + l;
+                                    if e < k {
+                                        let q = (raw[qs_start + q_off + l] & 0xF) as f32;
+                                        sum += (d1 * q - m1) * input_row[e];
+                                    }
+                                }
+                                // Next 32: high nibbles
+                                for l in 0..32 {
+                                    let e = elem_start + is / 2 * 64 + 32 + l;
+                                    if e < k {
+                                        let q = (raw[qs_start + q_off + l] >> 4) as f32;
+                                        sum += (d2 * q - m2) * input_row[e];
+                                    }
+                                }
+                                q_off += 32;
+                                is += 2;
+                            }
+                        }
+
+                        result[i * n + j] = sum;
+                    }
+                }
+            }
+            TensorDtype::Q5_K => {
+                trace!(m, k, n, "CPU quantized_matmul (Q5_K)");
+                use crate::gguf::quant::get_scale_min_k4;
+
+                for i in 0..m {
+                    let input_row = &input_data[i * k..i * k + k];
+                    for j in 0..n {
+                        let row_start = j * bytes_per_row;
+                        let mut sum = 0.0f32;
+
+                        for block_idx in 0..blocks_per_row {
+                            let bs = row_start + block_idx * 176;
+                            let d_val = half::f16::from_bits(
+                                u16::from_le_bytes([raw[bs], raw[bs + 1]])
+                            ).to_f32();
+                            let dmin = half::f16::from_bits(
+                                u16::from_le_bytes([raw[bs + 2], raw[bs + 3]])
+                            ).to_f32();
+                            let scales: [u8; 12] = raw[bs + 4..bs + 16].try_into().unwrap();
+                            let qh_start = bs + 16; // qh[32]
+                            let qs_start = bs + 48; // qs[128]
+
+                            let elem_start = block_idx * 256;
+                            let mut is = 0usize;
+                            let mut ql_off = 0usize;
+                            let mut u1: u8 = 1;
+                            let mut u2: u8 = 2;
+
+                            for _chunk in 0..4 {
+                                let (sc1, m1) = get_scale_min_k4(is, &scales);
+                                let d1 = d_val * sc1 as f32;
+                                let m1 = dmin * m1 as f32;
+                                let (sc2, m2) = get_scale_min_k4(is + 1, &scales);
+                                let d2 = d_val * sc2 as f32;
+                                let m2 = dmin * m2 as f32;
+
+                                for l in 0..32 {
+                                    let e = elem_start + is / 2 * 64 + l;
+                                    if e < k {
+                                        let high = if raw[qh_start + l] & u1 != 0 { 16u32 } else { 0 };
+                                        let q = (raw[qs_start + ql_off + l] & 0xF) as u32 + high;
+                                        sum += (d1 * q as f32 - m1) * input_row[e];
+                                    }
+                                }
+                                for l in 0..32 {
+                                    let e = elem_start + is / 2 * 64 + 32 + l;
+                                    if e < k {
+                                        let high = if raw[qh_start + l] & u2 != 0 { 16u32 } else { 0 };
+                                        let q = (raw[qs_start + ql_off + l] >> 4) as u32 + high;
+                                        sum += (d2 * q as f32 - m2) * input_row[e];
+                                    }
+                                }
+                                ql_off += 32;
+                                is += 2;
+                                u1 = u1.wrapping_shl(2);
+                                u2 = u2.wrapping_shl(2);
+                            }
+                        }
+
+                        result[i * n + j] = sum;
+                    }
+                }
+            }
+            TensorDtype::Q6_K => {
+                trace!(m, k, n, "CPU quantized_matmul (Q6_K)");
+
+                for i in 0..m {
+                    let input_row = &input_data[i * k..i * k + k];
+                    for j in 0..n {
+                        let row_start = j * bytes_per_row;
+                        let mut sum = 0.0f32;
+
+                        for block_idx in 0..blocks_per_row {
+                            let bs = row_start + block_idx * 210;
+                            // Q6_K layout: ql[128] | qh[64] | scales[16] | d(f16)
+                            let ql_start = bs;
+                            let qh_start = bs + 128;
+                            let sc_start = bs + 192;
+                            let d_val = half::f16::from_bits(
+                                u16::from_le_bytes([raw[bs + 208], raw[bs + 209]])
+                            ).to_f32();
+
+                            let elem_start = block_idx * 256;
+                            let mut ql_off = 0usize;
+                            let mut qh_off = 0usize;
+                            let mut sc_off = 0usize;
+
+                            for _n_chunk in 0..2 {
+                                // 128 values per chunk
+                                for l in 0..32 {
+                                    let is = l / 16;
+                                    let ql_byte0 = raw[ql_start + ql_off + l];
+                                    let ql_byte1 = raw[ql_start + ql_off + l + 32];
+                                    let qh_byte = raw[qh_start + qh_off + l];
+                                    let sc = raw[sc_start + sc_off + is] as i8;
+
+                                    let q1 = ((ql_byte0 & 0xF) | (((qh_byte >> 0) & 3) << 4)) as i32 - 32;
+                                    let e1 = elem_start + _n_chunk * 128 + l;
+                                    if e1 < k {
+                                        sum += d_val * sc as f32 * q1 as f32 * input_row[e1];
+                                    }
+
+                                    let sc2 = raw[sc_start + sc_off + is + 2] as i8;
+                                    let q2 = ((ql_byte1 & 0xF) | (((qh_byte >> 2) & 3) << 4)) as i32 - 32;
+                                    let e2 = elem_start + _n_chunk * 128 + l + 32;
+                                    if e2 < k {
+                                        sum += d_val * sc2 as f32 * q2 as f32 * input_row[e2];
+                                    }
+
+                                    let sc3 = raw[sc_start + sc_off + is + 4] as i8;
+                                    let q3 = ((ql_byte0 >> 4) | (((qh_byte >> 4) & 3) << 4)) as i32 - 32;
+                                    let e3 = elem_start + _n_chunk * 128 + l + 64;
+                                    if e3 < k {
+                                        sum += d_val * sc3 as f32 * q3 as f32 * input_row[e3];
+                                    }
+
+                                    let sc4 = raw[sc_start + sc_off + is + 6] as i8;
+                                    let q4 = ((ql_byte1 >> 4) | (((qh_byte >> 6) & 3) << 4)) as i32 - 32;
+                                    let e4 = elem_start + _n_chunk * 128 + l + 96;
+                                    if e4 < k {
+                                        sum += d_val * sc4 as f32 * q4 as f32 * input_row[e4];
+                                    }
+                                }
+                                ql_off += 64;
+                                qh_off += 32;
+                                sc_off += 8;
+                            }
+                        }
+
+                        result[i * n + j] = sum;
+                    }
+                }
+            }
+            _ => unreachable!("quantized_matmul: unsupported dtype {:?}", dtype),
         }
 
         DeviceTensor::new(Tensor::new(vec![m, n], result))
@@ -1659,6 +1963,242 @@ mod tests {
             "Q4_0 asymmetric matmul ({}) must match dequant reference ({})",
             matmul_val,
             ref_sum
+        );
+    }
+
+    // ---- quantized_matmul for new K-quant types ----
+
+    #[test]
+    fn test_quantized_matmul_q4_1_vs_dequant() {
+        use crate::gguf::quant::{BlockQ4_1, dequantize_q4_1, f32_to_f16};
+
+        let b = backend();
+        let block = BlockQ4_1 {
+            d: f32_to_f16(0.5),
+            m: f32_to_f16(0.25),
+            qs: {
+                let mut qs = [0u8; 16];
+                for j in 0..16 { qs[j] = (j as u8) | ((j as u8) << 4); }
+                qs
+            },
+        };
+        let reference = dequantize_q4_1(&[block]);
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&f32_to_f16(0.5).to_le_bytes());
+        raw.extend_from_slice(&f32_to_f16(0.25).to_le_bytes());
+        for j in 0..16u8 { raw.push(j | (j << 4)); }
+
+        let weights = Tensor::from_quantized(vec![1, 32], TensorDtype::Q4_1, raw);
+        let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
+
+        let result = b.quantized_matmul(&dt(weights), &dt(input));
+        let matmul_val = result.as_tensor().as_f32()[0];
+        let ref_sum: f32 = reference.iter().sum();
+        assert!(
+            (matmul_val - ref_sum).abs() < 0.1,
+            "Q4_1 matmul ({}) must match dequant reference ({})",
+            matmul_val, ref_sum
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q6_k_vs_dequant() {
+        use crate::gguf::quant::{BlockQ6K, dequantize_q6_k, f32_to_f16};
+
+        let b = backend();
+        // Create a Q6_K block with known scale and data
+        let mut block = BlockQ6K {
+            ql: [0; 128],
+            qh: [0; 64],
+            scales: [0; 16],
+            d: f32_to_f16(0.1),
+        };
+        block.scales[0] = 2; // First 16 elements use scale 2
+
+        let reference = dequantize_q6_k(&[block]);
+
+        // Build raw bytes in block layout order: ql[128] | qh[64] | scales[16] | d(2)
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block.ql);
+        raw.extend_from_slice(&block.qh);
+        raw.extend_from_slice(unsafe { &std::mem::transmute::<[i8; 16], [u8; 16]>(block.scales) });
+        raw.extend_from_slice(&block.d.to_le_bytes());
+        assert_eq!(raw.len(), 210);
+
+        let weights = Tensor::from_quantized(vec![1, 256], TensorDtype::Q6_K, raw);
+        let input = Tensor::new(vec![1, 256], vec![1.0f32; 256]);
+
+        let result = b.quantized_matmul(&dt(weights), &dt(input));
+        let matmul_val = result.as_tensor().as_f32()[0];
+        let ref_sum: f32 = reference.iter().sum();
+        assert!(
+            (matmul_val - ref_sum).abs() < 0.1,
+            "Q6_K matmul ({}) must match dequant reference ({})",
+            matmul_val, ref_sum
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q4_k_vs_dequant() {
+        use crate::gguf::quant::{BlockQ4K, dequantize_q4_k, f32_to_f16};
+
+        let b = backend();
+        let mut block = BlockQ4K {
+            d: f32_to_f16(1.0),
+            dmin: f32_to_f16(0.0),
+            scales: [0; 12],
+            qs: [0x55; 128], // low=5, high=5
+        };
+        block.scales[0] = 1; // Scale for sub-block 0
+        block.scales[1] = 2; // Scale for sub-block 1
+        block.scales[4] = 1; // Min for sub-block 0
+        block.scales[5] = 1; // Min for sub-block 1
+
+        let reference = dequantize_q4_k(&[block]);
+
+        // Build raw bytes
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block.d.to_le_bytes());
+        raw.extend_from_slice(&block.dmin.to_le_bytes());
+        raw.extend_from_slice(&block.scales);
+        raw.extend_from_slice(&block.qs);
+        assert_eq!(raw.len(), 144);
+
+        let weights = Tensor::from_quantized(vec![1, 256], TensorDtype::Q4_K, raw);
+        let input = Tensor::new(vec![1, 256], vec![1.0f32; 256]);
+
+        let result = b.quantized_matmul(&dt(weights), &dt(input));
+        let matmul_val = result.as_tensor().as_f32()[0];
+        let ref_sum: f32 = reference.iter().sum();
+        assert!(
+            (matmul_val - ref_sum).abs() < 0.1,
+            "Q4_K matmul ({}) must match dequant reference ({})",
+            matmul_val, ref_sum
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q5_0_vs_dequant() {
+        use crate::gguf::quant::{BlockQ5_0, dequantize_q5_0, f32_to_f16};
+
+        let b = backend();
+        // d=2.0, qs with varied nibbles, qh with some bits set
+        let block = BlockQ5_0 {
+            d: f32_to_f16(2.0),
+            qh: {
+                // Set alternating bits: 0x55555555 = bits 0,2,4,...
+                let val: u32 = 0x55555555;
+                val.to_le_bytes()
+            },
+            qs: {
+                let mut qs = [0u8; 16];
+                for j in 0..16 { qs[j] = ((j as u8) & 0xF) | (((15 - j) as u8) << 4); }
+                qs
+            },
+        };
+        let reference = dequantize_q5_0(&[block]);
+
+        // Build raw bytes: d(2) | qh(4) | qs(16) = 22 bytes
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block.d.to_le_bytes());
+        raw.extend_from_slice(&block.qh);
+        raw.extend_from_slice(&block.qs);
+        assert_eq!(raw.len(), 22);
+
+        let weights = Tensor::from_quantized(vec![1, 32], TensorDtype::Q5_0, raw);
+        let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
+
+        let result = b.quantized_matmul(&dt(weights), &dt(input));
+        let matmul_val = result.as_tensor().as_f32()[0];
+        let ref_sum: f32 = reference.iter().sum();
+        assert!(
+            (matmul_val - ref_sum).abs() < 0.1,
+            "Q5_0 matmul ({}) must match dequant reference ({})",
+            matmul_val, ref_sum
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q5_1_vs_dequant() {
+        use crate::gguf::quant::{BlockQ5_1, dequantize_q5_1, f32_to_f16};
+
+        let b = backend();
+        let block = BlockQ5_1 {
+            d: f32_to_f16(0.5),
+            m: f32_to_f16(1.0),
+            qh: {
+                let val: u32 = 0xAAAAAAAA; // bits 1,3,5,...
+                val.to_le_bytes()
+            },
+            qs: {
+                let mut qs = [0u8; 16];
+                for j in 0..16 { qs[j] = 0xA5; } // low=5, high=10
+                qs
+            },
+        };
+        let reference = dequantize_q5_1(&[block]);
+
+        // Build raw bytes: d(2) | m(2) | qh(4) | qs(16) = 24 bytes
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block.d.to_le_bytes());
+        raw.extend_from_slice(&block.m.to_le_bytes());
+        raw.extend_from_slice(&block.qh);
+        raw.extend_from_slice(&block.qs);
+        assert_eq!(raw.len(), 24);
+
+        let weights = Tensor::from_quantized(vec![1, 32], TensorDtype::Q5_1, raw);
+        let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
+
+        let result = b.quantized_matmul(&dt(weights), &dt(input));
+        let matmul_val = result.as_tensor().as_f32()[0];
+        let ref_sum: f32 = reference.iter().sum();
+        assert!(
+            (matmul_val - ref_sum).abs() < 0.1,
+            "Q5_1 matmul ({}) must match dequant reference ({})",
+            matmul_val, ref_sum
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q5_k_vs_dequant() {
+        use crate::gguf::quant::{BlockQ5K, dequantize_q5_k, f32_to_f16};
+
+        let b = backend();
+        let mut block = BlockQ5K {
+            d: f32_to_f16(1.0),
+            dmin: f32_to_f16(0.5),
+            scales: [0; 12],
+            qh: [0xFF; 32], // all high bits set — exercises wrapping_shl path
+            qs: [0x33; 128], // nibbles = 3
+        };
+        // Set scales for first 4 sub-blocks
+        for i in 0..4 {
+            block.scales[i] = 2;     // scale
+            block.scales[i + 4] = 1; // min
+        }
+
+        let reference = dequantize_q5_k(&[block]);
+
+        // Build raw bytes: d(2) | dmin(2) | scales(12) | qh(32) | qs(128) = 176
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block.d.to_le_bytes());
+        raw.extend_from_slice(&block.dmin.to_le_bytes());
+        raw.extend_from_slice(&block.scales);
+        raw.extend_from_slice(&block.qh);
+        raw.extend_from_slice(&block.qs);
+        assert_eq!(raw.len(), 176);
+
+        let weights = Tensor::from_quantized(vec![1, 256], TensorDtype::Q5_K, raw);
+        let input = Tensor::new(vec![1, 256], vec![1.0f32; 256]);
+
+        let result = b.quantized_matmul(&dt(weights), &dt(input));
+        let matmul_val = result.as_tensor().as_f32()[0];
+        let ref_sum: f32 = reference.iter().sum();
+        assert!(
+            (matmul_val - ref_sum).abs() < 0.5,
+            "Q5_K matmul ({}) must match dequant reference ({})",
+            matmul_val, ref_sum
         );
     }
 
