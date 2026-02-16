@@ -173,13 +173,24 @@ pub fn create_tokenizer_from_gguf(
             _ => Vec::new(),
         };
 
-        let merges: Vec<String> = gguf
-            .get_str_array("tokenizer.ggml.merges")
-            .map(|v| v.into_iter().map(|s| s.to_string()).collect())
-            .unwrap_or_default();
+        // For SentencePiece models (model_type = "llama"), merges may be present
+        // in the GGUF but should NOT be used — score-based tokenization takes
+        // precedence. Only use merges for GPT-2/BPE-style models.
+        let merges: Vec<String> = if model_type == "gpt2" {
+            gguf.get_str_array("tokenizer.ggml.merges")
+                .map(|v| v.into_iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let add_bos = gguf.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(false);
         let add_eos = gguf.get_bool("tokenizer.ggml.add_eos_token").unwrap_or(false);
+        // SentencePiece models default to adding space prefix (leading underline).
+        // Gemma models set this to false.
+        let add_space_prefix = gguf
+            .get_bool("tokenizer.ggml.add_space_prefix")
+            .unwrap_or(true);
 
         Ok(Box::new(BpeTokenizer::new(
             tokens,
@@ -191,6 +202,7 @@ pub fn create_tokenizer_from_gguf(
             pad_id,
             add_bos,
             add_eos,
+            add_space_prefix,
         )))
     }
 }

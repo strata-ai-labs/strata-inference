@@ -62,6 +62,9 @@ const SPIECE_UNDERLINE: char = '\u{2581}';
 /// - If `merges` is non-empty, rank-based merging is used (GPT-style BPE).
 /// - If `merges` is empty, score-based merging is used (SentencePiece BPE),
 ///   where `scores` determines merge priority (higher score = higher priority).
+/// GGUF token type for USER_DEFINED tokens.
+const TOKEN_TYPE_USER_DEFINED: u32 = 4;
+
 pub struct BpeTokenizer {
     /// Token string -> token ID.
     token_to_id: HashMap<String, u32>,
@@ -84,6 +87,13 @@ pub struct BpeTokenizer {
     add_bos: bool,
     /// Whether to automatically append EOS when encoding.
     add_eos: bool,
+    /// Whether to prepend the SentencePiece underline at the start of text.
+    /// Defaults to true for SentencePiece models, but Gemma sets this to false.
+    add_space_prefix: bool,
+    /// USER_DEFINED tokens to match literally before BPE.
+    /// Sorted by token text length (longest first) for greedy matching.
+    /// Each entry is (token_text, token_id).
+    user_defined_tokens: Vec<(String, u32)>,
 }
 
 impl BpeTokenizer {
@@ -94,7 +104,8 @@ impl BpeTokenizer {
     /// * `tokens` - Vocabulary tokens, indexed by token ID.
     /// * `scores` - Token scores/log-probabilities (one per token). Used for
     ///   SentencePiece-style score-based merging when `merges` is empty.
-    /// * `_token_types` - Token type flags (reserved for future use).
+    /// * `token_types` - Token type flags from GGUF. Type 4 (USER_DEFINED) tokens
+    ///   are matched literally in the input text before BPE runs.
     /// * `merges` - Explicit merge rules in `"left right"` format. If non-empty,
     ///   rank-based merging is used. If empty, score-based merging is used.
     /// * `bos_id` - Beginning-of-sequence token ID.
@@ -102,16 +113,18 @@ impl BpeTokenizer {
     /// * `pad_id` - Padding token ID.
     /// * `add_bos` - Whether to prepend BOS token during encoding.
     /// * `add_eos` - Whether to append EOS token during encoding.
+    /// * `add_space_prefix` - Whether to prepend SentencePiece underline to input text.
     pub fn new(
         tokens: Vec<String>,
         scores: Vec<f32>,
-        _token_types: Vec<u32>,
+        token_types: Vec<u32>,
         merges: Vec<String>,
         bos_id: Option<u32>,
         eos_id: Option<u32>,
         pad_id: Option<u32>,
         add_bos: bool,
         add_eos: bool,
+        add_space_prefix: bool,
     ) -> Self {
         let use_scores = merges.is_empty();
 
@@ -129,9 +142,24 @@ impl BpeTokenizer {
             }
         }
 
+        // Collect USER_DEFINED tokens for literal pre-matching.
+        // These are matched in the raw input text before BPE runs, sorted
+        // by length (longest first) so greedy matching picks the longest match.
+        let mut user_defined_tokens: Vec<(String, u32)> = Vec::new();
+        if use_scores {
+            for (i, tok) in tokens.iter().enumerate() {
+                let tt = token_types.get(i).copied().unwrap_or(0);
+                if tt == TOKEN_TYPE_USER_DEFINED && !tok.is_empty() {
+                    user_defined_tokens.push((tok.clone(), i as u32));
+                }
+            }
+            user_defined_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        }
+
         debug!(
             vocab_size = tokens.len(),
             merge_count = merge_ranks.len(),
+            user_defined_count = user_defined_tokens.len(),
             use_scores,
             "BPE tokenizer initialized"
         );
@@ -147,6 +175,8 @@ impl BpeTokenizer {
             pad_id,
             add_bos,
             add_eos,
+            add_space_prefix,
+            user_defined_tokens,
         }
     }
 
@@ -397,12 +427,13 @@ impl BpeTokenizer {
 
         if self.use_scores {
             // SentencePiece: replace spaces with the underline marker.
-            // The underline is prepended to the text and replaces all spaces.
-            let processed = format!(
-                "{}{}",
-                SPIECE_UNDERLINE,
-                text.replace(' ', &SPIECE_UNDERLINE.to_string())
-            );
+            // The underline is prepended to the text only if add_space_prefix is true.
+            let with_underlines = text.replace(' ', &SPIECE_UNDERLINE.to_string());
+            let processed = if self.add_space_prefix {
+                format!("{}{}", SPIECE_UNDERLINE, with_underlines)
+            } else {
+                with_underlines
+            };
             vec![processed]
         } else {
             // GPT-style: split into words with whitespace handling,
@@ -413,6 +444,83 @@ impl BpeTokenizer {
                 .collect()
         }
     }
+
+    /// Partition the raw input text by matching USER_DEFINED tokens.
+    ///
+    /// Scans for USER_DEFINED token strings (longest first) and splits the text
+    /// into alternating RawText/Token fragments. This mimics llama.cpp's
+    /// `tokenizer_st_partition` which handles USER_DEFINED tokens before the
+    /// SentencePiece BPE algorithm runs.
+    fn partition_user_defined(&self, text: &str) -> Vec<Fragment> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        let mut fragments = vec![Fragment::RawText(text.to_string())];
+
+        for (token_text, token_id) in &self.user_defined_tokens {
+            let mut new_fragments = Vec::new();
+
+            for fragment in fragments {
+                match fragment {
+                    Fragment::Token(id) => {
+                        new_fragments.push(Fragment::Token(id));
+                    }
+                    Fragment::RawText(raw) => {
+                        // Search for all occurrences of token_text in raw.
+                        let mut offset = 0;
+                        while offset < raw.len() {
+                            if let Some(pos) = raw[offset..].find(token_text.as_str()) {
+                                let abs_pos = offset + pos;
+                                // Text before the match.
+                                if abs_pos > offset {
+                                    new_fragments.push(Fragment::RawText(
+                                        raw[offset..abs_pos].to_string(),
+                                    ));
+                                }
+                                // The matched token.
+                                new_fragments.push(Fragment::Token(*token_id));
+                                offset = abs_pos + token_text.len();
+                            } else {
+                                break;
+                            }
+                        }
+                        // Remaining text after all matches.
+                        if offset < raw.len() {
+                            new_fragments.push(Fragment::RawText(raw[offset..].to_string()));
+                        }
+                    }
+                }
+            }
+
+            fragments = new_fragments;
+        }
+
+        fragments
+    }
+
+    /// Process a raw text fragment for SentencePiece encoding.
+    ///
+    /// Applies space→▁ conversion and optionally prepends the ▁ prefix.
+    fn spm_process_fragment(&self, text: &str, is_first: bool) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        let with_underlines = text.replace(' ', &SPIECE_UNDERLINE.to_string());
+        if self.add_space_prefix && is_first {
+            format!("{}{}", SPIECE_UNDERLINE, with_underlines)
+        } else {
+            with_underlines
+        }
+    }
+}
+
+/// Fragment produced by USER_DEFINED token partitioning.
+enum Fragment {
+    /// A resolved token ID (from a USER_DEFINED token match).
+    Token(u32),
+    /// Raw text that still needs BPE encoding.
+    RawText(String),
 }
 
 impl Tokenizer for BpeTokenizer {
@@ -426,11 +534,35 @@ impl Tokenizer for BpeTokenizer {
             }
         }
 
-        // Pre-tokenize and encode each piece.
-        let pieces = self.pre_tokenize(text);
-        for piece in &pieces {
-            let ids = self.encode_word(piece);
-            output.extend_from_slice(&ids);
+        if self.use_scores && !self.user_defined_tokens.is_empty() {
+            // SentencePiece path with USER_DEFINED tokens: pre-match them
+            // against the raw input text (before space→▁ conversion), then
+            // run BPE only on the remaining raw text fragments.
+            let fragments = self.partition_user_defined(text);
+            let mut is_first_raw = true;
+            for fragment in &fragments {
+                match fragment {
+                    Fragment::Token(id) => {
+                        output.push(*id);
+                        is_first_raw = true;
+                    }
+                    Fragment::RawText(raw) => {
+                        let processed = self.spm_process_fragment(raw, is_first_raw);
+                        if !processed.is_empty() {
+                            let ids = self.encode_word(&processed);
+                            output.extend_from_slice(&ids);
+                        }
+                        is_first_raw = false;
+                    }
+                }
+            }
+        } else {
+            // Standard path: pre-tokenize and encode each piece.
+            let pieces = self.pre_tokenize(text);
+            for piece in &pieces {
+                let ids = self.encode_word(piece);
+                output.extend_from_slice(&ids);
+            }
         }
 
         // Append EOS if configured and requested.
@@ -847,6 +979,7 @@ mod tests {
             Some(0),
             add_bos,
             add_eos,
+            true, // add_space_prefix
         )
     }
 
@@ -907,6 +1040,7 @@ mod tests {
             Some(0),
             false,
             false,
+            true, // add_space_prefix (not used for rank-based)
         )
     }
 
@@ -1168,6 +1302,7 @@ mod tests {
             Some(0),
             false,
             false,
+            true, // add_space_prefix
         );
 
         // Encoding a character not in vocab should fall back to byte tokens.
@@ -1408,6 +1543,7 @@ mod tests {
             tokens, scores, token_types, vec![],
             Some(1), Some(2), Some(0),
             true, true,
+            true, // add_space_prefix
         );
         let ids = tok.encode("h", true);
         assert_eq!(ids[0], 1); // BOS
@@ -1468,6 +1604,7 @@ mod tests {
             tokens, vec![0.0; 2], vec![0; 2], vec![],
             None, None, None,
             false, false,
+            true, // add_space_prefix
         );
         assert_eq!(tok.bos_token_id(), None);
         assert_eq!(tok.eos_token_id(), None);
@@ -1595,6 +1732,7 @@ mod tests {
             Some(0),
             false,
             false,
+            true, // add_space_prefix (not used for rank-based)
         )
     }
 
@@ -1675,6 +1813,7 @@ mod tests {
             Some(0),
             false,
             false,
+            true, // add_space_prefix (not used for rank-based)
         );
 
         // Encoding "A" should produce the byte-encoded token for 'A' = 0x41.
