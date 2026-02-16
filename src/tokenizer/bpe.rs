@@ -11,10 +11,43 @@
 //! `\u{2581}` character (LOWER ONE EIGHTH BLOCK) as a word-boundary marker.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use tracing::debug;
 
 use super::Tokenizer;
+
+/// GPT-2 byte-to-UTF8 mapping table.
+/// Maps each byte 0..255 to a single Unicode codepoint (as a String).
+/// Printable ASCII and Latin-1 supplement ranges map to themselves;
+/// remaining 68 bytes map to codepoints 256..323 (Ā, ā, Ă, etc.).
+static BYTE_TO_UNICODE: LazyLock<[String; 256]> = LazyLock::new(build_byte_to_unicode);
+
+/// Reverse mapping: Unicode string (single char) -> original byte value.
+static UNICODE_TO_BYTE: LazyLock<HashMap<String, u8>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    for (byte, s) in BYTE_TO_UNICODE.iter().enumerate() {
+        map.insert(s.clone(), byte as u8);
+    }
+    map
+});
+
+fn build_byte_to_unicode() -> [String; 256] {
+    let mut table: [String; 256] = std::array::from_fn(|_| String::new());
+    let mut n: u32 = 0;
+    for byte in 0u16..256 {
+        let is_direct = matches!(byte, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF);
+        let codepoint = if is_direct {
+            byte as u32
+        } else {
+            let cp = 256 + n;
+            n += 1;
+            cp
+        };
+        table[byte as usize] = char::from_u32(codepoint).unwrap().to_string();
+    }
+    table
+}
 
 /// The SentencePiece word-boundary marker character.
 const SPIECE_UNDERLINE: char = '\u{2581}';
@@ -314,16 +347,37 @@ impl BpeTokenizer {
         queue.sort_by(|a, b| self.compare_bigrams(a, b));
     }
 
-    /// Encode unknown bytes using byte-fallback tokens `<0x00>` .. `<0xFF>`.
+    /// Encode unknown bytes using byte-fallback tokens.
+    ///
+    /// For SentencePiece (use_scores=true): uses `<0xNN>` format.
+    /// For GPT-2 (use_scores=false): uses byte-to-unicode table.
     fn byte_fallback(&self, text: &str, output: &mut Vec<u32>) {
-        for byte in text.bytes() {
-            let byte_token = format!("<0x{:02X}>", byte);
-            if let Some(&id) = self.token_to_id.get(&byte_token) {
-                output.push(id);
+        if self.use_scores {
+            // SentencePiece: <0xNN> format
+            for byte in text.bytes() {
+                let byte_token = format!("<0x{:02X}>", byte);
+                if let Some(&id) = self.token_to_id.get(&byte_token) {
+                    output.push(id);
+                }
             }
-            // If byte token not in vocab, silently skip (shouldn't happen in
-            // well-formed models).
+        } else {
+            // GPT-2: use byte-to-unicode table
+            for byte in text.bytes() {
+                let encoded = &BYTE_TO_UNICODE[byte as usize];
+                if let Some(&id) = self.token_to_id.get(encoded) {
+                    output.push(id);
+                }
+            }
         }
+    }
+
+    /// Encode each byte of a word through the GPT-2 byte-to-unicode table.
+    fn byte_encode_word(word: &str) -> String {
+        let mut encoded = String::with_capacity(word.len());
+        for byte in word.bytes() {
+            encoded.push_str(&BYTE_TO_UNICODE[byte as usize]);
+        }
+        encoded
     }
 
     /// Pre-tokenize text into pieces suitable for BPE encoding.
@@ -351,8 +405,12 @@ impl BpeTokenizer {
             );
             vec![processed]
         } else {
-            // GPT-style: split into words with whitespace handling.
+            // GPT-style: split into words with whitespace handling,
+            // then byte-encode each piece through the GPT-2 table.
             gpt_pre_tokenize(text)
+                .into_iter()
+                .map(|piece| Self::byte_encode_word(&piece))
+                .collect()
         }
     }
 }
@@ -396,23 +454,72 @@ impl Tokenizer for BpeTokenizer {
                 {
                     continue;
                 }
-                // Handle byte tokens <0xNN>.
-                if token.starts_with("<0x") && token.ends_with('>') && token.len() == 6 {
-                    if let Ok(byte_val) = u8::from_str_radix(&token[3..5], 16) {
-                        text.push(byte_val as char);
-                        continue;
-                    }
-                }
                 text.push_str(token);
             }
         }
-        // Replace SentencePiece underline with space.
-        let result = text.replace(SPIECE_UNDERLINE, " ");
-        // Strip leading space that comes from the initial underline.
-        if result.starts_with(' ') {
-            result[1..].to_string()
+
+        if self.use_scores {
+            // SentencePiece decoding: handle <0xNN> byte tokens and underline.
+            let mut result = String::new();
+            let mut chars = text.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch == '<' {
+                    // Try to parse <0xNN> byte token
+                    let mut hex_buf = String::new();
+                    hex_buf.push(ch);
+                    let mut matched = false;
+                    // Peek ahead for "0x" + 2 hex digits + ">"
+                    let mut lookahead: Vec<char> = Vec::new();
+                    for _ in 0..5 {
+                        if let Some(&c) = chars.peek() {
+                            lookahead.push(c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if lookahead.len() == 5
+                        && lookahead[0] == '0'
+                        && lookahead[1] == 'x'
+                        && lookahead[4] == '>'
+                    {
+                        let hex_str: String =
+                            [lookahead[2], lookahead[3]].iter().collect();
+                        if let Ok(byte_val) = u8::from_str_radix(&hex_str, 16) {
+                            result.push(byte_val as char);
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        result.push(ch);
+                        for c in lookahead {
+                            result.push(c);
+                        }
+                    }
+                } else {
+                    result.push(ch);
+                }
+            }
+            // Replace SentencePiece underline with space.
+            let result = result.replace(SPIECE_UNDERLINE, " ");
+            // Strip leading space that comes from the initial underline.
+            if result.starts_with(' ') {
+                result[1..].to_string()
+            } else {
+                result
+            }
         } else {
-            result
+            // GPT-2 decoding: reverse the byte-to-unicode mapping.
+            let mut bytes = Vec::new();
+            for ch in text.chars() {
+                let s = ch.to_string();
+                if let Some(&byte) = UNICODE_TO_BYTE.get(&s) {
+                    bytes.push(byte);
+                }
+                // Characters not in the reverse map are dropped (shouldn't
+                // happen with well-formed GPT-2 tokens).
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
         }
     }
 
@@ -1368,5 +1475,214 @@ mod tests {
         let ids = tok.encode("a", true);
         // No BOS/EOS to add since they are None
         assert_eq!(ids, vec![0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // GPT-2 byte-level encoding tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_byte_to_unicode_table_size() {
+        // Table must cover all 256 byte values.
+        assert_eq!(BYTE_TO_UNICODE.len(), 256);
+        // Every entry should be a single Unicode codepoint.
+        for s in BYTE_TO_UNICODE.iter() {
+            assert_eq!(s.chars().count(), 1, "entry {:?} is not a single char", s);
+        }
+    }
+
+    #[test]
+    fn test_byte_to_unicode_known_mappings() {
+        // Printable ASCII maps to itself.
+        assert_eq!(BYTE_TO_UNICODE[b'A' as usize], "A");
+        assert_eq!(BYTE_TO_UNICODE[b'z' as usize], "z");
+        assert_eq!(BYTE_TO_UNICODE[b'!' as usize], "!");
+        assert_eq!(BYTE_TO_UNICODE[b'~' as usize], "~");
+
+        // Space (0x20) is NOT in the direct range, so it maps to a codepoint >= 256.
+        let space_char = BYTE_TO_UNICODE[0x20].chars().next().unwrap();
+        assert!(space_char as u32 >= 256, "space should map to extended codepoint");
+        // Specifically, 0x20 is the 33rd non-direct byte (bytes 0x00..=0x20),
+        // so it maps to 256 + 32 = 288 = 'Ġ'.
+        assert_eq!(space_char, 'Ġ');
+
+        // Null byte (0x00) maps to 256 = 'Ā'.
+        assert_eq!(BYTE_TO_UNICODE[0x00].chars().next().unwrap(), 'Ā');
+    }
+
+    #[test]
+    fn test_unicode_to_byte_roundtrip() {
+        // Every byte -> unicode -> byte roundtrip should be lossless.
+        for byte in 0u8..=255 {
+            let encoded = &BYTE_TO_UNICODE[byte as usize];
+            let decoded = UNICODE_TO_BYTE.get(encoded).copied();
+            assert_eq!(decoded, Some(byte), "roundtrip failed for byte {:#04x}", byte);
+        }
+    }
+
+    #[test]
+    fn test_byte_encode_word() {
+        // "A" (0x41) is printable ASCII, maps to "A".
+        assert_eq!(BpeTokenizer::byte_encode_word("A"), "A");
+        // " " (0x20) maps to "Ġ".
+        assert_eq!(BpeTokenizer::byte_encode_word(" "), "Ġ");
+        // "hello" is all printable ASCII.
+        assert_eq!(BpeTokenizer::byte_encode_word("hello"), "hello");
+        // " hello" has a space prefix that becomes "Ġ".
+        assert_eq!(BpeTokenizer::byte_encode_word(" hello"), "Ġhello");
+    }
+
+    /// Creates a GPT-2-style rank-based BPE tokenizer with byte-encoded vocab.
+    ///
+    /// The vocab uses byte-encoded token strings (as GPT-2 models do).
+    /// Includes basic merges for "hello" after byte encoding.
+    fn make_gpt2_tokenizer() -> BpeTokenizer {
+        let tokens = vec![
+            "<pad>".to_string(),  // 0
+            "<bos>".to_string(),  // 1
+            "<eos>".to_string(),  // 2
+            "h".to_string(),      // 3
+            "e".to_string(),      // 4
+            "l".to_string(),      // 5
+            "o".to_string(),      // 6
+            "Ġ".to_string(),      // 7  (byte-encoded space)
+            "he".to_string(),     // 8
+            "ll".to_string(),     // 9
+            "lo".to_string(),     // 10
+            "hel".to_string(),    // 11
+            "hell".to_string(),   // 12
+            "hello".to_string(),  // 13
+            "Ġhello".to_string(), // 14 (space + hello)
+            "w".to_string(),      // 15
+            "r".to_string(),      // 16
+            "d".to_string(),      // 17
+            "wo".to_string(),     // 18
+            "wor".to_string(),    // 19
+            "worl".to_string(),   // 20
+            "world".to_string(),  // 21
+            "Ġworld".to_string(), // 22
+            "Ġw".to_string(),     // 23
+        ];
+        let scores = vec![0.0; tokens.len()];
+        let token_types = vec![0u32; tokens.len()];
+
+        let merges = vec![
+            "h e".to_string(),       // rank 0
+            "l l".to_string(),       // rank 1
+            "l o".to_string(),       // rank 2
+            "he l".to_string(),      // rank 3
+            "hel l".to_string(),     // rank 4
+            "hell o".to_string(),    // rank 5
+            "w o".to_string(),       // rank 6
+            "wo r".to_string(),      // rank 7
+            "wor l".to_string(),     // rank 8
+            "worl d".to_string(),    // rank 9
+            "Ġ h".to_string(),       // rank 10
+            "Ġ w".to_string(),       // rank 11
+            "Ġh ello".to_string(),   // rank 12  (not actually used due to how BPE chains work)
+            "Ġ hello".to_string(),   // rank 13
+            "Ġ world".to_string(),   // rank 14
+            "Ġw orld".to_string(),   // rank 15
+        ];
+
+        BpeTokenizer::new(
+            tokens,
+            scores,
+            token_types,
+            merges,
+            Some(1),
+            Some(2),
+            Some(0),
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn test_gpt2_encode_hello() {
+        let tok = make_gpt2_tokenizer();
+        // "hello" -> pre-tokenize -> ["hello"] -> byte-encode -> ["hello"] (ASCII is identity)
+        // "hello" is token 13.
+        let ids = tok.encode("hello", false);
+        assert_eq!(ids, vec![13]);
+    }
+
+    #[test]
+    fn test_gpt2_encode_hello_world() {
+        let tok = make_gpt2_tokenizer();
+        // "hello world" -> pre-tokenize -> ["hello", " world"]
+        // byte-encode -> ["hello", "Ġworld"]
+        // "hello" = 13, "Ġworld" = 22
+        let ids = tok.encode("hello world", false);
+        assert_eq!(ids, vec![13, 22]);
+    }
+
+    #[test]
+    fn test_gpt2_decode_hello_world() {
+        let tok = make_gpt2_tokenizer();
+        // Tokens: "hello" (13), "Ġworld" (22) -> bytes: "hello" + " world"
+        let text = tok.decode(&[13, 22]);
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn test_gpt2_decode_roundtrip() {
+        let tok = make_gpt2_tokenizer();
+        let ids = tok.encode("hello world", false);
+        let text = tok.decode(&ids);
+        assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn test_gpt2_no_bos_by_default() {
+        let tok = make_gpt2_tokenizer();
+        let ids = tok.encode("hello", true);
+        // GPT-2 tokenizer has add_bos=false, so no BOS prepended.
+        assert_eq!(ids, vec![13]);
+    }
+
+    #[test]
+    fn test_gpt2_space_token() {
+        let tok = make_gpt2_tokenizer();
+        // Encoding just a space: pre-tokenize -> [" "] -> byte-encode -> ["Ġ"]
+        // "Ġ" is token 7.
+        let ids = tok.encode(" ", false);
+        assert_eq!(ids, vec![7]);
+    }
+
+    #[test]
+    fn test_gpt2_byte_fallback() {
+        // Create a GPT-2 tokenizer that has byte-encoded single-byte tokens.
+        let mut tokens: Vec<String> = Vec::new();
+        tokens.push("<pad>".to_string()); // 0
+        tokens.push("<bos>".to_string()); // 1
+        tokens.push("<eos>".to_string()); // 2
+        // Add byte-encoded tokens for all 256 bytes.
+        for byte in 0u8..=255 {
+            tokens.push(BYTE_TO_UNICODE[byte as usize].clone());
+        }
+        let scores = vec![0.0; tokens.len()];
+        let token_types = vec![0u32; tokens.len()];
+        let merges = vec!["not used".to_string()]; // non-empty to trigger rank mode
+
+        let tok = BpeTokenizer::new(
+            tokens.clone(),
+            scores,
+            token_types,
+            merges,
+            Some(1),
+            Some(2),
+            Some(0),
+            false,
+            false,
+        );
+
+        // Encoding "A" should produce the byte-encoded token for 'A' = 0x41.
+        // 'A' is printable ASCII so it maps to "A", which is at index 3 + 0x41 = 68.
+        let ids = tok.encode("A", false);
+        assert_eq!(ids.len(), 1);
+        // Verify the decoded output matches.
+        let decoded = tok.decode(&ids);
+        assert_eq!(decoded, "A");
     }
 }

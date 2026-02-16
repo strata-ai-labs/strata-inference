@@ -178,7 +178,7 @@ pub fn create_tokenizer_from_gguf(
             .map(|v| v.into_iter().map(|s| s.to_string()).collect())
             .unwrap_or_default();
 
-        let add_bos = gguf.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(true);
+        let add_bos = gguf.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(false);
         let add_eos = gguf.get_bool("tokenizer.ggml.add_eos_token").unwrap_or(false);
 
         Ok(Box::new(BpeTokenizer::new(
