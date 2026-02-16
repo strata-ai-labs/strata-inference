@@ -131,7 +131,7 @@ pub fn create_tokenizer_from_gguf(
     let model_type = gguf.get_str("tokenizer.ggml.model").unwrap_or("llama");
 
     match model_type {
-        "llama" | "gpt2" | "bert" => {}
+        "llama" | "gpt2" | "bert" | "t5" => {}
         other => {
             warn!(
                 model_type = other,
@@ -196,6 +196,10 @@ pub fn create_tokenizer_from_gguf(
         // SentencePiece models typically don't have this key.
         let pre_type = gguf.get_str("tokenizer.ggml.pre");
 
+        // T5/UGM models need Viterbi DP because they lack intermediate merge
+        // tokens. SPM models (LLaMA, Gemma) use greedy BPE merges.
+        let use_viterbi = model_type == "t5";
+
         Ok(Box::new(BpeTokenizer::new(
             tokens,
             scores,
@@ -208,6 +212,7 @@ pub fn create_tokenizer_from_gguf(
             add_eos,
             add_space_prefix,
             pre_type,
+            use_viterbi,
         )))
     }
 }

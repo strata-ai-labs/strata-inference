@@ -166,6 +166,16 @@ pub struct BpeTokenizer {
     /// Applied sequentially: each regex further splits segments from the previous one.
     /// Empty for SentencePiece models or when no `tokenizer.ggml.pre` is set.
     pre_regexes: Vec<Regex>,
+    /// Trie of all normal/user-defined/unused tokens for Viterbi search.
+    /// Only built for score-based (SentencePiece) tokenizers.
+    token_trie: Option<TrieNode>,
+    /// Unknown token ID (type=2 UNKNOWN token), for Viterbi fallback.
+    unk_id: Option<u32>,
+    /// Score penalty for unknown codepoints: min_normal_score - 10.0
+    unknown_token_score: f64,
+    /// Token types from GGUF (indexed by token ID). Used by Viterbi to
+    /// give USER_DEFINED tokens score 0.0.
+    token_types: Vec<u32>,
 }
 
 impl BpeTokenizer {
@@ -188,6 +198,10 @@ impl BpeTokenizer {
     /// * `add_space_prefix` - Whether to prepend SentencePiece underline to input text.
     /// * `pre_type` - The `tokenizer.ggml.pre` value from GGUF metadata, used to
     ///   select the regex pre-tokenizer pattern. `None` for SentencePiece models.
+    /// * `use_viterbi` - Whether to use Viterbi DP instead of BPE merges. Required
+    ///   for Unigram (UGM/T5) models where intermediate merge tokens don't exist.
+    ///   SPM models (LLaMA, Gemma) must use BPE because the greedy merge algorithm
+    ///   produces different segmentations than the globally-optimal Viterbi.
     pub fn new(
         tokens: Vec<String>,
         scores: Vec<f32>,
@@ -200,6 +214,7 @@ impl BpeTokenizer {
         add_eos: bool,
         add_space_prefix: bool,
         pre_type: Option<&str>,
+        use_viterbi: bool,
     ) -> Self {
         let use_scores = merges.is_empty();
 
@@ -252,12 +267,58 @@ impl BpeTokenizer {
             })
             .unwrap_or_default();
 
+        // Build Viterbi trie for Unigram (UGM/T5) models only.
+        // SPM models (LLaMA, Gemma) use BPE greedy merges which produce different
+        // segmentations than the globally-optimal Viterbi DP. Only UGM models need
+        // Viterbi because they lack intermediate merge tokens in the vocabulary.
+        // Matches llama.cpp's llm_tokenizer_ugm constructor (llama-vocab.cpp:818-838).
+        let (token_trie, unk_id, unknown_token_score) = if use_viterbi && use_scores {
+            let mut trie = TrieNode::new();
+            let mut min_score = f64::MAX;
+            let mut found_unk_id = None;
+
+            for (i, tok) in tokens.iter().enumerate() {
+                let tt = token_types.get(i).copied().unwrap_or(0);
+                match tt {
+                    // NORMAL (1), UNDEFINED (0), USER_DEFINED (4), UNUSED (5) → insert
+                    // UNKNOWN (2) → record its ID
+                    // CONTROL (3), BYTE (6) → skip
+                    2 => {
+                        found_unk_id = Some(i as u32);
+                    }
+                    3 | 6 => {}
+                    _ => {
+                        if !tok.is_empty() {
+                            trie.insert(tok.as_bytes(), i as u32);
+                            // Track min score for NORMAL tokens only
+                            if tt == 0 || tt == 1 {
+                                let s = scores.get(i).copied().unwrap_or(0.0) as f64;
+                                if s < min_score {
+                                    min_score = s;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let unk_score = if min_score == f64::MAX {
+                -10.0
+            } else {
+                min_score - 10.0
+            };
+            (Some(trie), found_unk_id, unk_score)
+        } else {
+            (None, None, 0.0)
+        };
+
         debug!(
             vocab_size = tokens.len(),
             merge_count = merge_ranks.len(),
             special_token_count = special_tokens.len(),
             use_scores,
             pre_regex_count = pre_regexes.len(),
+            has_viterbi_trie = token_trie.is_some(),
             "BPE tokenizer initialized"
         );
 
@@ -275,6 +336,10 @@ impl BpeTokenizer {
             add_space_prefix,
             special_tokens,
             pre_regexes,
+            token_trie,
+            unk_id,
+            unknown_token_score,
+            token_types,
         }
     }
 
@@ -290,8 +355,17 @@ impl BpeTokenizer {
             return Vec::new();
         }
 
+        // Viterbi DP for Unigram (UGM/T5) models.
+        // Must run WITHOUT the whole-word short-circuit below, because Viterbi
+        // may prefer splitting a word into sub-tokens with higher total score
+        // over using a single low-scored whole-word token.
+        if self.token_trie.is_some() {
+            return self.viterbi_encode(word);
+        }
+
         // Check if the entire word is a known token (common for single characters
-        // and special tokens).
+        // and special tokens). Safe for BPE since the whole word would be the
+        // final merge result anyway.
         if let Some(&id) = self.token_to_id.get(word) {
             return vec![id];
         }
@@ -413,6 +487,115 @@ impl BpeTokenizer {
             }
             idx = sym.next;
         }
+
+        output
+    }
+
+    /// Encode a word using Viterbi forward DP (SentencePiece Unigram).
+    ///
+    /// Matches llama.cpp's `llm_tokenizer_ugm_session::tokenize`
+    /// (llama-vocab.cpp:876-960). Walks the token trie at each byte
+    /// position to find all matching tokens, accumulates best scores
+    /// (f64 for precision parity with HF), then backtracks to recover
+    /// the optimal segmentation.
+    fn viterbi_encode(&self, text: &str) -> Vec<u32> {
+        let trie = self.token_trie.as_ref().unwrap();
+        let input = text.as_bytes();
+        let n = input.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Use u32::MAX as sentinel when no UNK token exists, to avoid
+        // collision with real token IDs.
+        let unk = self.unk_id.unwrap_or(u32::MAX);
+
+        // best[i] = (token_id, input_offset_start, cumulative_score)
+        // Initialize all slots with UNK (matching llama.cpp's tokenization_results init).
+        // best[0].score = 0.0, all others start at -infinity.
+        let mut best: Vec<(u32, usize, f64)> = vec![(unk, 0, f64::NEG_INFINITY); n + 1];
+        best[0] = (unk, 0, 0.0);
+
+        // Forward pass: step through input one UTF-8 codepoint at a time.
+        let mut i = 0;
+        while i < n {
+            let current_score = best[i].2;
+            if current_score == f64::NEG_INFINITY {
+                // Unreachable position — advance by one codepoint.
+                i += utf8_char_len(input[i]).min(n - i);
+                continue;
+            }
+
+            let cp_len = utf8_char_len(input[i]).min(n - i);
+            let mut single_codepoint_token_found = false;
+
+            // Traverse the trie starting from position i.
+            if let Some(mut node) = trie.traverse(input[i]) {
+                let mut j = i + 1; // j = position after consumed bytes
+
+                loop {
+                    // Check if current node holds a token.
+                    if let Some(token_id) = node.token_id {
+                        if j - i == cp_len {
+                            single_codepoint_token_found = true;
+                        }
+                        // USER_DEFINED tokens get score 0.0 (more likely to be selected).
+                        let tt = self.token_types.get(token_id as usize).copied().unwrap_or(0);
+                        let token_score = if tt == TOKEN_TYPE_USER_DEFINED {
+                            0.0
+                        } else {
+                            self.scores.get(token_id as usize).copied().unwrap_or(0.0) as f64
+                        };
+                        let challenger = current_score + token_score;
+                        if challenger > best[j].2 {
+                            best[j] = (token_id, i, challenger);
+                        }
+                    }
+
+                    // Try to advance to next byte.
+                    if j >= n {
+                        break;
+                    }
+                    match node.traverse(input[j]) {
+                        Some(next) => {
+                            node = next;
+                            j += 1;
+                        }
+                        None => break,
+                    }
+                }
+            }
+
+            // If no single-codepoint token was found, use UNK as fallback.
+            if !single_codepoint_token_found {
+                let end = i + cp_len;
+                let challenger = current_score + self.unknown_token_score;
+                if challenger > best[end].2 {
+                    best[end] = (unk, i, challenger);
+                }
+            }
+
+            // Move to the next UTF-8 codepoint.
+            i += cp_len;
+        }
+
+        // Backtrack from best[n] to collect token IDs.
+        // Consecutive UNK tokens are merged into a single UNK (matching llama.cpp).
+        // UNK tokens are emitted as-is (no byte fallback), matching llama.cpp's UGM
+        // which does NOT expand unknowns to <0xNN> byte tokens.
+        let mut output: Vec<u32> = Vec::new();
+        let mut is_prev_unknown = false;
+        let mut pos = n;
+        while pos > 0 {
+            let (token_id, start, _) = best[pos];
+            let is_unknown = token_id == unk;
+            if !(is_prev_unknown && is_unknown) {
+                output.push(token_id);
+            }
+            is_prev_unknown = is_unknown;
+            pos = start;
+        }
+        output.reverse();
 
         output
     }
@@ -888,6 +1071,52 @@ impl Ord for OrderedFloat {
 }
 
 // ---------------------------------------------------------------------------
+// Viterbi trie for Unigram/SentencePiece tokenization
+// ---------------------------------------------------------------------------
+
+/// A trie node for Viterbi tokenization, keyed on raw UTF-8 bytes.
+/// Matches llama.cpp's `naive_trie` struct (llama-vocab.cpp:28-69).
+struct TrieNode {
+    children: HashMap<u8, Box<TrieNode>>,
+    token_id: Option<u32>,
+}
+
+impl TrieNode {
+    fn new() -> Self {
+        Self {
+            children: HashMap::new(),
+            token_id: None,
+        }
+    }
+
+    fn insert(&mut self, key: &[u8], token_id: u32) {
+        if key.is_empty() {
+            self.token_id = Some(token_id);
+            return;
+        }
+        self.children
+            .entry(key[0])
+            .or_insert_with(|| Box::new(TrieNode::new()))
+            .insert(&key[1..], token_id);
+    }
+
+    fn traverse(&self, byte: u8) -> Option<&TrieNode> {
+        self.children.get(&byte).map(|n| n.as_ref())
+    }
+}
+
+/// Return the byte length of a UTF-8 codepoint from its leading byte.
+fn utf8_char_len(first_byte: u8) -> usize {
+    match first_byte {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1, // continuation byte; shouldn't appear at start
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pre-tokenization (no regex dependency)
 // ---------------------------------------------------------------------------
 
@@ -1148,6 +1377,7 @@ mod tests {
             add_eos,
             true, // add_space_prefix
             None, // pre_type (SentencePiece doesn't use regex)
+            false, // use_viterbi
         )
     }
 
@@ -1210,6 +1440,7 @@ mod tests {
             false,
             true, // add_space_prefix (not used for rank-based)
             None, // pre_type
+            false, // use_viterbi
         )
     }
 
@@ -1473,6 +1704,7 @@ mod tests {
             false,
             true, // add_space_prefix
             None, // pre_type
+            false, // use_viterbi
         );
 
         // Encoding a character not in vocab should fall back to byte tokens.
@@ -1523,6 +1755,244 @@ mod tests {
         // Since we don't have byte tokens in the test vocab, this may produce
         // an empty result, but should not panic.
         let _ = ids;
+    }
+
+    #[test]
+    fn test_viterbi_no_standalone_underline() {
+        // Simulate Gemma-like vocab where ▁ is NOT a standalone token,
+        // but ▁-prefixed tokens like ▁world DO exist.
+        // The Viterbi should still find ▁world from the input "a▁world".
+        let tokens = vec![
+            "<pad>".to_string(),             // 0
+            "a".to_string(),                 // 1
+            "w".to_string(),                 // 2
+            "o".to_string(),                 // 3
+            "r".to_string(),                 // 4
+            "l".to_string(),                 // 5
+            "d".to_string(),                 // 6
+            "or".to_string(),                // 7
+            "ld".to_string(),                // 8
+            "world".to_string(),             // 9
+            format!("{}world", SPIECE_UNDERLINE), // 10 ▁world
+            format!("{}a", SPIECE_UNDERLINE),     // 11 ▁a
+            // NOTE: No standalone ▁ token!
+        ];
+        let scores: Vec<f32> = vec![
+            0.0,    // 0: <pad>
+            -5.0,   // 1: a
+            -5.0,   // 2: w
+            -5.0,   // 3: o
+            -5.0,   // 4: r
+            -5.0,   // 5: l
+            -5.0,   // 6: d
+            -4.0,   // 7: or
+            -4.0,   // 8: ld
+            -2.0,   // 9: world
+            -1.0,   // 10: ▁world
+            -1.0,   // 11: ▁a
+        ];
+        let token_types = vec![0u32; tokens.len()];
+
+        let tok = BpeTokenizer::new(
+            tokens, scores, token_types, vec![],
+            None, None, Some(0),
+            false, false,
+            false, // add_space_prefix = false (Gemma style)
+            None,
+            true, // use_viterbi = true (UGM/T5 mode)
+        );
+
+        // Input "a world" → spm_process → "a▁world"
+        // Viterbi should find: a + ▁world
+        let ids = tok.encode("a world", false);
+        assert_eq!(ids, vec![1, 10], "Expected [a=1, ▁world=10], got {:?}", ids);
+    }
+
+    /// Helper: build a Viterbi tokenizer with configurable vocab.
+    /// Includes byte tokens <0x00>..<0xFF> at IDs 100..355 and an UNK token.
+    fn make_viterbi_tokenizer(
+        extra_tokens: Vec<(&str, f32, u32)>, // (text, score, token_type)
+    ) -> BpeTokenizer {
+        let mut tokens = Vec::new();
+        let mut scores = Vec::new();
+        let mut token_types = Vec::new();
+
+        // 0: <unk> (UNKNOWN type=2)
+        tokens.push("<unk>".to_string());
+        scores.push(0.0);
+        token_types.push(2u32);
+
+        // 1: <s> (CONTROL type=3)
+        tokens.push("<s>".to_string());
+        scores.push(0.0);
+        token_types.push(3u32);
+
+        // 2: </s> (CONTROL type=3)
+        tokens.push("</s>".to_string());
+        scores.push(0.0);
+        token_types.push(3u32);
+
+        // 3+: extra tokens
+        for (text, score, tt) in &extra_tokens {
+            tokens.push(text.to_string());
+            scores.push(*score);
+            token_types.push(*tt);
+        }
+
+        BpeTokenizer::new(
+            tokens, scores, token_types, vec![],
+            Some(1), Some(2), None,
+            false, false, false,
+            None,
+            true, // use_viterbi
+        )
+    }
+
+    #[test]
+    fn test_viterbi_prefers_split_over_low_scored_whole_word() {
+        // "ab" as a single token has score -1000 (terrible), while
+        // "a" (-1) + "b" (-1) = -2 total (much better).
+        // Viterbi must NOT be short-circuited by whole-word lookup.
+        let tok = make_viterbi_tokenizer(vec![
+            ("a", -1.0, 1),   // 3
+            ("b", -1.0, 1),   // 4
+            ("ab", -1000.0, 1), // 5
+        ]);
+        let ids = tok.viterbi_encode("ab");
+        assert_eq!(ids, vec![3, 4], "Viterbi should prefer a+b over ab");
+    }
+
+    #[test]
+    fn test_viterbi_prefers_whole_word_when_better_scored() {
+        // "ab" as a single token has score -1 (good), while
+        // "a" (-5) + "b" (-5) = -10 total. Whole word wins.
+        let tok = make_viterbi_tokenizer(vec![
+            ("a", -5.0, 1),  // 3
+            ("b", -5.0, 1),  // 4
+            ("ab", -1.0, 1), // 5
+        ]);
+        let ids = tok.viterbi_encode("ab");
+        assert_eq!(ids, vec![5], "Viterbi should prefer ab when it scores better");
+    }
+
+    #[test]
+    fn test_viterbi_unk_fallback_for_unknown_char() {
+        // Vocab has "a" and "b", but not "c".
+        // Input "acb" → a + UNK(c) + b. UNK should be emitted as-is.
+        let tok = make_viterbi_tokenizer(vec![
+            ("a", -1.0, 1), // 3
+            ("b", -1.0, 1), // 4
+        ]);
+        let ids = tok.viterbi_encode("acb");
+        // UNK id = 0 (<unk>), a=3, b=4
+        assert_eq!(ids, vec![3, 0, 4], "Unknown char should produce UNK token");
+    }
+
+    #[test]
+    fn test_viterbi_consecutive_unk_merged() {
+        // Vocab has "a" only. Input "axyz" → a + UNK(x) + UNK(y) + UNK(z).
+        // Consecutive UNKs should be merged into a single UNK.
+        let tok = make_viterbi_tokenizer(vec![
+            ("a", -1.0, 1), // 3
+        ]);
+        let ids = tok.viterbi_encode("axyz");
+        // Should be: a(3) + single UNK(0), NOT a(3) + UNK + UNK + UNK
+        assert_eq!(ids, vec![3, 0], "Consecutive UNKs should merge into one");
+    }
+
+    #[test]
+    fn test_viterbi_all_unknown_input() {
+        // Vocab has no matching tokens for "xyz".
+        // Should produce a single merged UNK.
+        let tok = make_viterbi_tokenizer(vec![]);
+        let ids = tok.viterbi_encode("xyz");
+        assert_eq!(ids, vec![0], "All-unknown input should produce single UNK");
+    }
+
+    #[test]
+    fn test_viterbi_single_character_input() {
+        let tok = make_viterbi_tokenizer(vec![
+            ("a", -2.0, 1), // 3
+        ]);
+        let ids = tok.viterbi_encode("a");
+        assert_eq!(ids, vec![3]);
+    }
+
+    #[test]
+    fn test_viterbi_empty_input() {
+        let tok = make_viterbi_tokenizer(vec![
+            ("a", -2.0, 1), // 3
+        ]);
+        let ids = tok.viterbi_encode("");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_viterbi_multibyte_utf8() {
+        // Test with multi-byte UTF-8: é (2 bytes: 0xC3 0xA9) and 中 (3 bytes).
+        let tok = make_viterbi_tokenizer(vec![
+            ("\u{00e9}", -1.0, 1),    // 3: é (2-byte UTF-8)
+            ("\u{4e2d}", -1.0, 1),    // 4: 中 (3-byte UTF-8)
+            ("a", -1.0, 1),           // 5
+        ]);
+        let ids = tok.viterbi_encode("a\u{00e9}\u{4e2d}");
+        assert_eq!(ids, vec![5, 3, 4], "Multi-byte UTF-8 codepoints should tokenize correctly");
+    }
+
+    #[test]
+    fn test_viterbi_multibyte_unknown() {
+        // Unknown multi-byte character should produce a single UNK (not one per byte).
+        let tok = make_viterbi_tokenizer(vec![
+            ("a", -1.0, 1), // 3
+        ]);
+        // 中 (3 bytes) is unknown. Should be one UNK, not three.
+        let ids = tok.viterbi_encode("a\u{4e2d}");
+        assert_eq!(ids, vec![3, 0], "Unknown multi-byte char should be single UNK");
+    }
+
+    #[test]
+    fn test_viterbi_user_defined_score_override() {
+        // USER_DEFINED tokens (type=4) get score 0.0 regardless of stored score.
+        // Since normal scores are negative, USER_DEFINED tokens are strongly preferred.
+        let tok = make_viterbi_tokenizer(vec![
+            ("a", -1.0, 1),             // 3: normal
+            ("b", -1.0, 1),             // 4: normal
+            ("ab", -100.0, 4),          // 5: USER_DEFINED (type=4), stored score=-100
+        ]);
+        // USER_DEFINED "ab" gets effective score 0.0, which beats a(-1)+b(-1)=-2.
+        let ids = tok.viterbi_encode("ab");
+        assert_eq!(ids, vec![5], "USER_DEFINED token should use score 0.0 and win");
+    }
+
+    #[test]
+    fn test_viterbi_optimal_segmentation() {
+        // Test that Viterbi finds the globally optimal segmentation, not greedy.
+        // Vocab: "abc"(-1), "ab"(-5), "c"(-5), "a"(-5), "bc"(-1)
+        // Input: "abc"
+        // Greedy left-to-right might pick "abc"(-1) or "ab"(-5)+"c"(-5)=-10
+        // Viterbi should find: "abc"(-1) since it's the best single token.
+        // But if "abc" has score -20 and "a"(-1)+"bc"(-1)=-2, Viterbi picks the split.
+        let tok = make_viterbi_tokenizer(vec![
+            ("a", -1.0, 1),    // 3
+            ("bc", -1.0, 1),   // 4
+            ("abc", -20.0, 1), // 5
+            ("b", -10.0, 1),   // 6
+            ("c", -10.0, 1),   // 7
+        ]);
+        let ids = tok.viterbi_encode("abc");
+        // a(-1) + bc(-1) = -2 total, beats abc(-20) or a(-1)+b(-10)+c(-10)=-21
+        assert_eq!(ids, vec![3, 4], "Viterbi should find globally optimal a+bc");
+    }
+
+    #[test]
+    fn test_viterbi_unk_between_known_tokens() {
+        // "aXb" where X is unknown. UNK should appear between a and b.
+        let tok = make_viterbi_tokenizer(vec![
+            ("a", -1.0, 1), // 3
+            ("b", -1.0, 1), // 4
+        ]);
+        let ids = tok.viterbi_encode("aXb");
+        assert_eq!(ids, vec![3, 0, 4]);
     }
 
     #[test]
@@ -1715,6 +2185,7 @@ mod tests {
             true, true,
             true, // add_space_prefix
             None, // pre_type
+            false, // use_viterbi
         );
         let ids = tok.encode("h", true);
         assert_eq!(ids[0], 1); // BOS
@@ -1777,6 +2248,7 @@ mod tests {
             false, false,
             true, // add_space_prefix
             None, // pre_type
+            false, // use_viterbi
         );
         assert_eq!(tok.bos_token_id(), None);
         assert_eq!(tok.eos_token_id(), None);
@@ -1906,6 +2378,7 @@ mod tests {
             false,
             true, // add_space_prefix (not used for rank-based)
             None, // pre_type (use hand-written pre-tokenizer for tests)
+            false, // use_viterbi
         )
     }
 
@@ -1988,6 +2461,7 @@ mod tests {
             false,
             true, // add_space_prefix (not used for rank-based)
             None, // pre_type
+            false, // use_viterbi
         );
 
         // Encoding "A" should produce the byte-encoded token for 'A' = 0x41.
@@ -2243,6 +2717,7 @@ mod tests {
             false,
             true,
             Some(pre_type),
+            false, // use_viterbi
         )
     }
 
@@ -2268,6 +2743,7 @@ mod tests {
             Some(1), Some(2), Some(0),
             false, false, true,
             None,
+            false, // use_viterbi
         );
 
         // CONTROL + USER_DEFINED tokens should all be in special_tokens.
@@ -2298,6 +2774,7 @@ mod tests {
             Some(1), Some(2), Some(0),
             false, false, false, // no space prefix
             None,
+            false, // use_viterbi
         );
 
         // With include_control=true, CONTROL tokens are partitioned.
@@ -2335,6 +2812,7 @@ mod tests {
             Some(1), Some(2), Some(0),
             false, false, false,
             None,
+            false, // use_viterbi
         );
 
         // With include_control=false, <s> should NOT be partitioned
@@ -2388,6 +2866,7 @@ mod tests {
             Some(1), Some(2), Some(0),
             false, false, true, // add_space_prefix
             None,
+            false, // use_viterbi
         );
 
         // Encode with decomposed input: "e\u{0301}" should NFC-normalize to "é".
@@ -2454,6 +2933,7 @@ mod tests {
             Some(1), Some(2), Some(0),
             false, false, true,
             Some("gpt-2"),
+            false, // use_viterbi
         );
 
         // With add_special_tokens=true: CONTROL tokens partitioned.
