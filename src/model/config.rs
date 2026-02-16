@@ -10,6 +10,7 @@ use tracing::info;
 pub enum ModelArch {
     Gemma3,
     Gemma2,
+    GemmaEmbedding,
     LLaMA,
     Bert,
 }
@@ -112,6 +113,7 @@ impl ModelConfig {
             "gemma2" => (ModelArch::Gemma2, "gemma2"),
             "llama" => (ModelArch::LLaMA, "llama"),
             "bert" => (ModelArch::Bert, "bert"),
+            "gemma-embedding" => (ModelArch::GemmaEmbedding, "gemma-embedding"),
             other => {
                 return Err(InferenceError::UnsupportedArchitecture(other.to_string()));
             }
@@ -216,6 +218,16 @@ impl ModelConfig {
                     1.0,   // embedding_scale
                     true,  // default causal
                     true,  // pre_norm
+                ),
+                ModelArch::GemmaEmbedding => (
+                    NormType::RMSNorm,
+                    Activation::GeGLU,
+                    PositionType::RoPE,
+                    true,  // has_ffn_gate
+                    false, // has_bias
+                    (hidden_size as f32).sqrt(), // embedding_scale = sqrt(hidden_size)
+                    false, // default causal (bidirectional)
+                    true,  // pre_norm (norm-before)
                 ),
                 ModelArch::Bert => (
                     NormType::LayerNorm,
@@ -1106,6 +1118,43 @@ mod tests {
         assert_eq!(config.position_type, PositionType::RoPE);
         assert!(config.has_ffn_gate);
         assert!(!config.has_bias);
+        assert!((config.embedding_scale - (768.0f32).sqrt()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_gemma_embedding_config() {
+        let kv = vec![
+            ("general.architecture", kv_string("gemma-embedding")),
+            ("gemma-embedding.embedding_length", kv_u32(768)),
+            ("gemma-embedding.block_count", kv_u32(24)),
+            ("gemma-embedding.attention.head_count", kv_u32(3)),
+            ("gemma-embedding.attention.head_count_kv", kv_u32(1)),
+            ("gemma-embedding.attention.key_length", kv_u32(256)),
+            ("gemma-embedding.feed_forward_length", kv_u32(1152)),
+            ("gemma-embedding.pooling_type", kv_u32(1)),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let config = ModelConfig::from_gguf(&gguf).unwrap();
+
+        assert_eq!(config.arch, ModelArch::GemmaEmbedding);
+        assert_eq!(config.arch_name, "gemma-embedding");
+        assert_eq!(config.hidden_size, 768);
+        assert_eq!(config.num_layers, 24);
+        assert_eq!(config.num_heads, 3);
+        assert_eq!(config.num_kv_heads, 1);
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.ffn_hidden, 1152);
+
+        // GemmaEmbedding-specific defaults
+        assert_eq!(config.norm_type, NormType::RMSNorm);
+        assert_eq!(config.activation, Activation::GeGLU);
+        assert_eq!(config.position_type, PositionType::RoPE);
+        assert!(config.has_ffn_gate);
+        assert!(!config.has_bias);
+        assert!(!config.causal); // bidirectional
+        assert!(config.pre_norm);
+        assert_eq!(config.pooling_type, PoolingType::Mean);
         assert!((config.embedding_scale - (768.0f32).sqrt()).abs() < 1e-4);
     }
 }

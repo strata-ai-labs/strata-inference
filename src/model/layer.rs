@@ -9,7 +9,7 @@ use crate::backend::{ComputeBackend, DeviceTensor};
 use crate::error::InferenceError;
 use crate::tensor::{Tensor, TensorDtype};
 
-use super::config::{Activation, ModelConfig, NormType, PositionType};
+use super::config::{Activation, ModelArch, ModelConfig, NormType, PositionType};
 use super::weights::{LayerWeights, ModelWeights};
 
 /// Linear (matrix multiply) forward pass, dispatching on quantized vs F32 weights.
@@ -268,10 +268,16 @@ pub fn transformer_layer_forward(
 ) -> DeviceTensor {
     trace!(pos_offset, pre_norm = config.pre_norm, "transformer_layer_forward");
 
-    if config.pre_norm {
-        pre_norm_layer_forward(input, layer, config, backend, pos_offset, attention_mask)
-    } else {
-        post_norm_layer_forward(input, layer, config, backend, pos_offset, attention_mask)
+    match config.arch {
+        ModelArch::GemmaEmbedding => {
+            gemma_embedding_layer_forward(input, layer, config, backend, pos_offset, attention_mask)
+        }
+        _ if config.pre_norm => {
+            pre_norm_layer_forward(input, layer, config, backend, pos_offset, attention_mask)
+        }
+        _ => {
+            post_norm_layer_forward(input, layer, config, backend, pos_offset, attention_mask)
+        }
     }
 }
 
@@ -405,6 +411,127 @@ fn post_norm_layer_forward(
     output
 }
 
+/// Apply RMSNorm per-head to a [seq_len, num_heads * head_dim] tensor.
+///
+/// The weight tensor is [head_dim], shared across all heads.
+/// For each head slice [seq_len, head_dim], we compute RMSNorm independently
+/// (since RMSNorm normalizes over the last dimension, we must split by head
+/// to get the correct mean-of-squares over head_dim, not total_dim).
+fn rms_norm_per_head(
+    input: &DeviceTensor,
+    weight: &DeviceTensor,
+    num_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    backend: &dyn ComputeBackend,
+) -> DeviceTensor {
+    let seq_len = input.shape()[0];
+    let input_host = backend.download(input);
+    let input_data = input_host.as_f32();
+    let total_dim = num_heads * head_dim;
+
+    let mut result_data = vec![0.0f32; seq_len * total_dim];
+
+    for h in 0..num_heads {
+        let head_tensor = extract_head(input_data, seq_len, total_dim, h, head_dim);
+        let head_dev = backend.upload(&head_tensor);
+        let normed = backend.rms_norm(&head_dev, weight, eps);
+        let normed_host = backend.download(&normed);
+        let normed_data = normed_host.as_f32();
+
+        for pos in 0..seq_len {
+            let src_offset = pos * head_dim;
+            let dst_offset = pos * total_dim + h * head_dim;
+            result_data[dst_offset..dst_offset + head_dim]
+                .copy_from_slice(&normed_data[src_offset..src_offset + head_dim]);
+        }
+    }
+
+    backend.upload(&Tensor::new(vec![seq_len, total_dim], result_data))
+}
+
+/// GemmaEmbedding layer forward pass.
+///
+/// This architecture has per-head Q/K norms and post-projection norms:
+///
+/// 1.  normed = rms_norm(input, attn_norm_w)
+/// 2.  q, k, v = project(normed)
+/// 3.  q = rms_norm_per_head(q, attn_q_norm_w)
+/// 4.  k = rms_norm_per_head(k, attn_k_norm_w)
+/// 5.  (q, k) = rope(q, k)
+/// 6.  attn_out = multi_head_attention(q, k, v)  (bidirectional)
+/// 7.  projected = output_project(attn_out)
+/// 8.  projected = rms_norm(projected, attn_post_norm_w)
+/// 9.  residual = input + projected
+/// 10. normed2 = rms_norm(residual, ffn_norm_w)
+/// 11. ffn_out = geglu_ffn(normed2)
+/// 12. ffn_out = rms_norm(ffn_out, ffn_post_norm_w)
+/// 13. output = residual + ffn_out
+fn gemma_embedding_layer_forward(
+    input: &DeviceTensor,
+    layer: &LayerWeights,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+    pos_offset: usize,
+    attention_mask: &[f32],
+) -> DeviceTensor {
+    // 1. Pre-attention normalization
+    let attn_norm_w = layer.attn_norm_w.as_ref()
+        .expect("GemmaEmbedding layer requires attn_norm_w");
+    let normed = normalize(input, attn_norm_w, None, config, backend);
+
+    // 2. QKV projections
+    let q = linear_forward(&normed, &layer.attn_q, None, backend);
+    let k = linear_forward(&normed, &layer.attn_k, None, backend);
+    let v = linear_forward(&normed, &layer.attn_v, None, backend);
+
+    // 3-4. Per-head Q/K RMSNorm
+    let q = if let Some(ref qn_w) = layer.attn_q_norm_w {
+        rms_norm_per_head(&q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
+    } else {
+        q
+    };
+    let k = if let Some(ref kn_w) = layer.attn_k_norm_w {
+        rms_norm_per_head(&k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
+    } else {
+        k
+    };
+
+    // 5-6. Multi-head attention (RoPE is applied inside, causal=false for bidirectional)
+    let attn_out = multi_head_attention(q, k, v, config, backend, pos_offset, attention_mask);
+
+    // 7. Output projection
+    let projected = linear_forward(&attn_out, &layer.attn_output, None, backend);
+
+    // 8. Post-attention norm (before residual)
+    let projected = if let Some(ref norm_w) = layer.attn_post_norm_w {
+        backend.rms_norm(&projected, norm_w, config.norm_eps)
+    } else {
+        projected
+    };
+
+    // 9. Residual
+    let residual = backend.add(input, &projected);
+
+    // 10. Pre-FFN normalization
+    let ffn_norm_w = layer.ffn_norm_w.as_ref()
+        .expect("GemmaEmbedding layer requires ffn_norm_w");
+    let normed2 = normalize(&residual, ffn_norm_w, None, config, backend);
+
+    // 11. FFN (GeGLU path)
+    let ffn_out = ffn_forward(&normed2, layer, config, backend);
+
+    // 12. Post-FFN norm (before residual)
+    let ffn_out = if let Some(ref norm_w) = layer.ffn_post_norm_w {
+        backend.rms_norm(&ffn_out, norm_w, config.norm_eps)
+    } else {
+        ffn_out
+    };
+
+    // 13. Residual connection
+    backend.add(&residual, &ffn_out)
+}
+
 /// FFN forward pass, dispatching on activation type.
 fn ffn_forward(
     input: &DeviceTensor,
@@ -510,14 +637,16 @@ pub fn model_forward(
         );
     }
 
-    // 7. Final output normalization
-    hidden = normalize(
-        &hidden,
-        &weights.output_norm_w,
-        weights.output_norm_b.as_ref(),
-        config,
-        backend,
-    );
+    // 7. Final output normalization (absent for BERT which uses per-layer post-norm)
+    if let Some(ref norm_w) = weights.output_norm_w {
+        hidden = normalize(
+            &hidden,
+            norm_w,
+            weights.output_norm_b.as_ref(),
+            config,
+            backend,
+        );
+    }
 
     // Return hidden states [seq_len, hidden_size]
     Ok(hidden)
@@ -777,14 +906,16 @@ pub fn model_forward_step(
     // 7. Advance cache position after all layers processed
     cache.advance(n_tokens);
 
-    // 8. Final output normalization
-    hidden = normalize(
-        &hidden,
-        &weights.output_norm_w,
-        weights.output_norm_b.as_ref(),
-        config,
-        backend,
-    );
+    // 8. Final output normalization (absent for BERT)
+    if let Some(ref norm_w) = weights.output_norm_w {
+        hidden = normalize(
+            &hidden,
+            norm_w,
+            weights.output_norm_b.as_ref(),
+            config,
+            backend,
+        );
+    }
 
     Ok(hidden)
 }
@@ -911,6 +1042,10 @@ mod tests {
             ffn_gate: Some(zero_weight(ffn_hidden, hidden_size)),
             ffn_up_bias: None,
             ffn_down_bias: None,
+            attn_q_norm_w: None,
+            attn_k_norm_w: None,
+            attn_post_norm_w: None,
+            ffn_post_norm_w: None,
         }
     }
 
@@ -938,6 +1073,10 @@ mod tests {
             ffn_gate: None,
             ffn_up_bias: Some(zeros_bias(ffn_hidden)),
             ffn_down_bias: Some(zeros_bias(hidden_size)),
+            attn_q_norm_w: None,
+            attn_k_norm_w: None,
+            attn_post_norm_w: None,
+            ffn_post_norm_w: None,
         }
     }
 
@@ -1335,6 +1474,10 @@ mod tests {
             ffn_gate: Some(zero_weight(ffn_hidden, hidden_size)),
             ffn_up_bias: None,
             ffn_down_bias: None,
+            attn_q_norm_w: None,
+            attn_k_norm_w: None,
+            attn_post_norm_w: None,
+            ffn_post_norm_w: None,
         };
 
         let seq_len = 2;
@@ -1370,7 +1513,7 @@ mod tests {
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
         };
@@ -1405,7 +1548,7 @@ mod tests {
             embedding_norm_w: Some(ones_weight(hidden_size)),
             embedding_norm_b: Some(zeros_bias(hidden_size)),
             layers: vec![bert_layer_weights(hidden_size, ffn_hidden)],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: Some(zeros_bias(hidden_size)),
             output_projection: None,
         };
@@ -1445,7 +1588,7 @@ mod tests {
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
         };
@@ -1485,7 +1628,7 @@ mod tests {
                 gemma_layer_weights(hidden_size, ffn_hidden),
                 gemma_layer_weights(hidden_size, ffn_hidden),
             ],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
         };
@@ -1517,7 +1660,7 @@ mod tests {
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
         };
@@ -1695,7 +1838,7 @@ mod tests {
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
         };
@@ -1735,7 +1878,7 @@ mod tests {
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
         };
@@ -1768,7 +1911,7 @@ mod tests {
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
         };
@@ -1808,7 +1951,7 @@ mod tests {
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
         };
@@ -1857,7 +2000,7 @@ mod tests {
                 gemma_layer_weights(hidden_size, ffn_hidden),
                 gemma_layer_weights(hidden_size, ffn_hidden),
             ],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
         };
@@ -1916,6 +2059,10 @@ mod tests {
             ffn_gate: Some(zero_weight(ffn_hidden, hidden_size)),
             ffn_up_bias: None,
             ffn_down_bias: None,
+            attn_q_norm_w: None,
+            attn_k_norm_w: None,
+            attn_post_norm_w: None,
+            ffn_post_norm_w: None,
         };
 
         let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
@@ -1925,7 +2072,7 @@ mod tests {
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![layer],
-            output_norm_w: ones_weight(hidden_size),
+            output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
         };
@@ -1945,5 +2092,474 @@ mod tests {
         for &v in out2.as_tensor().as_f32() {
             assert!(v.is_finite(), "GQA cached forward pass produced non-finite value: {}", v);
         }
+    }
+
+    // ====================================================================
+    // rms_norm_per_head tests
+    // ====================================================================
+
+    #[test]
+    fn test_rms_norm_per_head_single_head() {
+        // With 1 head, per-head norm should equal regular rms_norm
+        let b = cpu();
+        let head_dim = 4;
+        let input_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]; // seq_len=2, dim=4
+        let input = dt(Tensor::new(vec![2, head_dim], input_data));
+        let weight = ones_weight(head_dim);
+
+        let result = rms_norm_per_head(&input, &weight, 1, head_dim, 1e-6, &b);
+        let expected = b.rms_norm(&input, &weight, 1e-6);
+
+        assert_eq!(result.shape(), expected.shape());
+        let r = result.as_tensor().as_f32();
+        let e = expected.as_tensor().as_f32();
+        for i in 0..r.len() {
+            assert!((r[i] - e[i]).abs() < 1e-5, "mismatch at {}: {} vs {}", i, r[i], e[i]);
+        }
+    }
+
+    #[test]
+    fn test_rms_norm_per_head_multi_head_differs_from_full() {
+        // With 2 heads of dim 2, per-head norm normalizes each head's [2]
+        // independently. This should differ from normalizing the full [4] dim.
+        let b = cpu();
+        let num_heads = 2;
+        let head_dim = 2;
+        let total_dim = num_heads * head_dim; // 4
+        // seq_len=1: [3.0, 4.0, 0.1, 0.1]
+        // Head 0: [3.0, 4.0], Head 1: [0.1, 0.1]
+        // RMS of head 0 = sqrt((9+16)/2) = sqrt(12.5) ≈ 3.536
+        // RMS of head 1 = sqrt((0.01+0.01)/2) = sqrt(0.01) = 0.1
+        // Per-head norm produces very different scales for the two heads,
+        // whereas full-dim norm would use a single RMS over all 4 values.
+        let input = dt(Tensor::new(vec![1, total_dim], vec![3.0, 4.0, 0.1, 0.1]));
+        let weight = ones_weight(head_dim);
+
+        let per_head = rms_norm_per_head(&input, &weight, num_heads, head_dim, 1e-6, &b);
+
+        // Full rms_norm over [4] dims (would use RMS of [3.0, 4.0, 0.1, 0.1])
+        let full_weight = ones_weight(total_dim);
+        let full_norm = b.rms_norm(&input, &full_weight, 1e-6);
+
+        let ph = per_head.as_tensor().as_f32();
+        let fn_ = full_norm.as_tensor().as_f32();
+
+        // They should be different because per-head normalizes independently
+        let mut any_different = false;
+        for i in 0..ph.len() {
+            if (ph[i] - fn_[i]).abs() > 1e-4 {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "per-head norm should differ from full-dim norm when heads have different magnitudes");
+
+        // Per-head: head 0 values should be roughly [3/3.536, 4/3.536] ≈ [0.849, 1.131]
+        // Per-head: head 1 values should be roughly [0.1/0.1, 0.1/0.1] = [1.0, 1.0]
+        assert!((ph[0] - 3.0 / (12.5f32).sqrt()).abs() < 1e-3,
+            "head 0 elem 0: expected ~{}, got {}", 3.0 / (12.5f32).sqrt(), ph[0]);
+        assert!((ph[2] - 1.0).abs() < 1e-3,
+            "head 1 elem 0: expected ~1.0, got {}", ph[2]);
+    }
+
+    #[test]
+    fn test_rms_norm_per_head_preserves_shape() {
+        let b = cpu();
+        let num_heads = 3;
+        let head_dim = 4;
+        let seq_len = 5;
+        let total_dim = num_heads * head_dim; // 12
+
+        let input_data: Vec<f32> = (0..seq_len * total_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let input = dt(Tensor::new(vec![seq_len, total_dim], input_data));
+        let weight = ones_weight(head_dim);
+
+        let result = rms_norm_per_head(&input, &weight, num_heads, head_dim, 1e-6, &b);
+        assert_eq!(result.shape(), &[seq_len, total_dim]);
+
+        // All values should be finite
+        for &v in result.as_tensor().as_f32() {
+            assert!(v.is_finite(), "rms_norm_per_head produced non-finite value: {}", v);
+        }
+    }
+
+    // ====================================================================
+    // gemma_embedding_layer_forward tests
+    // ====================================================================
+
+    /// Create a GemmaEmbedding-style config for testing.
+    fn gemma_embedding_config(
+        hidden_size: usize, num_heads: usize, num_kv_heads: usize,
+        head_dim: usize, ffn_hidden: usize,
+    ) -> ModelConfig {
+        ModelConfig {
+            arch: ModelArch::GemmaEmbedding,
+            arch_name: "gemma-embedding".to_string(),
+            hidden_size,
+            num_layers: 1,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            ffn_hidden,
+            vocab_size: 16,
+            max_seq_len: 128,
+            norm_type: NormType::RMSNorm,
+            norm_eps: 1e-6,
+            activation: Activation::GeGLU,
+            position_type: PositionType::RoPE,
+            rope_freq_base: 10000.0,
+            rope_dim: head_dim,
+            causal: false,
+            attn_logit_softcap: 0.0,
+            attn_scale: None,
+            embedding_scale: (hidden_size as f32).sqrt(),
+            pooling_type: PoolingType::Mean,
+            has_ffn_gate: true,
+            has_bias: false,
+            pre_norm: true,
+        }
+    }
+
+    /// Create minimal LayerWeights for GemmaEmbedding with per-head norms and post-projection norms.
+    fn gemma_embedding_layer_weights(
+        hidden_size: usize, num_kv_heads: usize, head_dim: usize, ffn_hidden: usize,
+    ) -> LayerWeights {
+        let kv_dim = num_kv_heads * head_dim;
+        LayerWeights {
+            attn_norm_w: Some(ones_weight(hidden_size)),
+            attn_norm_b: None,
+            ffn_norm_w: Some(ones_weight(hidden_size)),
+            ffn_norm_b: None,
+            attn_output_norm_w: None,
+            attn_output_norm_b: None,
+            ffn_output_norm_w: None,
+            ffn_output_norm_b: None,
+            attn_q: identity_weight(hidden_size),
+            attn_k: zero_weight(kv_dim, hidden_size),
+            attn_v: zero_weight(kv_dim, hidden_size),
+            attn_output: identity_weight(hidden_size),
+            attn_q_bias: None,
+            attn_k_bias: None,
+            attn_v_bias: None,
+            attn_output_bias: None,
+            ffn_up: zero_weight(ffn_hidden, hidden_size),
+            ffn_down: zero_weight(hidden_size, ffn_hidden),
+            ffn_gate: Some(zero_weight(ffn_hidden, hidden_size)),
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+            attn_q_norm_w: Some(ones_weight(head_dim)),
+            attn_k_norm_w: Some(ones_weight(head_dim)),
+            attn_post_norm_w: Some(ones_weight(hidden_size)),
+            ffn_post_norm_w: Some(ones_weight(hidden_size)),
+        }
+    }
+
+    #[test]
+    fn test_gemma_embedding_layer_output_shape() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+
+        let config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        let layer = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+
+        let seq_len = 3;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[seq_len, hidden_size]);
+
+        for &v in output.as_tensor().as_f32() {
+            assert!(v.is_finite(), "GemmaEmbedding layer produced non-finite value: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_gemma_embedding_layer_with_gqa() {
+        // Test the real GemmaEmbedding architecture: 3 heads, 1 KV head, head_dim=4
+        // (scaled down from the actual 256 for test speed)
+        let b = cpu();
+        let hidden_size = 12; // 3 heads * 4 head_dim
+        let num_heads = 3;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let ffn_hidden = 8;
+
+        let config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        let layer = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+
+        let seq_len = 2;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[seq_len, hidden_size]);
+
+        for &v in output.as_tensor().as_f32() {
+            assert!(v.is_finite(), "GemmaEmbedding GQA layer produced non-finite value: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_gemma_embedding_post_norms_affect_output() {
+        // Verify that post-attention and post-FFN norms actually change the output
+        // by comparing with/without them.
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+
+        let config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+
+        // Layer WITH post-norms (use non-trivial weights to see a difference)
+        let mut layer_with = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        // Use non-identity attn weights so attention actually does something
+        let attn_data: Vec<f32> = (0..hidden_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        layer_with.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+        layer_with.attn_k = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+        layer_with.attn_v = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+
+        // Layer WITHOUT post-norms (but otherwise identical)
+        let mut layer_without = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        layer_without.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+        layer_without.attn_k = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+        layer_without.attn_v = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data));
+        layer_without.attn_post_norm_w = None;
+        layer_without.ffn_post_norm_w = None;
+
+        let seq_len = 2;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output_with = transformer_layer_forward(&input, &layer_with, &config, &b, 0, &mask);
+        let output_without = transformer_layer_forward(&input, &layer_without, &config, &b, 0, &mask);
+
+        let data_w = output_with.as_tensor().as_f32();
+        let data_wo = output_without.as_tensor().as_f32();
+
+        let mut any_different = false;
+        for i in 0..data_w.len() {
+            if (data_w[i] - data_wo[i]).abs() > 1e-6 {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "Post-norms should change the output when attention weights are non-zero");
+    }
+
+    #[test]
+    fn test_gemma_embedding_per_head_norms_affect_output() {
+        // Verify that per-head Q/K norms actually change the output
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+
+        let config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+
+        // Use non-zero K and V weights so attention actually does something
+        let attn_data: Vec<f32> = (0..hidden_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let kv_dim = num_kv_heads * head_dim;
+        let kv_data: Vec<f32> = (0..kv_dim * hidden_size).map(|i| (i as f32) * 0.01).collect();
+
+        // Layer WITH per-head Q/K norms (using weight 2.0 so it's different from 1.0)
+        let mut layer_with = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        layer_with.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+        layer_with.attn_k = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
+        layer_with.attn_v = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
+        layer_with.attn_q_norm_w = Some(dt(Tensor::new(vec![head_dim], vec![2.0f32; head_dim])));
+        layer_with.attn_k_norm_w = Some(dt(Tensor::new(vec![head_dim], vec![2.0f32; head_dim])));
+
+        // Layer WITHOUT per-head norms (but same attention weights)
+        let mut layer_without = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        layer_without.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data));
+        layer_without.attn_k = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
+        layer_without.attn_v = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data));
+        layer_without.attn_q_norm_w = None;
+        layer_without.attn_k_norm_w = None;
+
+        let seq_len = 2;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output_with = transformer_layer_forward(&input, &layer_with, &config, &b, 0, &mask);
+        let output_without = transformer_layer_forward(&input, &layer_without, &config, &b, 0, &mask);
+
+        let data_w = output_with.as_tensor().as_f32();
+        let data_wo = output_without.as_tensor().as_f32();
+
+        let mut any_different = false;
+        for i in 0..data_w.len() {
+            if (data_w[i] - data_wo[i]).abs() > 1e-6 {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "Per-head Q/K norms with weight=2.0 should produce different output than no norms");
+    }
+
+    #[test]
+    fn test_model_forward_bert_no_output_norm() {
+        // BERT model without output_norm_w should still produce valid output
+        // (BERT does per-layer post-norm, so no global final norm is needed)
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+        let max_seq_len = 128;
+        let config = bert_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let pos_emb_data: Vec<f32> = (0..max_seq_len * hidden_size).map(|i| (i as f32) * 0.001).collect();
+
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: Some(dt(Tensor::new(vec![max_seq_len, hidden_size], pos_emb_data))),
+            embedding_norm_w: Some(ones_weight(hidden_size)),
+            embedding_norm_b: Some(zeros_bias(hidden_size)),
+            layers: vec![bert_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: None,
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let input_ids = &[0u32, 2, 4, 6];
+        let attention_mask = &[1.0f32, 1.0, 1.0, 1.0];
+
+        let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
+        assert_eq!(output.shape(), &[4, hidden_size]);
+        for &v in output.as_tensor().as_f32() {
+            assert!(v.is_finite(), "BERT model_forward without output_norm produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_model_forward_gemma_embedding_full() {
+        // End-to-end model_forward with GemmaEmbedding architecture
+        let b = cpu();
+        let hidden_size = 12; // 3 heads * 4 head_dim
+        let num_heads = 3;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let ffn_hidden = 8;
+        let vocab_size = 16;
+
+        let mut config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        config.vocab_size = vocab_size;
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let layer = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![layer],
+            output_norm_w: Some(ones_weight(hidden_size)),
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let input_ids = &[1u32, 3, 5];
+        let attention_mask = &[1.0f32, 1.0, 1.0];
+
+        let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
+        assert_eq!(output.shape(), &[3, hidden_size]);
+        for &v in output.as_tensor().as_f32() {
+            assert!(v.is_finite(), "GemmaEmbedding model_forward produced non-finite value: {}", v);
+        }
+
+        // Verify embedding scale is applied (output should differ from unscaled)
+        let mut config_no_scale = config.clone();
+        config_no_scale.embedding_scale = 1.0;
+        let embedding_data2: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let layer2 = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        let weights2 = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data2)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![layer2],
+            output_norm_w: Some(ones_weight(hidden_size)),
+            output_norm_b: None,
+            output_projection: None,
+        };
+        let output_no_scale = model_forward(input_ids, attention_mask, &weights2, &config_no_scale, &b, 0).unwrap();
+        let d1 = output.as_tensor().as_f32();
+        let d2 = output_no_scale.as_tensor().as_f32();
+        let mut any_diff = false;
+        for i in 0..d1.len() {
+            if (d1[i] - d2[i]).abs() > 1e-6 {
+                any_diff = true;
+                break;
+            }
+        }
+        assert!(any_diff, "Embedding scale should produce different outputs");
+    }
+
+    #[test]
+    fn test_gemma_embedding_is_bidirectional() {
+        // GemmaEmbedding should be bidirectional (causal=false).
+        // Verify that changing token at position 2 affects output at position 0.
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+
+        let mut config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        config.vocab_size = vocab_size;
+        assert!(!config.causal, "GemmaEmbedding should be bidirectional");
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.05).collect();
+
+        // Use non-zero K and V weights so attention actually attends across positions
+        let mut layer = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        let attn_data: Vec<f32> = (0..hidden_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let kv_dim = num_kv_heads * head_dim;
+        let kv_data: Vec<f32> = (0..kv_dim * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        layer.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data));
+        layer.attn_k = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
+        layer.attn_v = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data));
+
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![layer],
+            output_norm_w: Some(ones_weight(hidden_size)),
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let mask = &[1.0f32, 1.0, 1.0];
+
+        let out1 = model_forward(&[1, 2, 3], mask, &weights, &config, &b, 0).unwrap();
+        let out2 = model_forward(&[1, 2, 5], mask, &weights, &config, &b, 0).unwrap();
+
+        // Position 0 output should differ because token at position 2 changed
+        // (bidirectional attention allows position 0 to see position 2)
+        let d1 = out1.as_tensor().as_f32();
+        let d2 = out2.as_tensor().as_f32();
+        let pos0_differs = (0..hidden_size).any(|j| (d1[j] - d2[j]).abs() > 1e-6);
+        assert!(pos0_differs, "Bidirectional: changing token at pos 2 should affect output at pos 0");
     }
 }
