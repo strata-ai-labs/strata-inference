@@ -271,8 +271,10 @@ kernel void gemm_transpose(
 }
 
 // -----------------------------------------------------------------------
-// gelu — element-wise fast GELU approximation
-//   y = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// gelu — element-wise exact GELU using erf approximation
+//   y = x * 0.5 * (1 + erf(x / sqrt(2)))
+// erf approximation: Abramowitz & Stegun formula 7.1.26 (max error ~1.5e-7)
+// Same polynomial used by llama.cpp Metal shaders.
 // -----------------------------------------------------------------------
 kernel void gelu(
     device const float* input  [[buffer(0)]],
@@ -282,11 +284,15 @@ kernel void gelu(
 {
     if (tid >= count) return;
     float x = input[tid];
-    const float SQRT_2_OVER_PI = 0.7978845608f;
-    float inner = SQRT_2_OVER_PI * (x + 0.044715f * x * x * x);
-    // Clamp before tanh to avoid NaN from fast-math exp overflow
-    inner = clamp(inner, -10.0f, 10.0f);
-    output[tid] = 0.5f * x * (1.0f + metal::tanh(inner));
+    const float SQRT_2_INV = 0.7071067811865475f;
+    float arg = x * SQRT_2_INV;
+    // Abramowitz & Stegun erf approximation
+    float sign_arg = sign(arg);
+    float abs_arg = fabs(arg);
+    float t = 1.0f / (1.0f + 0.3275911f * abs_arg);
+    float y = 1.0f - (((((1.061405429f * t + -1.453152027f) * t) + 1.421413741f) * t + -0.284496736f) * t + 0.254829592f) * t * exp(-abs_arg * abs_arg);
+    float erf_val = sign_arg * y;
+    output[tid] = 0.5f * x * (1.0f + erf_val);
 }
 
 // -----------------------------------------------------------------------
@@ -307,29 +313,31 @@ kernel void add_tensor(
 // add_bias — broadcast row-add:  t[r*cols+c] += bias[c]
 // -----------------------------------------------------------------------
 kernel void add_bias(
-    device       float* t      [[buffer(0)]],
-    device const float* bias   [[buffer(1)]],
-    constant     uint&  rows   [[buffer(2)]],
-    constant     uint&  cols   [[buffer(3)]],
+    device const float* input  [[buffer(0)]],
+    device       float* output [[buffer(1)]],
+    device const float* bias   [[buffer(2)]],
+    constant     uint&  rows   [[buffer(3)]],
+    constant     uint&  cols   [[buffer(4)]],
     uint2 gid [[thread_position_in_grid]])
 {
     uint r = gid.y;
     uint c = gid.x;
     if (r >= rows || c >= cols) return;
-    t[r * cols + c] += bias[c];
+    output[r * cols + c] = input[r * cols + c] + bias[c];
 }
 
 // -----------------------------------------------------------------------
-// scale_kernel — in-place scalar multiply  t[i] *= factor
+// scale_kernel — out-of-place scalar multiply  output[i] = input[i] * factor
 // -----------------------------------------------------------------------
 kernel void scale_kernel(
-    device       float* t      [[buffer(0)]],
-    constant     float& factor [[buffer(1)]],
-    constant     uint&  count  [[buffer(2)]],
+    device const float* input  [[buffer(0)]],
+    device       float* output [[buffer(1)]],
+    constant     float& factor [[buffer(2)]],
+    constant     uint&  count  [[buffer(3)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= count) return;
-    t[tid] *= factor;
+    output[tid] = input[tid] * factor;
 }
 
 // -----------------------------------------------------------------------
@@ -401,9 +409,10 @@ kernel void layer_norm(
 //   One threadgroup per row; shared-memory reductions for max and sum.
 // -----------------------------------------------------------------------
 kernel void softmax_rows(
-    device float* data          [[buffer(0)]],
-    constant uint& rows         [[buffer(1)]],
-    constant uint& cols         [[buffer(2)]],
+    device const float* input   [[buffer(0)]],
+    device       float* output  [[buffer(1)]],
+    constant     uint&  rows    [[buffer(2)]],
+    constant     uint&  cols    [[buffer(3)]],
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint threads_per_group [[threads_per_threadgroup]])
@@ -416,7 +425,7 @@ kernel void softmax_rows(
     // --- Find row max ---
     float local_max = -INFINITY;
     for (uint c = lid; c < cols; c += threads_per_group) {
-        local_max = max(local_max, data[row * cols + c]);
+        local_max = max(local_max, input[row * cols + c]);
     }
     shared[lid] = local_max;
 
@@ -433,8 +442,8 @@ kernel void softmax_rows(
     float local_sum = 0.0f;
     for (uint c = lid; c < cols; c += threads_per_group) {
         uint idx = row * cols + c;
-        float val = exp(data[idx] - row_max);
-        data[idx] = val;
+        float val = exp(input[idx] - row_max);
+        output[idx] = val;
         local_sum += val;
     }
     shared[lid] = local_sum;
@@ -452,7 +461,7 @@ kernel void softmax_rows(
     if (total > 0.0f) {
         float inv_total = 1.0f / total;
         for (uint c = lid; c < cols; c += threads_per_group) {
-            data[row * cols + c] *= inv_total;
+            output[row * cols + c] *= inv_total;
         }
     }
 }
@@ -537,15 +546,16 @@ kernel void quantized_matmul_q8_0(
     const short ix = tiisg / (NW / NQ);  // 0..NQ-1 (which group of 4 threads)
     const short il = tiisg % (NW / NQ);  // 0..3 (which sub-chunk within group)
 
-    const int ib0 = sgitg * NQ + ix;
+    const int ib0 = ix;
 
     // Cache for input vector elements
     float yl[NQ];
 
     device const float * yb = input + ib0 * QK8_0 + il * NQ;
 
-    // Process all blocks for this row
-    for (int ib = ib0; ib < (int)nb; ib += N_SG_Q8 * NQ) {
+    // Process all blocks for this row — each simdgroup independently
+    // covers ALL blocks for its assigned rows (stride = NQ blocks).
+    for (int ib = ib0; ib < (int)nb; ib += NQ) {
         // Cache input values
         for (short i = 0; i < NQ; ++i) {
             yl[i] = yb[i];
@@ -564,7 +574,7 @@ kernel void quantized_matmul_q8_0(
             sumf[row] += sumq * float(ax[row][ib].d);
         }
 
-        yb += N_SG_Q8 * NQ * QK8_0;
+        yb += NQ * QK8_0;
     }
 
     // Reduce across simdgroup using simd_sum
@@ -823,8 +833,13 @@ kernel void rope_norm(
     output[idx0] = x0 * cos_theta - x1 * sin_theta;
     output[idx1] = x0 * sin_theta + x1 * cos_theta;
 
-    // Copy non-rotated dimensions if this thread is responsible
-    // (handled by the caller ensuring rope_dim <= head_dim)
+    // Copy non-rotated dimensions (rope_dim .. head_dim) for this head.
+    // Each pair-thread copies one non-rotated element to avoid redundant work.
+    uint non_rot_idx = rope_dim + pair;
+    if (non_rot_idx < head_dim) {
+        uint src = base_idx + non_rot_idx;
+        output[src] = input[src];
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -879,6 +894,14 @@ kernel void rope_neox(
 
     output[idx_lo] = x_lo * cos_theta - x_hi * sin_theta;
     output[idx_hi] = x_lo * sin_theta + x_hi * cos_theta;
+
+    // Copy non-rotated dimensions (rope_dim .. head_dim) for this head.
+    // Each thread copies one non-rotated element to avoid redundant work.
+    uint non_rot_idx = rope_dim + i;
+    if (non_rot_idx < head_dim) {
+        uint src = base_idx + non_rot_idx;
+        output[src] = input[src];
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -887,19 +910,19 @@ kernel void rope_neox(
 //   2D grid: (cols, rows). offset allows shifting for KV-cache decoding.
 // -----------------------------------------------------------------------
 kernel void causal_mask(
-    device       float* scores [[buffer(0)]],
-    constant     uint&  rows   [[buffer(1)]],
-    constant     uint&  cols   [[buffer(2)]],
-    constant     uint&  offset [[buffer(3)]],
+    device const float* input  [[buffer(0)]],
+    device       float* output [[buffer(1)]],
+    constant     uint&  rows   [[buffer(2)]],
+    constant     uint&  cols   [[buffer(3)]],
+    constant     uint&  offset [[buffer(4)]],
     uint2 gid [[thread_position_in_grid]])
 {
     uint r = gid.y;
     uint c = gid.x;
     if (r >= rows || c >= cols) return;
+    uint idx = r * cols + c;
     // Mask future tokens: j > i + offset means this position cannot attend
-    if (c > r + offset) {
-        scores[r * cols + c] = -INFINITY;
-    }
+    output[idx] = (c > r + offset) ? -INFINITY : input[idx];
 }
 
 // -----------------------------------------------------------------------

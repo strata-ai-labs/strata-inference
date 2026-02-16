@@ -576,18 +576,8 @@ impl MetalBackend {
         let gy = (n_heads + 15) / 16;
         let gz = seq_len;
 
-        // If rope_dim < head_dim, copy input to output first so non-rotated
-        // dims are preserved. The kernel reads from input and only writes
-        // the rotated pairs to output, so the copy is safe.
-        if rope_dim < head_dim {
-            let src_ptr = msg_send_ptr(Self::buf_id(input_dt), self.sels.contents);
-            let dst_ptr = msg_send_ptr(out_buf.buffer, self.sels.contents);
-            std::ptr::copy_nonoverlapping(
-                src_ptr as *const u8,
-                dst_ptr as *mut u8,
-                out_bytes,
-            );
-        }
+        // Non-rotated dimensions (rope_dim .. head_dim) are copied by the
+        // kernel itself, so no CPU-side memcpy is needed.
 
         self.dispatch_3d(enc, gx, gy, gz, 16, 16, 1);
 
@@ -788,7 +778,7 @@ impl ComputeBackend for MetalBackend {
                 "Metal quantized_matmul: no native kernel for {:?}, using dequant fallback",
                 dtype
             );
-            let weights_f32 = weights.as_tensor().to_f32();
+            let weights_f32 = self.download(weights).to_f32();
             let weights_f32_dev = self.upload(&weights_f32);
             return self.matmul_transpose(input, &weights_f32_dev);
         }
@@ -896,25 +886,14 @@ impl ComputeBackend for MetalBackend {
         let out_bytes = out_count * std::mem::size_of::<f32>();
 
         unsafe {
-            // add_bias kernel works in-place on the first buffer, so we need to
-            // copy input to output first, then run in-place on the output.
             let out_buf = self.create_buffer_empty(out_bytes);
-
-            // Copy input to output
-            let src_ptr = msg_send_ptr(Self::buf_id(a), self.sels.contents);
-            let dst_ptr = msg_send_ptr(out_buf.buffer, self.sels.contents);
-            std::ptr::copy_nonoverlapping(
-                src_ptr as *const u8,
-                dst_ptr as *mut u8,
-                out_bytes,
-            );
-
             let enc = self.ensure_encoder(self.pso_add_bias);
 
-            self.set_buffer(enc, out_buf.buffer, 0);
-            self.set_buffer(enc, Self::buf_id(bias), 1);
-            self.set_u32(enc, rows as u32, 2);
-            self.set_u32(enc, cols as u32, 3);
+            self.set_buffer(enc, Self::buf_id(a), 0);
+            self.set_buffer(enc, out_buf.buffer, 1);
+            self.set_buffer(enc, Self::buf_id(bias), 2);
+            self.set_u32(enc, rows as u32, 3);
+            self.set_u32(enc, cols as u32, 4);
 
             self.dispatch_2d(enc, cols, rows, 16, 16);
 
@@ -1040,22 +1019,13 @@ impl ComputeBackend for MetalBackend {
         let threads_per_group = (cols.next_power_of_two()).min(256);
 
         unsafe {
-            // softmax_rows operates in-place, so copy input to output first.
             let out_buf = self.create_buffer_empty(out_bytes);
-
-            let src_ptr = msg_send_ptr(Self::buf_id(t), self.sels.contents);
-            let dst_ptr = msg_send_ptr(out_buf.buffer, self.sels.contents);
-            std::ptr::copy_nonoverlapping(
-                src_ptr as *const u8,
-                dst_ptr as *mut u8,
-                out_bytes,
-            );
-
             let enc = self.ensure_encoder(self.pso_softmax_rows);
 
-            self.set_buffer(enc, out_buf.buffer, 0);
-            self.set_u32(enc, rows as u32, 1);
-            self.set_u32(enc, cols as u32, 2);
+            self.set_buffer(enc, Self::buf_id(t), 0);
+            self.set_buffer(enc, out_buf.buffer, 1);
+            self.set_u32(enc, rows as u32, 2);
+            self.set_u32(enc, cols as u32, 3);
 
             self.dispatch_rows(enc, rows, threads_per_group);
 
@@ -1068,22 +1038,13 @@ impl ComputeBackend for MetalBackend {
         let out_bytes = count * std::mem::size_of::<f32>();
 
         unsafe {
-            // scale_kernel operates in-place, so copy input to output first.
             let out_buf = self.create_buffer_empty(out_bytes);
-
-            let src_ptr = msg_send_ptr(Self::buf_id(t), self.sels.contents);
-            let dst_ptr = msg_send_ptr(out_buf.buffer, self.sels.contents);
-            std::ptr::copy_nonoverlapping(
-                src_ptr as *const u8,
-                dst_ptr as *mut u8,
-                out_bytes,
-            );
-
             let enc = self.ensure_encoder(self.pso_scale);
 
-            self.set_buffer(enc, out_buf.buffer, 0);
-            self.set_f32(enc, factor, 1);
-            self.set_u32(enc, count as u32, 2);
+            self.set_buffer(enc, Self::buf_id(t), 0);
+            self.set_buffer(enc, out_buf.buffer, 1);
+            self.set_f32(enc, factor, 2);
+            self.set_u32(enc, count as u32, 3);
 
             self.dispatch_1d(enc, count);
 
@@ -1097,26 +1058,17 @@ impl ComputeBackend for MetalBackend {
         let out_bytes = count * std::mem::size_of::<f32>();
 
         unsafe {
-            // causal_mask operates in-place, so copy input to output first.
             let out_buf = self.create_buffer_empty(out_bytes);
-
-            let src_ptr = msg_send_ptr(Self::buf_id(scores), self.sels.contents);
-            let dst_ptr = msg_send_ptr(out_buf.buffer, self.sels.contents);
-            std::ptr::copy_nonoverlapping(
-                src_ptr as *const u8,
-                dst_ptr as *mut u8,
-                out_bytes,
-            );
-
             let enc = self.ensure_encoder(self.pso_causal_mask);
 
-            self.set_buffer(enc, out_buf.buffer, 0);
-            self.set_u32(enc, rows as u32, 1);
-            self.set_u32(enc, cols as u32, 2);
+            self.set_buffer(enc, Self::buf_id(scores), 0);
+            self.set_buffer(enc, out_buf.buffer, 1);
+            self.set_u32(enc, rows as u32, 2);
+            self.set_u32(enc, cols as u32, 3);
             // offset = cols - seq_len, so that for a KV-cache scenario
             // the diagonal is shifted. For simple causal mask, offset = 0.
             let offset = if cols > seq_len { cols - seq_len } else { 0 };
-            self.set_u32(enc, offset as u32, 3);
+            self.set_u32(enc, offset as u32, 4);
 
             self.dispatch_2d(enc, cols, rows, 16, 16);
 
@@ -1191,7 +1143,18 @@ impl ComputeBackend for MetalBackend {
     }
 
     fn embedding_lookup(&self, table: &DeviceTensor, ids: &[u32]) -> DeviceTensor {
-        let table_shape = table.shape();
+        // Convert non-F32 embedding tables — the GPU kernel expects F32.
+        let table_f32;
+        let effective_table = if table.dtype() != TensorDtype::F32 {
+            let tensor = self.download(table);
+            let f32_tensor = tensor.to_f32();
+            table_f32 = self.upload(&f32_tensor);
+            &table_f32
+        } else {
+            table
+        };
+
+        let table_shape = effective_table.shape();
         let vocab_size = table_shape[0];
         let hidden = *table_shape.last().unwrap();
         let num_tokens = ids.len();
@@ -1213,7 +1176,7 @@ impl ComputeBackend for MetalBackend {
             let out_buf = self.create_buffer_empty(out_bytes);
             let enc = self.ensure_encoder(self.pso_embedding_lookup);
 
-            self.set_buffer(enc, Self::buf_id(table), 0);
+            self.set_buffer(enc, Self::buf_id(effective_table), 0);
             self.set_buffer(enc, ids_buf.buffer, 1);
             self.set_buffer(enc, out_buf.buffer, 2);
             self.set_u32(enc, hidden as u32, 3);
