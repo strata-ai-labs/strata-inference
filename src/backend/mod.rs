@@ -4,34 +4,121 @@
 //! and [`DeviceTensor`] as a wrapper for tensors that live on a compute device.
 
 pub mod cpu;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
+#[cfg(feature = "cuda")]
+pub mod cuda;
+mod dl;
+
+use std::any::Any;
+use std::sync::Arc;
+
+use tracing::info;
 
 use crate::tensor::{Tensor, TensorDtype};
 
+/// Storage for device tensor data.
+///
+/// CPU storage wraps a [`Tensor`] directly. GPU backends store an opaque
+/// buffer handle via `Box<dyn Any + Send + Sync>`.
+#[allow(dead_code)]
+enum DeviceStorage {
+    Cpu(Tensor),
+    Gpu(Box<dyn Any + Send + Sync>),
+}
+
+impl std::fmt::Debug for DeviceStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceStorage::Cpu(t) => write!(f, "Cpu({:?})", t),
+            DeviceStorage::Gpu(_) => write!(f, "Gpu(...)"),
+        }
+    }
+}
+
+impl Clone for DeviceStorage {
+    fn clone(&self) -> Self {
+        match self {
+            DeviceStorage::Cpu(t) => DeviceStorage::Cpu(t.clone()),
+            DeviceStorage::Gpu(_) => panic!("GPU DeviceTensor cannot be cloned; download first"),
+        }
+    }
+}
+
 /// A tensor that lives on a compute device (CPU, GPU, etc.).
 ///
-/// For the CPU backend, this is a simple wrapper around [`Tensor`].
-/// GPU backends will extend this with device-specific buffer handles.
+/// For the CPU backend, wraps a [`Tensor`] directly.
+/// GPU backends store an opaque buffer handle alongside shape/dtype metadata.
 #[derive(Debug, Clone)]
 pub struct DeviceTensor {
-    pub tensor: Tensor,
+    shape: Vec<usize>,
+    dtype: TensorDtype,
+    storage: DeviceStorage,
 }
 
 impl DeviceTensor {
-    /// Create a new device tensor wrapping the given tensor.
+    /// Create a CPU-resident device tensor wrapping the given tensor.
     pub fn new(tensor: Tensor) -> Self {
-        Self { tensor }
+        let shape = tensor.shape().to_vec();
+        let dtype = tensor.dtype();
+        Self {
+            shape,
+            dtype,
+            storage: DeviceStorage::Cpu(tensor),
+        }
     }
 
-    /// Returns the shape of the underlying tensor.
+    /// Create a GPU-resident device tensor with an opaque buffer.
+    #[allow(dead_code)]
+    pub(crate) fn from_gpu(
+        shape: Vec<usize>,
+        dtype: TensorDtype,
+        inner: Box<dyn Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            shape,
+            dtype,
+            storage: DeviceStorage::Gpu(inner),
+        }
+    }
+
+    /// Returns the shape of this tensor.
     pub fn shape(&self) -> &[usize] {
-        self.tensor.shape()
+        &self.shape
     }
 
-    /// Returns the data type of the underlying tensor.
+    /// Returns the data type of this tensor.
     pub fn dtype(&self) -> TensorDtype {
-        self.tensor.dtype()
+        self.dtype
+    }
+
+    /// Try to get the underlying CPU tensor (returns `None` for GPU tensors).
+    pub fn try_as_tensor(&self) -> Option<&Tensor> {
+        match &self.storage {
+            DeviceStorage::Cpu(t) => Some(t),
+            DeviceStorage::Gpu(_) => None,
+        }
+    }
+
+    /// Get the underlying CPU tensor. Panics if this is a GPU tensor.
+    pub fn as_tensor(&self) -> &Tensor {
+        self.try_as_tensor()
+            .expect("DeviceTensor::as_tensor called on GPU-resident tensor; download first")
+    }
+
+    /// Downcast the GPU-resident inner buffer to a concrete type.
+    #[allow(dead_code)]
+    pub(crate) fn gpu_inner<T: 'static>(&self) -> Option<&T> {
+        match &self.storage {
+            DeviceStorage::Gpu(inner) => inner.downcast_ref::<T>(),
+            DeviceStorage::Cpu(_) => None,
+        }
     }
 }
+
+// Backwards compatibility: allow tests and code that used `.tensor` to keep working
+// via the `as_tensor()` method. The `pub tensor` field is replaced by storage.
+// Direct accesses like `dt.tensor.as_f32()` should use `dt.as_tensor().as_f32()`.
 
 /// Compute backend trait -- all operations needed for transformer inference.
 ///
@@ -124,4 +211,66 @@ pub trait ComputeBackend: Send + Sync {
     /// table: [vocab_size, hidden_size], ids: token IDs
     /// Returns: [len(ids), hidden_size]
     fn embedding_lookup(&self, table: &DeviceTensor, ids: &[u32]) -> DeviceTensor;
+
+    /// Element-wise multiply with broadcast: [M, N] * [N] -> [M, N] or same-shape.
+    fn mul(&self, a: &DeviceTensor, b: &DeviceTensor) -> DeviceTensor;
+
+    /// Tanh activation (element-wise).
+    fn tanh(&self, t: &DeviceTensor) -> DeviceTensor;
+
+    /// GELU-gated linear unit: gelu(gate) * up (element-wise).
+    ///
+    /// Used by Gemma models whose FFN uses GELU gating instead of SiLU.
+    fn geglu(&self, gate: &DeviceTensor, up: &DeviceTensor) -> DeviceTensor;
+
+    /// RoPE with NeoX-style half-split dimension pairing.
+    ///
+    /// Pairs `(x[i], x[i + n_dims/2])` instead of `(x[2i], x[2i+1])`.
+    /// Used by Gemma3 and most modern models.
+    fn rope_neox(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        pos_offset: usize,
+        freq_base: f32,
+        head_dim: usize,
+        rope_dim: usize,
+    ) -> (DeviceTensor, DeviceTensor);
+}
+
+/// Auto-detect and return the best available compute backend.
+///
+/// Priority: CUDA > Metal > CPU.
+pub fn select_backend() -> Arc<dyn ComputeBackend> {
+    // Try CUDA first (if feature enabled)
+    #[cfg(feature = "cuda")]
+    {
+        match cuda::CudaBackend::try_new() {
+            Ok(backend) => {
+                info!("Selected CUDA backend");
+                return Arc::new(backend);
+            }
+            Err(e) => {
+                info!(error = %e, "CUDA not available, trying next backend");
+            }
+        }
+    }
+
+    // Try Metal (macOS only, if feature enabled)
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        match metal::MetalBackend::try_new() {
+            Ok(backend) => {
+                info!("Selected Metal backend");
+                return Arc::new(backend);
+            }
+            Err(e) => {
+                info!(error = %e, "Metal not available, falling back to CPU");
+            }
+        }
+    }
+
+    // CPU fallback (always available)
+    info!("Selected CPU backend");
+    Arc::new(cpu::CpuBackend::new())
 }

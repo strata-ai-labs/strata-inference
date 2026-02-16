@@ -26,6 +26,7 @@ pub enum NormType {
 pub enum Activation {
     GELU,
     SwiGLU,
+    GeGLU,
 }
 
 /// Position embedding type.
