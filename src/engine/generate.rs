@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 
@@ -54,6 +55,8 @@ pub struct GenerationOutput {
     pub stop_reason: StopReason,
     /// Number of prompt tokens (for timing calculations).
     pub prompt_tokens: usize,
+    /// Time spent on the prefill forward pass (excludes tokenization and setup).
+    pub prefill_duration: Duration,
 }
 
 /// Configuration for text generation.
@@ -307,7 +310,8 @@ impl GenerationEngine {
             }
         }
 
-        // Prefill
+        // Prefill (timed separately from tokenization/setup)
+        let prefill_start = Instant::now();
         let hidden = model_forward_step(
             &prompt_ids,
             &self.weights,
@@ -318,6 +322,7 @@ impl GenerationEngine {
 
         let logits = self.project_to_logits(&hidden, prompt_ids.len() - 1);
         let mut next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
+        let prefill_duration = prefill_start.elapsed();
 
         // Decode loop — track why we stopped
         let mut stop_reason = StopReason::MaxTokens; // default if loop exhausts
@@ -356,6 +361,7 @@ impl GenerationEngine {
             token_ids: generated_ids,
             stop_reason,
             prompt_tokens,
+            prefill_duration,
         })
     }
 
@@ -900,6 +906,11 @@ mod tests {
         // prompt "hello" with BOS = 2 tokens
         assert_eq!(output.prompt_tokens, 2);
         assert!(!output.token_ids.is_empty() || output.stop_reason == StopReason::StopToken);
+        // prefill_duration should be non-zero (actual forward pass happened)
+        assert!(
+            output.prefill_duration.as_nanos() > 0,
+            "prefill_duration should be non-zero"
+        );
     }
 
     #[test]

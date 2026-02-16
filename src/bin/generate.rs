@@ -141,25 +141,23 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    // Generate with timing split
-    let prefill_start = Instant::now();
-    let mut first_token_time: Option<Instant> = None;
+    // Generate with timing
+    let decode_start_cell: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None);
 
     let output = engine.generate_stream_full(&input, &gen_config, |_token_id| {
-        if first_token_time.is_none() {
-            first_token_time = Some(Instant::now());
+        if decode_start_cell.get().is_none() {
+            decode_start_cell.set(Some(Instant::now()));
         }
         true
     })?;
 
     let gen_end = Instant::now();
 
-    // Timing calculations
-    let prefill_ms = first_token_time
-        .map(|t| (t - prefill_start).as_secs_f64() * 1000.0)
-        .unwrap_or_else(|| (gen_end - prefill_start).as_secs_f64() * 1000.0);
+    // Timing calculations — prefill comes from the engine (excludes tokenization)
+    let prefill_ms = output.prefill_duration.as_secs_f64() * 1000.0;
 
-    let decode_ms = first_token_time
+    let decode_ms = decode_start_cell
+        .get()
         .map(|t| (gen_end - t).as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
 
