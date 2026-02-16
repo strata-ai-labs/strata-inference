@@ -154,6 +154,9 @@ impl ModelConfig {
                 "{}.attention.layer_norm_rms_epsilon",
                 arch_name
             ))
+            .or_else(|| {
+                gguf.get_f32(&format!("{}.attention.layer_norm_epsilon", arch_name))
+            })
             .unwrap_or(1e-6);
 
         let rope_freq_base = gguf
