@@ -576,24 +576,20 @@ impl MetalBackend {
         let gy = (n_heads + 15) / 16;
         let gz = seq_len;
 
-        self.dispatch_3d(enc, gx, gy, gz, 16, 16, 1);
+        // If rope_dim < head_dim, copy input to output first so non-rotated
+        // dims are preserved. The kernel reads from input and only writes
+        // the rotated pairs to output, so the copy is safe.
+        if rope_dim < head_dim {
+            let src_ptr = msg_send_ptr(Self::buf_id(input_dt), self.sels.contents);
+            let dst_ptr = msg_send_ptr(out_buf.buffer, self.sels.contents);
+            std::ptr::copy_nonoverlapping(
+                src_ptr as *const u8,
+                dst_ptr as *mut u8,
+                out_bytes,
+            );
+        }
 
-        // If rope_dim < head_dim, we need to copy the non-rotated dimensions.
-        // The kernel only writes the rotated pairs. For the non-rotated tail,
-        // we rely on the fact that the output buffer is uninitialized — so we
-        // need to copy those elements. We do this by pre-copying the entire
-        // input to the output buffer if rope_dim < head_dim.
-        //
-        // Actually, for simplicity and correctness, if rope_dim < head_dim,
-        // we copy the full input into the output first, then run the kernel
-        // in-place. But since the kernel reads from input and writes to output,
-        // this is safe as long as the copy happens before the kernel dispatch.
-        //
-        // The most practical approach: always copy non-rotated dims on CPU
-        // after the fact, or use a separate copy kernel. For now, since most
-        // models use rope_dim == head_dim, we handle the common case. If
-        // rope_dim < head_dim, the non-rotated dimensions will be zero.
-        // TODO: Add a copy kernel for non-rotated dimensions if needed.
+        self.dispatch_3d(enc, gx, gy, gz, 16, 16, 1);
 
         Self::wrap(out_buf, vec![seq_len, total_cols], TensorDtype::F32)
     }
@@ -1214,8 +1210,18 @@ impl ComputeBackend for MetalBackend {
 
     fn embedding_lookup(&self, table: &DeviceTensor, ids: &[u32]) -> DeviceTensor {
         let table_shape = table.shape();
+        let vocab_size = table_shape[0];
         let hidden = *table_shape.last().unwrap();
         let num_tokens = ids.len();
+
+        // Bounds check: all token IDs must be within vocab range
+        for (i, &id) in ids.iter().enumerate() {
+            assert!(
+                (id as usize) < vocab_size,
+                "embedding_lookup: token_id {} at index {} is out of range (vocab_size = {})",
+                id, i, vocab_size
+            );
+        }
 
         let out_count = num_tokens * hidden;
         let out_bytes = out_count * std::mem::size_of::<f32>();
@@ -1813,5 +1819,116 @@ mod tests {
         let out_gpu = metal.download(&metal.mean_pool(&metal.upload(&t), &mask));
 
         assert_vecs_close(out_gpu.as_f32(), out_cpu.as_f32(), 1e-4, "mean_pool");
+    }
+
+    #[test]
+    fn test_quantized_matmul_q4_0_vs_cpu() {
+        let metal = backend();
+        let cpu_be = cpu();
+
+        // Create Q4_0 weights: 2 rows x 32 cols
+        // Q4_0 block: 2 bytes f16 scale + 16 bytes (32 nibbles)
+        let scale = half::f16::from_f32(0.5);
+        let mut raw = Vec::new();
+        for _ in 0..2 {
+            raw.extend_from_slice(&scale.to_bits().to_le_bytes());
+            // All nibbles = 12 -> after -8 = 4, dequant = 0.5 * 4 = 2.0
+            for _ in 0..16 {
+                raw.push(0xCC);
+            }
+        }
+        let weights = Tensor::from_quantized(vec![2, 32], TensorDtype::Q4_0, raw);
+        let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
+
+        let out_cpu = cpu_be.download(&cpu_be.quantized_matmul(&cpu_be.upload(&weights), &cpu_be.upload(&input)));
+        let out_gpu = metal.download(&metal.quantized_matmul(&metal.upload(&weights), &metal.upload(&input)));
+
+        assert_eq!(out_cpu.shape(), &[1, 2]);
+        assert_eq!(out_gpu.shape(), &[1, 2]);
+        assert_vecs_close(out_gpu.as_f32(), out_cpu.as_f32(), 1.0, "quantized_matmul_q4_0");
+    }
+
+    #[test]
+    fn test_upload_download_roundtrip_f32() {
+        let metal = backend();
+
+        let data = vec![1.0f32, -2.5, 3.14, 0.0, 100.0];
+        let t = Tensor::new(vec![5], data.clone());
+        let dt = metal.upload(&t);
+        let result = metal.download(&dt);
+
+        assert_eq!(result.shape(), &[5]);
+        assert_vecs_close(result.as_f32(), &data, 1e-6, "roundtrip_f32");
+    }
+
+    #[test]
+    fn test_upload_download_roundtrip_q8_0() {
+        let metal = backend();
+
+        // Create Q8_0 tensor: 1 row x 32 cols
+        let scale = half::f16::from_f32(0.1);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&scale.to_bits().to_le_bytes());
+        for i in 0..32i8 {
+            raw.push(i as u8);
+        }
+        let t = Tensor::from_quantized(vec![1, 32], TensorDtype::Q8_0, raw);
+
+        // Upload to GPU, download, and compare against CPU dequantization
+        let cpu_f32 = t.to_f32();
+        let dt = metal.upload(&t);
+        let result = metal.download(&dt);
+        let result_f32 = result.to_f32();
+
+        assert_eq!(cpu_f32.shape(), result_f32.shape());
+        assert_vecs_close(result_f32.as_f32(), cpu_f32.as_f32(), 1e-6, "roundtrip_q8_0");
+    }
+
+    #[test]
+    fn test_rope_partial_rotation_vs_cpu() {
+        // Test with rope_dim < head_dim to verify non-rotated dims are preserved
+        let metal = backend();
+        let cpu_be = cpu();
+
+        // seq_len=1, 2 heads, head_dim=8, rope_dim=4 (only first 4 dims rotated)
+        let q_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.1 + 0.1).collect();
+        let k_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.05 + 0.5).collect();
+        let q = Tensor::new(vec![1, 16], q_data);
+        let k = Tensor::new(vec![1, 16], k_data);
+
+        let (cpu_q, cpu_k) = cpu_be.rope(&cpu_be.upload(&q), &cpu_be.upload(&k), 1, 10000.0, 8, 4);
+        let (gpu_q, gpu_k) = metal.rope(&metal.upload(&q), &metal.upload(&k), 1, 10000.0, 8, 4);
+
+        let cpu_q_d = cpu_be.download(&cpu_q);
+        let gpu_q_d = metal.download(&gpu_q);
+        let cpu_k_d = cpu_be.download(&cpu_k);
+        let gpu_k_d = metal.download(&gpu_k);
+
+        assert_vecs_close(gpu_q_d.as_f32(), cpu_q_d.as_f32(), 1e-3, "rope partial Q");
+        assert_vecs_close(gpu_k_d.as_f32(), cpu_k_d.as_f32(), 1e-3, "rope partial K");
+    }
+
+    #[test]
+    fn test_rope_neox_partial_rotation_vs_cpu() {
+        // Test with rope_dim < head_dim for NeoX variant
+        let metal = backend();
+        let cpu_be = cpu();
+
+        // seq_len=1, 2 heads, head_dim=8, rope_dim=4
+        let q_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.1 + 0.1).collect();
+        let k_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.05 + 0.5).collect();
+        let q = Tensor::new(vec![1, 16], q_data);
+        let k = Tensor::new(vec![1, 16], k_data);
+
+        let (cpu_q, cpu_k) = cpu_be.rope_neox(&cpu_be.upload(&q), &cpu_be.upload(&k), 1, 10000.0, 8, 4);
+        let (gpu_q, gpu_k) = metal.rope_neox(&metal.upload(&q), &metal.upload(&k), 1, 10000.0, 8, 4);
+
+        let cpu_q_d = cpu_be.download(&cpu_q);
+        let gpu_q_d = metal.download(&gpu_q);
+        let cpu_k_d = cpu_be.download(&cpu_k);
+        let gpu_k_d = metal.download(&gpu_k);
+
+        assert_vecs_close(gpu_q_d.as_f32(), cpu_q_d.as_f32(), 1e-3, "rope_neox partial Q");
+        assert_vecs_close(gpu_k_d.as_f32(), cpu_k_d.as_f32(), 1e-3, "rope_neox partial K");
     }
 }

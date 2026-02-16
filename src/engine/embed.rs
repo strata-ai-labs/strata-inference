@@ -162,7 +162,7 @@ impl EmbeddingEngine {
         // Guard: zero-length sequences get a zero vector (shouldn't happen in
         // normal use, but prevents underflow in the Last path).
         if seq_len == 0 {
-            return DeviceTensor::new(Tensor::new(vec![hidden_size], vec![0.0f32; hidden_size]));
+            return self.backend.upload(&Tensor::new(vec![hidden_size], vec![0.0f32; hidden_size]));
         }
 
         match self.config.pooling_type {

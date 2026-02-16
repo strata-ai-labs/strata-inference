@@ -1130,7 +1130,7 @@ impl ComputeBackend for CudaBackend {
         Self::wrap(out, t.shape().to_vec(), TensorDtype::F32)
     }
 
-    fn apply_causal_mask(&self, scores: &DeviceTensor, _seq_len: usize) -> DeviceTensor {
+    fn apply_causal_mask(&self, scores: &DeviceTensor, seq_len: usize) -> DeviceTensor {
         let (rows, cols) = Self::shape_2d(scores);
 
         let out = match self.alloc_zeros_f32(rows * cols) {
@@ -1149,14 +1149,20 @@ impl ComputeBackend for CudaBackend {
             tracing::warn!(error = %e, "CUDA: causal_mask copy failed");
         }
 
+        // offset = cols - seq_len for KV-cache scenarios where cols > seq_len.
+        // For simple causal mask (square matrix), offset = 0.
+        let offset = if cols > seq_len { cols - seq_len } else { 0 };
+
         let mut p_data = out.ptr;
         let mut p_rows = rows as u32;
         let mut p_cols = cols as u32;
+        let mut p_offset = offset as u32;
 
-        let mut params: [*mut c_void; 3] = [
+        let mut params: [*mut c_void; 4] = [
             &mut p_data as *mut _ as *mut c_void,
             &mut p_rows as *mut _ as *mut c_void,
             &mut p_cols as *mut _ as *mut c_void,
+            &mut p_offset as *mut _ as *mut c_void,
         ];
 
         let grid = (
@@ -1306,11 +1312,20 @@ impl ComputeBackend for CudaBackend {
         let shape = table.shape();
         assert_eq!(shape.len(), 2, "embedding_lookup: table must be 2D");
 
-        let _vocab_size = shape[0];
+        let vocab_size = shape[0];
         let hidden_size = shape[1];
         let n_tokens = ids.len();
 
-        trace!(_vocab_size, hidden_size, n_tokens, "CUDA embedding_lookup");
+        // Bounds check: all token IDs must be within vocab range
+        for (i, &id) in ids.iter().enumerate() {
+            assert!(
+                (id as usize) < vocab_size,
+                "embedding_lookup: token_id {} at index {} is out of range (vocab_size = {})",
+                id, i, vocab_size
+            );
+        }
+
+        trace!(vocab_size, hidden_size, n_tokens, "CUDA embedding_lookup");
 
         // For quantized embedding tables, dequantize to F32 first and re-upload.
         // The GPU kernel expects F32 input for simplicity.
@@ -1358,12 +1373,13 @@ impl ComputeBackend for CudaBackend {
             &mut p_hidden as *mut _ as *mut c_void,
         ];
 
+        // Grid: (ceil(hidden/256), num_tokens, 1) — kernel uses blockIdx.y as token index
         let grid = (
-            Self::div_ceil(hidden_size as u32, 16),
-            Self::div_ceil(n_tokens as u32, 16),
+            Self::div_ceil(hidden_size as u32, 256),
+            n_tokens as u32,
             1,
         );
-        let block = (16, 16, 1);
+        let block = (256, 1, 1);
         unsafe {
             self.launch(self.fn_embedding_lookup, grid, block, 0, &mut params);
         }
@@ -2168,5 +2184,155 @@ mod tests {
 
         let diff = max_abs_diff(cpu_r.as_f32(), cuda_r.as_f32());
         assert!(diff < 1e-6, "mul: max abs diff = {diff}");
+    }
+
+    #[test]
+    fn test_quantized_matmul_q4_0_vs_cpu() {
+        let cuda = match try_cuda() {
+            Some(b) => b,
+            None => {
+                eprintln!("CUDA not available, skipping");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+
+        // Create Q4_0 weights: 2 rows x 32 cols
+        let scale = half::f16::from_f32(0.5);
+        let mut raw = Vec::new();
+        for _ in 0..2 {
+            raw.extend_from_slice(&scale.to_bits().to_le_bytes());
+            // All nibbles = 12 -> after -8 = 4, dequant = 0.5 * 4 = 2.0
+            for _ in 0..16 {
+                raw.push(0xCC);
+            }
+        }
+        let weights = Tensor::from_quantized(vec![2, 32], TensorDtype::Q4_0, raw);
+        let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
+
+        let cpu_out = cpu.download(&cpu.quantized_matmul(&cpu.upload(&weights), &cpu.upload(&input)));
+        let cuda_out = cuda.download(&cuda.quantized_matmul(&cuda.upload(&weights), &cuda.upload(&input)));
+
+        assert_eq!(cpu_out.shape(), &[1, 2]);
+        assert_eq!(cuda_out.shape(), &[1, 2]);
+        let diff = max_abs_diff(cpu_out.as_f32(), cuda_out.as_f32());
+        eprintln!("quantized_matmul_q4_0 max diff: {diff}");
+        assert!(diff < 1.0, "quantized_matmul_q4_0: max abs diff = {diff}");
+    }
+
+    #[test]
+    fn test_upload_download_roundtrip_f32() {
+        let cuda = match try_cuda() {
+            Some(b) => b,
+            None => {
+                eprintln!("CUDA not available, skipping");
+                return;
+            }
+        };
+
+        let data = vec![1.0f32, -2.5, 3.14, 0.0, 100.0];
+        let t = Tensor::new(vec![5], data.clone());
+        let dt = cuda.upload(&t);
+        let result = cuda.download(&dt);
+
+        assert_eq!(result.shape(), &[5]);
+        let diff = max_abs_diff(result.as_f32(), &data);
+        assert!(diff < 1e-6, "roundtrip_f32: max abs diff = {diff}");
+    }
+
+    #[test]
+    fn test_upload_download_roundtrip_q8_0() {
+        let cuda = match try_cuda() {
+            Some(b) => b,
+            None => {
+                eprintln!("CUDA not available, skipping");
+                return;
+            }
+        };
+
+        // Create Q8_0 tensor: 1 row x 32 cols
+        let scale = half::f16::from_f32(0.1);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&scale.to_bits().to_le_bytes());
+        for i in 0..32i8 {
+            raw.push(i as u8);
+        }
+        let t = Tensor::from_quantized(vec![1, 32], TensorDtype::Q8_0, raw);
+
+        // Compare CPU dequant vs upload+download+dequant roundtrip
+        let cpu_f32 = t.to_f32();
+        let dt = cuda.upload(&t);
+        let result = cuda.download(&dt);
+        let result_f32 = result.to_f32();
+
+        assert_eq!(cpu_f32.shape(), result_f32.shape());
+        let diff = max_abs_diff(result_f32.as_f32(), cpu_f32.as_f32());
+        assert!(diff < 1e-6, "roundtrip_q8_0: max abs diff = {diff}");
+    }
+
+    #[test]
+    fn test_rope_partial_rotation_vs_cpu() {
+        let cuda = match try_cuda() {
+            Some(b) => b,
+            None => {
+                eprintln!("CUDA not available, skipping");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+
+        // seq_len=1, 2 heads, head_dim=8, rope_dim=4 (only first 4 dims rotated)
+        let q_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.1 + 0.1).collect();
+        let k_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.05 + 0.5).collect();
+        let q = Tensor::new(vec![1, 16], q_data);
+        let k = Tensor::new(vec![1, 16], k_data);
+
+        let (cpu_q, cpu_k) = cpu.rope(&cpu.upload(&q), &cpu.upload(&k), 1, 10000.0, 8, 4);
+        let (cuda_q, cuda_k) = cuda.rope(&cuda.upload(&q), &cuda.upload(&k), 1, 10000.0, 8, 4);
+
+        let cpu_q_d = cpu.download(&cpu_q);
+        let cuda_q_d = cuda.download(&cuda_q);
+        let cpu_k_d = cpu.download(&cpu_k);
+        let cuda_k_d = cuda.download(&cuda_k);
+
+        let q_diff = max_abs_diff(cpu_q_d.as_f32(), cuda_q_d.as_f32());
+        let k_diff = max_abs_diff(cpu_k_d.as_f32(), cuda_k_d.as_f32());
+        eprintln!("rope partial Q max diff: {q_diff}");
+        eprintln!("rope partial K max diff: {k_diff}");
+        assert!(q_diff < 1e-3, "rope partial Q: max abs diff = {q_diff}");
+        assert!(k_diff < 1e-3, "rope partial K: max abs diff = {k_diff}");
+    }
+
+    #[test]
+    fn test_rope_neox_partial_rotation_vs_cpu() {
+        let cuda = match try_cuda() {
+            Some(b) => b,
+            None => {
+                eprintln!("CUDA not available, skipping");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+
+        // seq_len=1, 2 heads, head_dim=8, rope_dim=4
+        let q_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.1 + 0.1).collect();
+        let k_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.05 + 0.5).collect();
+        let q = Tensor::new(vec![1, 16], q_data);
+        let k = Tensor::new(vec![1, 16], k_data);
+
+        let (cpu_q, cpu_k) = cpu.rope_neox(&cpu.upload(&q), &cpu.upload(&k), 1, 10000.0, 8, 4);
+        let (cuda_q, cuda_k) = cuda.rope_neox(&cuda.upload(&q), &cuda.upload(&k), 1, 10000.0, 8, 4);
+
+        let cpu_q_d = cpu.download(&cpu_q);
+        let cuda_q_d = cuda.download(&cuda_q);
+        let cpu_k_d = cpu.download(&cpu_k);
+        let cuda_k_d = cuda.download(&cuda_k);
+
+        let q_diff = max_abs_diff(cpu_q_d.as_f32(), cuda_q_d.as_f32());
+        let k_diff = max_abs_diff(cpu_k_d.as_f32(), cuda_k_d.as_f32());
+        eprintln!("rope_neox partial Q max diff: {q_diff}");
+        eprintln!("rope_neox partial K max diff: {k_diff}");
+        assert!(q_diff < 1e-3, "rope_neox partial Q: max abs diff = {q_diff}");
+        assert!(k_diff < 1e-3, "rope_neox partial K: max abs diff = {k_diff}");
     }
 }

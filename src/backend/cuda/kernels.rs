@@ -1588,26 +1588,33 @@ GEGLU_DONE:
 // Pairs: (x[2i], x[2i+1]) for each head dimension pair.
 //   x_new[2i]   = x[2i]   * cos(theta) - x[2i+1] * sin(theta)
 //   x_new[2i+1] = x[2i]   * sin(theta) + x[2i+1] * cos(theta)
-// where theta = pos * base^(-2i/dim)
+// where theta = (pos_offset + seq_idx) * base^(-2i/head_dim)
 //
 // Parameters:
-//   data ptr (.u64)    — input/output tensor (seq_len, n_heads, head_dim)
-//   pos (.u32)         — position index
-//   head_dim (.u32)    — dimension per head
-//   n_heads (.u32)     — number of attention heads
-//   freq_base (.f32)   — RoPE base frequency (e.g. 10000.0)
+//   input ptr (.u64)    — input tensor [seq_len, n_heads * head_dim]
+//   output ptr (.u64)   — output tensor (same shape)
+//   pos_offset (.u32)   — starting position offset
+//   freq_base (.f32)    — RoPE base frequency (e.g. 10000.0)
+//   head_dim (.u32)     — dimension per head
+//   rope_dim (.u32)     — number of rotated dims per head (must be even)
+//   n_heads (.u32)      — number of attention heads
+//   seq_len (.u32)      — sequence length
 //
-// Grid:  (head_dim/2, n_heads, seq_len)
-// Block: (256, 1, 1) — each thread handles one rotation pair
-//
-// Note: blockIdx.x * blockDim.x + threadIdx.x gives the pair index
+// Grid:  (ceil(rope_dim/2 / 16), ceil(n_heads / 16), seq_len)
+// Block: (16, 16, 1)
+//   threadIdx.x + blockIdx.x*16 → pair_idx (0..rope_dim/2)
+//   threadIdx.y + blockIdx.y*16 → head_idx (0..n_heads)
+//   blockIdx.z → seq_idx (0..seq_len)
 // -------------------------------------------------------------------------
 .visible .entry rope_norm(
-    .param .u64 param_data,
-    .param .u32 param_pos,
+    .param .u64 param_input,
+    .param .u64 param_output,
+    .param .u32 param_pos_offset,
+    .param .f32 param_freq_base,
     .param .u32 param_head_dim,
+    .param .u32 param_rope_dim,
     .param .u32 param_n_heads,
-    .param .f32 param_freq_base
+    .param .u32 param_seq_len
 )
 {
     .reg .u64 %rd<10>;
@@ -1615,60 +1622,71 @@ GEGLU_DONE:
     .reg .f32 %f<20>;
     .reg .pred %p<3>;
 
-    ld.param.u64 %rd0, [param_data];
-    ld.param.u32 %r0, [param_pos];
-    ld.param.u32 %r1, [param_head_dim];
-    ld.param.u32 %r2, [param_n_heads];
+    ld.param.u64 %rd0, [param_input];
+    ld.param.u64 %rd1, [param_output];
+    ld.param.u32 %r0, [param_pos_offset];
     ld.param.f32 %f0, [param_freq_base];
+    ld.param.u32 %r1, [param_head_dim];
+    ld.param.u32 %r2, [param_rope_dim];
+    ld.param.u32 %r3, [param_n_heads];
+    ld.param.u32 %r4, [param_seq_len];
 
     // pair_idx = blockIdx.x * blockDim.x + threadIdx.x
-    mov.u32 %r3, %ctaid.x;
-    mov.u32 %r4, %ntid.x;
-    mul.lo.u32 %r3, %r3, %r4;
-    mov.u32 %r5, %tid.x;
-    add.u32 %r3, %r3, %r5;       // pair_idx (i)
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mul.lo.u32 %r5, %r5, %r6;
+    mov.u32 %r7, %tid.x;
+    add.u32 %r5, %r5, %r7;       // pair_idx
 
-    // half_dim = head_dim / 2
-    shr.u32 %r6, %r1, 1;
-    setp.ge.u32 %p0, %r3, %r6;
+    // head_idx = blockIdx.y * blockDim.y + threadIdx.y
+    mov.u32 %r8, %ctaid.y;
+    mov.u32 %r9, %ntid.y;
+    mul.lo.u32 %r8, %r8, %r9;
+    mov.u32 %r10, %tid.y;
+    add.u32 %r8, %r8, %r10;      // head_idx
+
+    // seq_idx = blockIdx.z
+    mov.u32 %r11, %ctaid.z;
+
+    // Bounds check: pair_idx < rope_dim/2, head_idx < n_heads
+    shr.u32 %r12, %r2, 1;         // half_rope = rope_dim / 2
+    setp.ge.u32 %p0, %r5, %r12;
     @%p0 bra ROPE_N_DONE;
+    setp.ge.u32 %p1, %r8, %r3;
+    @%p1 bra ROPE_N_DONE;
 
-    mov.u32 %r7, %ctaid.y;        // head_idx
-    mov.u32 %r8, %ctaid.z;        // seq_idx
-
-    // Compute theta = pos * freq_base^(-2*i / head_dim)
-    // = pos * exp(-2*i/head_dim * ln(freq_base))
-    // = pos * exp2(-2*i/head_dim * log2(freq_base))
-    shl.b32 %r9, %r3, 1;          // 2*i
-    cvt.rn.f32.u32 %f1, %r9;      // (float)(2*i)
+    // Compute theta = (pos_offset + seq_idx) * freq_base^(-2*pair_idx / head_dim)
+    add.u32 %r13, %r0, %r11;      // pos = pos_offset + seq_idx
+    shl.b32 %r14, %r5, 1;         // 2 * pair_idx
+    cvt.rn.f32.u32 %f1, %r14;     // (float)(2*pair_idx)
     cvt.rn.f32.u32 %f2, %r1;      // (float)head_dim
-    div.approx.f32 %f3, %f1, %f2; // 2*i / head_dim
-    neg.f32 %f3, %f3;             // -2*i / head_dim
-
-    // log2(freq_base)
-    lg2.approx.f32 %f4, %f0;
-    mul.rn.f32 %f3, %f3, %f4;     // -2*i/head_dim * log2(freq_base)
-    ex2.approx.f32 %f5, %f3;      // freq_base^(-2*i/head_dim)
-
-    cvt.rn.f32.u32 %f6, %r0;      // (float)pos
+    div.approx.f32 %f3, %f1, %f2; // 2*pair_idx / head_dim
+    neg.f32 %f3, %f3;             // -2*pair_idx / head_dim
+    lg2.approx.f32 %f4, %f0;      // log2(freq_base)
+    mul.rn.f32 %f3, %f3, %f4;     // -2*pair_idx/head_dim * log2(freq_base)
+    ex2.approx.f32 %f5, %f3;      // freq_base^(-2*pair_idx/head_dim)
+    cvt.rn.f32.u32 %f6, %r13;     // (float)pos
     mul.rn.f32 %f7, %f6, %f5;     // theta = pos * freq
 
-    // cos(theta), sin(theta) via PTX
     cos.approx.f32 %f8, %f7;
     sin.approx.f32 %f9, %f7;
 
-    // Compute data offset:
-    // offset = (seq_idx * n_heads * head_dim + head_idx * head_dim + 2*i) * 4
-    mul.lo.u32 %r10, %r8, %r2;
-    add.u32 %r10, %r10, %r7;
-    mul.lo.u32 %r10, %r10, %r1;
-    add.u32 %r10, %r10, %r9;      // linear index of x[2i]
-    mul.wide.u32 %rd1, %r10, 4;
-    add.u64 %rd2, %rd0, %rd1;
+    // Compute linear index: (seq_idx * n_heads + head_idx) * head_dim + 2*pair_idx
+    mul.lo.u32 %r15, %r11, %r3;   // seq_idx * n_heads
+    add.u32 %r15, %r15, %r8;      // + head_idx
+    mul.lo.u32 %r15, %r15, %r1;   // * head_dim
+    add.u32 %r15, %r15, %r14;     // + 2*pair_idx
 
-    // Load x[2i] and x[2i+1]
-    ld.global.f32 %f10, [%rd2];
-    ld.global.f32 %f11, [%rd2+4];
+    // Input addresses
+    mul.wide.u32 %rd2, %r15, 4;
+    add.u64 %rd3, %rd0, %rd2;     // &input[idx]
+
+    // Output addresses
+    add.u64 %rd4, %rd1, %rd2;     // &output[idx]
+
+    // Load x[2i] and x[2i+1] from input
+    ld.global.f32 %f10, [%rd3];
+    ld.global.f32 %f11, [%rd3+4];
 
     // Rotate
     // x_new[2i]   = x[2i]   * cos - x[2i+1] * sin
@@ -1681,9 +1699,9 @@ GEGLU_DONE:
     mul.rn.f32 %f16, %f11, %f8;
     add.rn.f32 %f17, %f15, %f16;  // new_x1
 
-    // Store
-    st.global.f32 [%rd2], %f14;
-    st.global.f32 [%rd2+4], %f17;
+    // Store to output
+    st.global.f32 [%rd4], %f14;
+    st.global.f32 [%rd4+4], %f17;
 ROPE_N_DONE:
     ret;
 }
@@ -1694,80 +1712,99 @@ ROPE_N_DONE:
 // Pairs: (x[i], x[i + half]) for each head.
 //   x_new[i]        = x[i]      * cos(theta) - x[i+half] * sin(theta)
 //   x_new[i + half] = x[i]      * sin(theta) + x[i+half] * cos(theta)
-// where theta = pos * base^(-2i/dim)
+// where theta = (pos_offset + seq_idx) * base^(-2i/head_dim)
 //
-// Parameters: same as rope_norm
-// Grid:  (head_dim/2, n_heads, seq_len)
-// Block: (256, 1, 1)
+// Parameters: same as rope_norm (8 params)
+// Grid:  (ceil(rope_dim/2 / 16), ceil(n_heads / 16), seq_len)
+// Block: (16, 16, 1)
 // -------------------------------------------------------------------------
 .visible .entry rope_neox(
-    .param .u64 param_data,
-    .param .u32 param_pos,
+    .param .u64 param_input,
+    .param .u64 param_output,
+    .param .u32 param_pos_offset,
+    .param .f32 param_freq_base,
     .param .u32 param_head_dim,
+    .param .u32 param_rope_dim,
     .param .u32 param_n_heads,
-    .param .f32 param_freq_base
+    .param .u32 param_seq_len
 )
 {
-    .reg .u64 %rd<10>;
+    .reg .u64 %rd<12>;
     .reg .u32 %r<20>;
     .reg .f32 %f<20>;
     .reg .pred %p<3>;
 
-    ld.param.u64 %rd0, [param_data];
-    ld.param.u32 %r0, [param_pos];
-    ld.param.u32 %r1, [param_head_dim];
-    ld.param.u32 %r2, [param_n_heads];
+    ld.param.u64 %rd0, [param_input];
+    ld.param.u64 %rd1, [param_output];
+    ld.param.u32 %r0, [param_pos_offset];
     ld.param.f32 %f0, [param_freq_base];
+    ld.param.u32 %r1, [param_head_dim];
+    ld.param.u32 %r2, [param_rope_dim];
+    ld.param.u32 %r3, [param_n_heads];
+    ld.param.u32 %r4, [param_seq_len];
 
-    // i = blockIdx.x * blockDim.x + threadIdx.x
-    mov.u32 %r3, %ctaid.x;
-    mov.u32 %r4, %ntid.x;
-    mul.lo.u32 %r3, %r3, %r4;
-    mov.u32 %r5, %tid.x;
-    add.u32 %r3, %r3, %r5;
+    // pair_idx = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mul.lo.u32 %r5, %r5, %r6;
+    mov.u32 %r7, %tid.x;
+    add.u32 %r5, %r5, %r7;       // pair_idx (i)
 
-    // half = head_dim / 2
-    shr.u32 %r6, %r1, 1;
-    setp.ge.u32 %p0, %r3, %r6;
+    // head_idx = blockIdx.y * blockDim.y + threadIdx.y
+    mov.u32 %r8, %ctaid.y;
+    mov.u32 %r9, %ntid.y;
+    mul.lo.u32 %r8, %r8, %r9;
+    mov.u32 %r10, %tid.y;
+    add.u32 %r8, %r8, %r10;      // head_idx
+
+    // seq_idx = blockIdx.z
+    mov.u32 %r11, %ctaid.z;
+
+    // Bounds check: pair_idx < rope_dim/2, head_idx < n_heads
+    shr.u32 %r12, %r2, 1;         // half_rope = rope_dim / 2
+    setp.ge.u32 %p0, %r5, %r12;
     @%p0 bra ROPE_X_DONE;
+    setp.ge.u32 %p1, %r8, %r3;
+    @%p1 bra ROPE_X_DONE;
 
-    mov.u32 %r7, %ctaid.y;        // head_idx
-    mov.u32 %r8, %ctaid.z;        // seq_idx
-
-    // theta = pos * freq_base^(-2*i / head_dim)
-    shl.b32 %r9, %r3, 1;
-    cvt.rn.f32.u32 %f1, %r9;
+    // Compute theta = (pos_offset + seq_idx) * freq_base^(-2*i / head_dim)
+    add.u32 %r13, %r0, %r11;      // pos = pos_offset + seq_idx
+    shl.b32 %r14, %r5, 1;         // 2 * pair_idx
+    cvt.rn.f32.u32 %f1, %r14;
     cvt.rn.f32.u32 %f2, %r1;
     div.approx.f32 %f3, %f1, %f2;
     neg.f32 %f3, %f3;
     lg2.approx.f32 %f4, %f0;
     mul.rn.f32 %f3, %f3, %f4;
     ex2.approx.f32 %f5, %f3;
-    cvt.rn.f32.u32 %f6, %r0;
+    cvt.rn.f32.u32 %f6, %r13;
     mul.rn.f32 %f7, %f6, %f5;
 
     cos.approx.f32 %f8, %f7;
     sin.approx.f32 %f9, %f7;
 
-    // Base offset for this head in this sequence position
-    // base = (seq_idx * n_heads + head_idx) * head_dim
-    mul.lo.u32 %r10, %r8, %r2;
-    add.u32 %r10, %r10, %r7;
-    mul.lo.u32 %r10, %r10, %r1;
+    // Base offset: (seq_idx * n_heads + head_idx) * head_dim
+    mul.lo.u32 %r15, %r11, %r3;
+    add.u32 %r15, %r15, %r8;
+    mul.lo.u32 %r15, %r15, %r1;
 
-    // Offset for x[i]: base + i
-    add.u32 %r11, %r10, %r3;
-    mul.wide.u32 %rd1, %r11, 4;
-    add.u64 %rd2, %rd0, %rd1;
+    // NeoX pairing: (x[base + i], x[base + i + half_rope])
+    add.u32 %r16, %r15, %r5;      // base + i
+    add.u32 %r17, %r16, %r12;     // base + i + half_rope
 
-    // Offset for x[i + half]: base + i + half
-    add.u32 %r12, %r11, %r6;
-    mul.wide.u32 %rd3, %r12, 4;
-    add.u64 %rd4, %rd0, %rd3;
+    // Input addresses
+    mul.wide.u32 %rd2, %r16, 4;
+    add.u64 %rd3, %rd0, %rd2;     // &input[base + i]
+    mul.wide.u32 %rd4, %r17, 4;
+    add.u64 %rd5, %rd0, %rd4;     // &input[base + i + half]
 
-    // Load x[i] and x[i + half]
-    ld.global.f32 %f10, [%rd2];
-    ld.global.f32 %f11, [%rd4];
+    // Output addresses
+    add.u64 %rd6, %rd1, %rd2;     // &output[base + i]
+    add.u64 %rd7, %rd1, %rd4;     // &output[base + i + half]
+
+    // Load from input
+    ld.global.f32 %f10, [%rd3];
+    ld.global.f32 %f11, [%rd5];
 
     // Rotate (NeoX style: first half paired with second half)
     mul.rn.f32 %f12, %f10, %f8;
@@ -1778,8 +1815,9 @@ ROPE_N_DONE:
     mul.rn.f32 %f16, %f11, %f8;
     add.rn.f32 %f17, %f15, %f16;
 
-    st.global.f32 [%rd2], %f14;
-    st.global.f32 [%rd4], %f17;
+    // Store to output
+    st.global.f32 [%rd6], %f14;
+    st.global.f32 [%rd7], %f17;
 ROPE_X_DONE:
     ret;
 }
