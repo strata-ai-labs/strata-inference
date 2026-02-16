@@ -215,12 +215,12 @@ impl GenerationEngine {
                 break;
             }
 
+            generated_ids.push(next_token);
+
             if cache.len() >= self.config.max_seq_len {
                 debug!(step, "Context length reached");
                 break;
             }
-
-            generated_ids.push(next_token);
 
             // Forward pass with single token
             let hidden = model_forward_step(
@@ -328,15 +328,15 @@ impl GenerationEngine {
                 break;
             }
 
-            if cache.len() >= self.config.max_seq_len {
-                stop_reason = StopReason::ContextLength;
-                break;
-            }
-
             generated_ids.push(next_token);
 
             if !callback(next_token) {
                 stop_reason = StopReason::Cancelled;
+                break;
+            }
+
+            if cache.len() >= self.config.max_seq_len {
+                stop_reason = StopReason::ContextLength;
                 break;
             }
 
@@ -995,6 +995,77 @@ mod tests {
 
         let output = engine.generate_full("hello", &gen_cfg).unwrap();
         assert_eq!(output.stop_reason, StopReason::ContextLength);
+        // prompt=2 tokens, max_seq_len=5 → 3 forward passes possible,
+        // but 4 tokens sampled (1 from prefill + 3 from decode steps).
+        // The last token is sampled but can't be fed back — it should
+        // still be included in the output (this was the token drop bug).
+        assert_eq!(
+            output.token_ids.len(),
+            4,
+            "Context-length stop should preserve the final sampled token"
+        );
+    }
+
+    #[test]
+    fn test_generate_context_length_preserves_last_token() {
+        // Verify the simple generate() API also preserves the last token
+        // when hitting context length (same bug as generate_full).
+        let mut config = gen_config(4);
+        config.max_seq_len = 5; // prompt(2) + 3 decode forward passes
+        let weights = gen_weights(&config);
+        let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
+        let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
+        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+
+        let gen_cfg = GenerationConfig {
+            max_tokens: 100,
+            stop_tokens: vec![],
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                ..Default::default()
+            },
+        };
+
+        // generate() returns decoded text; verify it's non-empty
+        let text = engine.generate("hello", &gen_cfg).unwrap();
+        assert!(!text.is_empty(), "Should produce output at context limit");
+    }
+
+    #[test]
+    fn test_generate_stream_context_length_fires_callback() {
+        // Verify the streaming API calls the callback for the final token
+        // even when that token triggers the context-length stop.
+        let mut config = gen_config(4);
+        config.max_seq_len = 5;
+        let weights = gen_weights(&config);
+        let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
+        let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
+        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+
+        let gen_cfg = GenerationConfig {
+            max_tokens: 100,
+            stop_tokens: vec![],
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                ..Default::default()
+            },
+        };
+
+        let mut streamed_tokens = Vec::new();
+        let output = engine
+            .generate_stream_full("hello", &gen_cfg, |tok| {
+                streamed_tokens.push(tok);
+                true
+            })
+            .unwrap();
+
+        assert_eq!(output.stop_reason, StopReason::ContextLength);
+        assert_eq!(output.token_ids.len(), 4);
+        // Every token in token_ids should have been streamed via callback
+        assert_eq!(
+            output.token_ids, streamed_tokens,
+            "Streamed tokens should match token_ids exactly"
+        );
     }
 
     #[test]
