@@ -70,27 +70,63 @@ const TOKEN_TYPE_CONTROL: u32 = 3;
 /// GGUF token type for USER_DEFINED tokens.
 const TOKEN_TYPE_USER_DEFINED: u32 = 4;
 
-/// Return the pre-tokenizer regex pattern for a given `tokenizer.ggml.pre` value.
+/// Return the pre-tokenizer regex patterns for a given `tokenizer.ggml.pre` value.
 ///
 /// These patterns match llama.cpp's `llama-vocab.cpp` pre-tokenizer definitions.
+/// When multiple patterns are returned, they are applied **sequentially**: each regex
+/// splits the segments produced by the previous one (matching llama.cpp's
+/// `unicode_regex_split` behavior). Unmatched text between regex matches is preserved
+/// as separate segments.
+///
 /// Returns `None` for unknown or SentencePiece-only types that don't use regex.
-fn pretokenizer_regex_for(pre_type: &str) -> Option<&'static str> {
+fn pretokenizer_regex_for(pre_type: &str) -> Option<Vec<&'static str>> {
     match pre_type {
-        "default" | "gpt-2" => Some(
-            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
-        ),
-        "llama3" | "llama-bpe" => Some(
-            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-        ),
-        "deepseek-llm" | "deepseek-coder" => Some(
-            r"[\p{L}]+|[\p{N}]+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
-        ),
-        "qwen2" => Some(
-            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-        ),
-        "command-r" => Some(
-            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-        ),
+        "gpt-2" | "mpt" | "olmo" | "jais" => Some(vec![
+            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)",
+        ]),
+        "llama3" | "llama-bpe" => Some(vec![
+            r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        ]),
+        "qwen2" => Some(vec![
+            // Same as llama3 but \p{N} instead of \p{N}{1,3} — single digits only.
+            r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        ]),
+        "command-r" | "starcoder" | "refact" | "smollm" | "codeshell" | "exaone" => Some(vec![
+            // Two patterns applied sequentially: first split on individual digits,
+            // then apply GPT-2 pattern to remaining segments.
+            r"\p{N}",
+            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)",
+        ]),
+        "falcon" => Some(vec![
+            r"[\p{P}$+<=>^~|]+",
+            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)",
+            r"[0-9][0-9][0-9]",
+        ]),
+        "deepseek-llm" => Some(vec![
+            // Approximation: uses \p{L} instead of llama.cpp's explicit Unicode
+            // letter ranges. This may group CJK characters with adjacent Latin text
+            // differently than llama.cpp (which excludes CJK from the letter pattern).
+            r"[\r\n]",
+            r"\s?\p{L}+",
+            r"\s?[\p{P}\p{S}]+",
+            r"\s+$",
+            r"[\u{4e00}-\u{9fff}\u{0800}-\u{4dff}\u{ac00}-\u{d7ff}]+",
+            r"\p{N}+",
+        ]),
+        "deepseek-coder" => Some(vec![
+            r"[\r\n]",
+            r"\s?\p{L}+",
+            r"\s?\p{P}+",
+            r"[\u{4e00}-\u{9fff}\u{0800}-\u{4dff}\u{ac00}-\u{d7ff}]+",
+            r"\p{N}",
+        ]),
+        "default" => Some(vec![
+            // The llama.cpp default for unknown BPE pre-types: 4 sequential patterns.
+            r"[\p{P}$+<=>^~|]+",
+            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)",
+            r"\p{N}+",
+            r"[0-9][0-9][0-9]",
+        ]),
         _ => None,
     }
 }
@@ -122,11 +158,14 @@ pub struct BpeTokenizer {
     add_space_prefix: bool,
     /// Special tokens (CONTROL + USER_DEFINED) to match literally before BPE.
     /// Sorted by token text length (longest first) for greedy matching.
-    /// Each entry is (token_text, token_id).
-    special_tokens: Vec<(String, u32)>,
-    /// Compiled regex for pre-tokenization (regex-BPE models like LLaMA 3, GPT-2).
-    /// None for SentencePiece models or when no `tokenizer.ggml.pre` is set.
-    pre_regex: Option<Regex>,
+    /// Each entry is (token_text, token_id, is_control).
+    /// When `add_special_tokens=false`, CONTROL tokens are skipped during partitioning
+    /// (matching llama.cpp's `tokenizer_st_partition` behavior with `parse_special=false`).
+    special_tokens: Vec<(String, u32, bool)>,
+    /// Compiled regex patterns for pre-tokenization (regex-BPE models).
+    /// Applied sequentially: each regex further splits segments from the previous one.
+    /// Empty for SentencePiece models or when no `tokenizer.ggml.pre` is set.
+    pre_regexes: Vec<Regex>,
 }
 
 impl BpeTokenizer {
@@ -183,34 +222,42 @@ impl BpeTokenizer {
         // by length (longest first) so greedy matching picks the longest match.
         // This mirrors llama.cpp's `cache_special_tokens` which includes
         // CONTROL, USER_DEFINED, and UNKNOWN tokens.
-        let mut special_tokens: Vec<(String, u32)> = Vec::new();
+        // The `is_control` flag (3rd element) tracks whether each token is
+        // CONTROL type, used to gate partitioning on `add_special_tokens`.
+        let mut special_tokens: Vec<(String, u32, bool)> = Vec::new();
         for (i, tok) in tokens.iter().enumerate() {
             let tt = token_types.get(i).copied().unwrap_or(0);
             if (tt == TOKEN_TYPE_CONTROL || tt == TOKEN_TYPE_USER_DEFINED) && !tok.is_empty() {
-                special_tokens.push((tok.clone(), i as u32));
+                special_tokens.push((tok.clone(), i as u32, tt == TOKEN_TYPE_CONTROL));
             }
         }
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-        // Compile the pre-tokenizer regex if a `pre` type is specified.
-        let pre_regex = pre_type
+        // Compile the pre-tokenizer regex patterns if a `pre` type is specified.
+        let pre_regexes: Vec<Regex> = pre_type
             .and_then(pretokenizer_regex_for)
-            .and_then(|pattern| {
-                match Regex::new(pattern) {
-                    Ok(re) => Some(re),
-                    Err(e) => {
-                        tracing::warn!(pattern, error = %e, "Failed to compile pre-tokenizer regex, falling back to hand-written splitter");
-                        None
-                    }
-                }
-            });
+            .map(|patterns| {
+                patterns
+                    .into_iter()
+                    .filter_map(|pattern| {
+                        match Regex::new(pattern) {
+                            Ok(re) => Some(re),
+                            Err(e) => {
+                                tracing::warn!(pattern, error = %e, "Failed to compile pre-tokenizer regex pattern, skipping");
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         debug!(
             vocab_size = tokens.len(),
             merge_count = merge_ranks.len(),
             special_token_count = special_tokens.len(),
             use_scores,
-            has_pre_regex = pre_regex.is_some(),
+            pre_regex_count = pre_regexes.len(),
             "BPE tokenizer initialized"
         );
 
@@ -227,7 +274,7 @@ impl BpeTokenizer {
             add_eos,
             add_space_prefix,
             special_tokens,
-            pre_regex,
+            pre_regexes,
         }
     }
 
@@ -468,9 +515,10 @@ impl BpeTokenizer {
     /// - Replace spaces with the SentencePiece underline character `\u{2581}`.
     /// - Do NOT split the text further (SentencePiece operates on the full string).
     ///
-    /// For regex-BPE models (pre_regex is set):
-    /// - Split text using the compiled regex pattern.
-    /// - Byte-encode each match through the GPT-2 table.
+    /// For regex-BPE models (pre_regexes is non-empty):
+    /// - Apply each regex pattern sequentially to progressively split the text.
+    /// - Unmatched text between regex matches is preserved as separate segments.
+    /// - Byte-encode each final segment through the GPT-2 table.
     ///
     /// For GPT-style models (fallback):
     /// - Split on whitespace boundaries, keeping whitespace attached to the
@@ -491,20 +539,20 @@ impl BpeTokenizer {
                 with_underlines
             };
             vec![processed]
-        } else if let Some(ref re) = self.pre_regex {
-            // Regex-BPE: split text using the compiled pattern, then byte-encode.
-            let mut pieces = Vec::new();
-            let mut search_start = 0;
-            while search_start < text.len() {
-                match re.find_from_pos(text, search_start) {
-                    Ok(Some(m)) => {
-                        pieces.push(Self::byte_encode_word(m.as_str()));
-                        search_start = m.end();
-                    }
-                    _ => break,
+        } else if !self.pre_regexes.is_empty() {
+            // Sequential regex splitting: each regex further splits segments from
+            // the previous one. Unmatched text between matches is preserved.
+            let mut segments = vec![text.to_string()];
+            for re in &self.pre_regexes {
+                let mut new_segments = Vec::new();
+                for seg in &segments {
+                    Self::regex_split_segment(re, seg, &mut new_segments);
+                }
+                if !new_segments.is_empty() {
+                    segments = new_segments;
                 }
             }
-            pieces
+            segments.iter().map(|s| Self::byte_encode_word(s)).collect()
         } else {
             // Fallback: hand-written GPT-2 pre-tokenizer, then byte-encode.
             gpt_pre_tokenize(text)
@@ -514,20 +562,59 @@ impl BpeTokenizer {
         }
     }
 
+    /// Split a text segment using a regex pattern, preserving unmatched text.
+    ///
+    /// Both matched parts and unmatched gaps between matches become separate
+    /// segments in the output. This matches llama.cpp's `unicode_regex_split_stl`.
+    fn regex_split_segment(re: &Regex, segment: &str, out: &mut Vec<String>) {
+        let mut pos = 0;
+        while pos < segment.len() {
+            match re.find_from_pos(segment, pos) {
+                Ok(Some(m)) => {
+                    // Zero-length match protection: advance by one byte.
+                    if m.start() == m.end() {
+                        pos += 1;
+                        continue;
+                    }
+                    // Unmatched gap before this match.
+                    if m.start() > pos {
+                        out.push(segment[pos..m.start()].to_string());
+                    }
+                    // The match itself.
+                    out.push(m.as_str().to_string());
+                    pos = m.end();
+                }
+                _ => break,
+            }
+        }
+        // Remaining unmatched text after the last match.
+        if pos < segment.len() {
+            out.push(segment[pos..].to_string());
+        }
+    }
+
     /// Partition the raw input text by matching special tokens.
     ///
-    /// Scans for special token strings (CONTROL + USER_DEFINED, longest first)
-    /// and splits the text into alternating RawText/Token fragments. This mimics
-    /// llama.cpp's `tokenizer_st_partition` which handles special tokens before
-    /// the BPE algorithm runs.
-    fn partition_special_tokens(&self, text: &str) -> Vec<Fragment> {
+    /// Scans for special token strings (longest first) and splits the text into
+    /// alternating RawText/Token fragments. This mimics llama.cpp's
+    /// `tokenizer_st_partition`.
+    ///
+    /// When `include_control` is false, CONTROL tokens are skipped (only
+    /// USER_DEFINED tokens are matched). This matches llama.cpp's behavior
+    /// when `parse_special=false`.
+    fn partition_special_tokens(&self, text: &str, include_control: bool) -> Vec<Fragment> {
         if text.is_empty() {
             return Vec::new();
         }
 
         let mut fragments = vec![Fragment::RawText(text.to_string())];
 
-        for (token_text, token_id) in &self.special_tokens {
+        for (token_text, token_id, is_control) in &self.special_tokens {
+            // Skip CONTROL tokens when include_control is false.
+            // USER_DEFINED tokens are always partitioned (matches llama.cpp).
+            if *is_control && !include_control {
+                continue;
+            }
             let mut new_fragments = Vec::new();
 
             for fragment in fragments {
@@ -570,12 +657,13 @@ impl BpeTokenizer {
 
     /// Process a raw text fragment for SentencePiece encoding.
     ///
-    /// Applies space→▁ conversion and optionally prepends the ▁ prefix.
+    /// Applies NFC normalization, space→▁ conversion, and optionally prepends ▁.
     fn spm_process_fragment(&self, text: &str, is_first: bool) -> String {
         if text.is_empty() {
             return String::new();
         }
-        let with_underlines = text.replace(' ', &SPIECE_UNDERLINE.to_string());
+        let normalized: String = text.nfc().collect();
+        let with_underlines = normalized.replace(' ', &SPIECE_UNDERLINE.to_string());
         if self.add_space_prefix && is_first {
             format!("{}{}", SPIECE_UNDERLINE, with_underlines)
         } else {
@@ -584,9 +672,9 @@ impl BpeTokenizer {
     }
 }
 
-/// Fragment produced by USER_DEFINED token partitioning.
+/// Fragment produced by special token partitioning.
 enum Fragment {
-    /// A resolved token ID (from a USER_DEFINED token match).
+    /// A resolved token ID (from a CONTROL or USER_DEFINED token match).
     Token(u32),
     /// Raw text that still needs BPE encoding.
     RawText(String),
@@ -604,9 +692,10 @@ impl Tokenizer for BpeTokenizer {
         }
 
         if !self.special_tokens.is_empty() {
-            // Partition text by special tokens (CONTROL + USER_DEFINED),
-            // then process each fragment according to the tokenizer type.
-            let fragments = self.partition_special_tokens(text);
+            // Partition text by special tokens, then process each fragment.
+            // CONTROL tokens are only partitioned when add_special_tokens=true,
+            // while USER_DEFINED tokens are always partitioned (matches llama.cpp).
+            let fragments = self.partition_special_tokens(text, add_special_tokens);
             let mut is_first_raw = true;
             for fragment in &fragments {
                 match fragment {
@@ -616,7 +705,7 @@ impl Tokenizer for BpeTokenizer {
                     }
                     Fragment::RawText(raw) => {
                         if self.use_scores {
-                            // SentencePiece: apply space→▁ conversion.
+                            // SentencePiece: apply NFC + space→▁ conversion.
                             let processed = self.spm_process_fragment(raw, is_first_raw);
                             if !processed.is_empty() {
                                 let ids = self.encode_word(&processed);
@@ -636,20 +725,10 @@ impl Tokenizer for BpeTokenizer {
             }
         } else {
             // No special tokens to partition — standard path.
-            if self.use_scores {
-                // SentencePiece without special tokens.
-                let pieces = self.pre_tokenize(text);
-                for piece in &pieces {
-                    let ids = self.encode_word(piece);
-                    output.extend_from_slice(&ids);
-                }
-            } else {
-                // Rank-based BPE without special tokens.
-                let pieces = self.pre_tokenize(text);
-                for piece in &pieces {
-                    let ids = self.encode_word(piece);
-                    output.extend_from_slice(&ids);
-                }
+            let pieces = self.pre_tokenize(text);
+            for piece in &pieces {
+                let ids = self.encode_word(piece);
+                output.extend_from_slice(&ids);
             }
         }
 
@@ -1934,6 +2013,20 @@ mod tests {
         assert!(pretokenizer_regex_for("deepseek-coder").is_some());
         assert!(pretokenizer_regex_for("qwen2").is_some());
         assert!(pretokenizer_regex_for("command-r").is_some());
+        assert!(pretokenizer_regex_for("falcon").is_some());
+    }
+
+    #[test]
+    fn test_pretokenizer_regex_for_pattern_counts() {
+        // Verify the number of patterns matches llama.cpp.
+        assert_eq!(pretokenizer_regex_for("gpt-2").unwrap().len(), 1);
+        assert_eq!(pretokenizer_regex_for("llama3").unwrap().len(), 1);
+        assert_eq!(pretokenizer_regex_for("qwen2").unwrap().len(), 1);
+        assert_eq!(pretokenizer_regex_for("command-r").unwrap().len(), 2);
+        assert_eq!(pretokenizer_regex_for("falcon").unwrap().len(), 3);
+        assert_eq!(pretokenizer_regex_for("deepseek-llm").unwrap().len(), 6);
+        assert_eq!(pretokenizer_regex_for("deepseek-coder").unwrap().len(), 5);
+        assert_eq!(pretokenizer_regex_for("default").unwrap().len(), 4);
     }
 
     #[test]
@@ -1945,18 +2038,21 @@ mod tests {
 
     #[test]
     fn test_pretokenizer_regex_compiles() {
-        // Verify all patterns compile without error.
+        // Verify all patterns for all types compile without error.
         for pre_type in &["default", "gpt-2", "llama3", "llama-bpe", "deepseek-llm",
-                          "deepseek-coder", "qwen2", "command-r"] {
-            let pattern = pretokenizer_regex_for(pre_type).unwrap();
-            let re = Regex::new(pattern);
-            assert!(re.is_ok(), "Failed to compile pattern for {}: {:?}", pre_type, re.err());
+                          "deepseek-coder", "qwen2", "command-r", "falcon"] {
+            let patterns = pretokenizer_regex_for(pre_type).unwrap();
+            for (i, pattern) in patterns.iter().enumerate() {
+                let re = Regex::new(pattern);
+                assert!(re.is_ok(), "Failed to compile pattern #{} for {}: {:?}", i, pre_type, re.err());
+            }
         }
     }
 
     #[test]
     fn test_regex_gpt2_splits_hello_world() {
-        let re = Regex::new(pretokenizer_regex_for("gpt-2").unwrap()).unwrap();
+        let patterns = pretokenizer_regex_for("gpt-2").unwrap();
+        let re = Regex::new(patterns[0]).unwrap();
         let matches: Vec<&str> = collect_regex_matches(&re, "hello world");
         // GPT-2 regex: "hello" (letters), " world" (space + letters)
         assert_eq!(matches, vec!["hello", " world"]);
@@ -1964,31 +2060,33 @@ mod tests {
 
     #[test]
     fn test_regex_gpt2_splits_contractions() {
-        let re = Regex::new(pretokenizer_regex_for("gpt-2").unwrap()).unwrap();
+        let patterns = pretokenizer_regex_for("gpt-2").unwrap();
+        let re = Regex::new(patterns[0]).unwrap();
         let matches: Vec<&str> = collect_regex_matches(&re, "I'm don't");
-        // Contractions should be split: "'m", "'t"
-        assert!(matches.contains(&"'m"));
-        assert!(matches.contains(&"'t"));
+        // Exact expected split
+        assert_eq!(matches, vec!["I", "'m", " don", "'t"]);
     }
 
     #[test]
     fn test_regex_gpt2_splits_digits() {
-        let re = Regex::new(pretokenizer_regex_for("gpt-2").unwrap()).unwrap();
+        let patterns = pretokenizer_regex_for("gpt-2").unwrap();
+        let re = Regex::new(patterns[0]).unwrap();
         let matches: Vec<&str> = collect_regex_matches(&re, "abc123");
-        assert!(matches.contains(&"abc"));
-        assert!(matches.contains(&"123"));
+        assert_eq!(matches, vec!["abc", "123"]);
     }
 
     #[test]
     fn test_regex_llama3_splits_hello_world() {
-        let re = Regex::new(pretokenizer_regex_for("llama3").unwrap()).unwrap();
+        let patterns = pretokenizer_regex_for("llama3").unwrap();
+        let re = Regex::new(patterns[0]).unwrap();
         let matches: Vec<&str> = collect_regex_matches(&re, "hello world");
         assert_eq!(matches, vec!["hello", " world"]);
     }
 
     #[test]
     fn test_regex_llama3_digits_max_three() {
-        let re = Regex::new(pretokenizer_regex_for("llama3").unwrap()).unwrap();
+        let patterns = pretokenizer_regex_for("llama3").unwrap();
+        let re = Regex::new(patterns[0]).unwrap();
         let matches: Vec<&str> = collect_regex_matches(&re, "12345");
         // LLaMA 3 regex limits digit runs to {1,3}
         assert_eq!(matches, vec!["123", "45"]);
@@ -1996,20 +2094,55 @@ mod tests {
 
     #[test]
     fn test_regex_llama3_contractions_case_insensitive() {
-        let re = Regex::new(pretokenizer_regex_for("llama3").unwrap()).unwrap();
+        let patterns = pretokenizer_regex_for("llama3").unwrap();
+        let re = Regex::new(patterns[0]).unwrap();
         let matches: Vec<&str> = collect_regex_matches(&re, "I'M DON'T");
-        assert!(matches.contains(&"'M"));
-        assert!(matches.contains(&"'T"));
+        assert_eq!(matches, vec!["I", "'M", " DON", "'T"]);
+    }
+
+    #[test]
+    fn test_regex_llama3_newlines() {
+        // LLaMA 3 regex should split newlines via \s*[\r\n]+ pattern.
+        let patterns = pretokenizer_regex_for("llama3").unwrap();
+        let re = Regex::new(patterns[0]).unwrap();
+        let matches: Vec<&str> = collect_regex_matches(&re, "hello\nworld\r\nfoo");
+        assert!(matches.contains(&"\n"));
+        assert!(matches.contains(&"hello"));
+        assert!(matches.contains(&"world"));
+        assert!(matches.contains(&"foo"));
+    }
+
+    #[test]
+    fn test_regex_qwen2_single_digits() {
+        // Qwen2 uses \p{N} (single digit) instead of \p{N}{1,3}.
+        let patterns = pretokenizer_regex_for("qwen2").unwrap();
+        let re = Regex::new(patterns[0]).unwrap();
+        let matches: Vec<&str> = collect_regex_matches(&re, "12345");
+        // Each digit should be a separate match.
+        assert_eq!(matches, vec!["1", "2", "3", "4", "5"]);
     }
 
     #[test]
     fn test_regex_trailing_whitespace() {
         // The negative lookahead `\s+(?!\S)` should match trailing whitespace.
-        let re = Regex::new(pretokenizer_regex_for("gpt-2").unwrap()).unwrap();
+        let patterns = pretokenizer_regex_for("gpt-2").unwrap();
+        let re = Regex::new(patterns[0]).unwrap();
         let matches: Vec<&str> = collect_regex_matches(&re, "hello   ");
         assert_eq!(matches[0], "hello");
-        // Remaining whitespace matches via `\s+(?!\S)` or `\s+`
-        assert!(matches.len() >= 2);
+        // Remaining whitespace matches via `\s+(?!\S)`.
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[1], "   ");
+    }
+
+    #[test]
+    fn test_sequential_regex_command_r() {
+        // Command-R uses two patterns: \p{N} then GPT-2 pattern.
+        // This means digits are first split individually, then GPT-2 pattern
+        // further splits the remaining segments.
+        let tok = make_gpt2_tokenizer_with_regex("command-r");
+        // Should still work for basic text.
+        let ids = tok.encode("hello world", false);
+        assert_eq!(ids, vec![13, 22]);
     }
 
     /// Helper to collect all regex matches as string slices.
@@ -2019,6 +2152,10 @@ mod tests {
         while start < text.len() {
             match re.find_from_pos(text, start) {
                 Ok(Some(m)) => {
+                    if m.start() == m.end() {
+                        start += 1;
+                        continue;
+                    }
                     matches.push(m.as_str());
                     start = m.end();
                 }
@@ -2135,10 +2272,15 @@ mod tests {
 
         // CONTROL + USER_DEFINED tokens should all be in special_tokens.
         assert_eq!(tok.special_tokens.len(), 3); // <s>, </s>, <special>
+        // Verify is_control flags.
+        let control_count = tok.special_tokens.iter().filter(|(_, _, c)| *c).count();
+        let user_defined_count = tok.special_tokens.iter().filter(|(_, _, c)| !*c).count();
+        assert_eq!(control_count, 2);     // <s>, </s>
+        assert_eq!(user_defined_count, 1); // <special>
     }
 
     #[test]
-    fn test_control_token_partitioning() {
+    fn test_control_token_partitioning_with_include() {
         let tokens = vec![
             "<pad>".to_string(),     // 0
             "<s>".to_string(),       // 1 (CONTROL)
@@ -2158,8 +2300,8 @@ mod tests {
             None,
         );
 
-        // Encoding text that contains a CONTROL token literal should split it out.
-        let fragments = tok.partition_special_tokens("hello<s>world");
+        // With include_control=true, CONTROL tokens are partitioned.
+        let fragments = tok.partition_special_tokens("hello<s>world", true);
         let mut token_count = 0;
         let mut raw_count = 0;
         for f in &fragments {
@@ -2172,12 +2314,52 @@ mod tests {
         assert_eq!(raw_count, 2);   // "hello", "world"
     }
 
+    #[test]
+    fn test_control_token_skipped_when_not_included() {
+        // When include_control=false, CONTROL tokens should NOT be partitioned.
+        let tokens = vec![
+            "<pad>".to_string(),     // 0
+            "<s>".to_string(),       // 1 (CONTROL)
+            "</s>".to_string(),      // 2 (CONTROL)
+            "h".to_string(),         // 3
+            "e".to_string(),         // 4
+            "l".to_string(),         // 5
+            "o".to_string(),         // 6
+            "<special>".to_string(), // 7 (USER_DEFINED)
+        ];
+        let scores = vec![0.0; tokens.len()];
+        let token_types = vec![0, 3, 3, 0, 0, 0, 0, 4];
+
+        let tok = BpeTokenizer::new(
+            tokens, scores, token_types, vec![],
+            Some(1), Some(2), Some(0),
+            false, false, false,
+            None,
+        );
+
+        // With include_control=false, <s> should NOT be partitioned
+        // but <special> (USER_DEFINED) should still be partitioned.
+        let fragments = tok.partition_special_tokens("hello<s><special>world", false);
+        let mut token_ids = Vec::new();
+        let mut raw_texts = Vec::new();
+        for f in &fragments {
+            match f {
+                Fragment::Token(id) => token_ids.push(*id),
+                Fragment::RawText(raw) => raw_texts.push(raw.clone()),
+            }
+        }
+        // <special> (USER_DEFINED) is partitioned.
+        assert_eq!(token_ids, vec![7]);
+        // <s> stays in the raw text since it's CONTROL and include_control=false.
+        assert_eq!(raw_texts, vec!["hello<s>".to_string(), "world".to_string()]);
+    }
+
     // -----------------------------------------------------------------------
     // NFC normalization tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_spm_nfc_normalization() {
+    fn test_spm_nfc_normalization_pre_tokenize() {
         // NFC normalization: é as e + combining accent -> é (precomposed).
         // The decomposed form is "e\u{0301}" (2 codepoints), NFC is "é" (1 codepoint).
         let tok = make_spm_tokenizer(false, false);
@@ -2186,6 +2368,34 @@ mod tests {
         let pieces_composed = tok.pre_tokenize("é");
         // After NFC, both should produce the same pre-tokenized output.
         assert_eq!(pieces_decomposed, pieces_composed);
+    }
+
+    #[test]
+    fn test_spm_nfc_normalization_encode_with_control_tokens() {
+        // Test NFC normalization through the full encode path with CONTROL tokens.
+        // This exercises spm_process_fragment (the path taken when special_tokens is non-empty).
+        let tokens = vec![
+            "<pad>".to_string(),     // 0
+            "<s>".to_string(),       // 1 (CONTROL)
+            "</s>".to_string(),      // 2 (CONTROL)
+            "\u{2581}\u{00e9}".to_string(), // 3: "▁é" (precomposed)
+        ];
+        let scores = vec![0.0, 0.0, 0.0, -1.0];
+        let token_types = vec![0, 3, 3, 0]; // CONTROL tokens at 1 and 2
+
+        let tok = BpeTokenizer::new(
+            tokens, scores, token_types, vec![],
+            Some(1), Some(2), Some(0),
+            false, false, true, // add_space_prefix
+            None,
+        );
+
+        // Encode with decomposed input: "e\u{0301}" should NFC-normalize to "é".
+        // With add_space_prefix, the fragment "e\u{0301}" becomes "▁é" after NFC + underline.
+        // This tests that NFC happens inside spm_process_fragment (the CONTROL token path).
+        let decomposed_ids = tok.encode("e\u{0301}", true);
+        let composed_ids = tok.encode("\u{00e9}", true);
+        assert_eq!(decomposed_ids, composed_ids);
     }
 
     #[test]
@@ -2198,5 +2408,62 @@ mod tests {
             pieces[0],
             format!("{}hello{}world", SPIECE_UNDERLINE, SPIECE_UNDERLINE)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end regex BPE + CONTROL token test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_regex_bpe_with_control_token_partitioning() {
+        // End-to-end test: regex-BPE tokenizer with CONTROL tokens.
+        let tokens = vec![
+            "<pad>".to_string(),     // 0 (NORMAL)
+            "<bos>".to_string(),     // 1 (CONTROL)
+            "<eos>".to_string(),     // 2 (CONTROL)
+            "h".to_string(),         // 3
+            "e".to_string(),         // 4
+            "l".to_string(),         // 5
+            "o".to_string(),         // 6
+            "Ġ".to_string(),         // 7 (byte-encoded space)
+            "he".to_string(),        // 8
+            "ll".to_string(),        // 9
+            "lo".to_string(),        // 10
+            "hel".to_string(),       // 11
+            "hell".to_string(),      // 12
+            "hello".to_string(),     // 13
+            "w".to_string(),         // 14
+            "r".to_string(),         // 15
+            "d".to_string(),         // 16
+            "Ġworld".to_string(),    // 17
+        ];
+        let scores = vec![0.0; tokens.len()];
+        let token_types = vec![0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let merges = vec![
+            "h e".to_string(),
+            "l l".to_string(),
+            "l o".to_string(),
+            "he l".to_string(),
+            "hel l".to_string(),
+            "hell o".to_string(),
+        ];
+
+        let tok = BpeTokenizer::new(
+            tokens, scores, token_types, merges,
+            Some(1), Some(2), Some(0),
+            false, false, true,
+            Some("gpt-2"),
+        );
+
+        // With add_special_tokens=true: CONTROL tokens partitioned.
+        let ids_with = tok.encode("hello<bos>world", true);
+        // "hello" -> 13, <bos> -> 1 (CONTROL match), "world" -> individual chars
+        assert!(ids_with.contains(&1)); // <bos> was partitioned
+
+        // With add_special_tokens=false: CONTROL tokens NOT partitioned.
+        // "<bos>" stays in the raw text and is encoded as part of BPE.
+        let ids_without = tok.encode("hello<bos>world", false);
+        assert!(!ids_without.contains(&1)); // <bos> was NOT partitioned
     }
 }
