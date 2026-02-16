@@ -64,6 +64,10 @@ pub struct ModelWeights {
     /// Position embedding table (BERT only): [max_seq_len, hidden_size]
     pub position_embedding: Option<DeviceTensor>,
 
+    /// Token type embedding table (BERT only): [num_types, hidden_size]
+    /// Row 0 is added to all embeddings (hardcoded token_type=0, "Sentence A").
+    pub token_type_embedding: Option<DeviceTensor>,
+
     /// Embedding normalization (BERT only)
     pub embedding_norm_w: Option<DeviceTensor>,
     pub embedding_norm_b: Option<DeviceTensor>,
@@ -212,6 +216,9 @@ impl ModelWeights {
         } else {
             None
         };
+
+        // Token type embeddings (BERT only): [num_types, hidden_size]
+        let token_type_embedding = load_tensor_optional(gguf, "token_types.weight", backend)?;
 
         // Embedding normalization (BERT only)
         let embedding_norm_w = if config.has_bias {
@@ -463,6 +470,7 @@ impl ModelWeights {
         Ok(ModelWeights {
             token_embedding,
             position_embedding,
+            token_type_embedding,
             embedding_norm_w,
             embedding_norm_b,
             layers,
@@ -627,6 +635,7 @@ mod tests {
             position_type: PositionType::RoPE,
             rope_freq_base: 10000.0,
             rope_dim: hidden_size / 4,
+            rope_neox: false,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -657,6 +666,7 @@ mod tests {
             position_type: PositionType::Learned,
             rope_freq_base: 0.0,
             rope_dim: 0,
+            rope_neox: false,
             causal: false,
             attn_logit_softcap: 0.0,
             attn_scale: None,

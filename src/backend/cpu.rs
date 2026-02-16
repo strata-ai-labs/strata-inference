@@ -586,17 +586,17 @@ impl ComputeBackend for CpuBackend {
     }
 
     fn gelu(&self, t: &DeviceTensor) -> DeviceTensor {
-        // Approximate GELU: 0.5 * x * (1.0 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        // Exact GELU: 0.5 * x * (1.0 + erf(x / sqrt(2)))
+        // Matches llama.cpp's implementation using error function.
         let data = t.as_tensor().as_f32();
         trace!(n_elements = data.len(), "CPU gelu");
 
-        let sqrt_2_over_pi: f32 = (2.0f32 / std::f32::consts::PI).sqrt();
+        let sqrt_2_inv: f32 = std::f32::consts::FRAC_1_SQRT_2; // 1/sqrt(2)
 
         let result: Vec<f32> = data
             .iter()
             .map(|&x| {
-                let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
-                0.5 * x * (1.0 + inner.tanh())
+                0.5 * x * (1.0 + libm::erff(x * sqrt_2_inv))
             })
             .collect();
 

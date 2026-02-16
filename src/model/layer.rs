@@ -147,10 +147,17 @@ fn multi_head_attention(
 
     // Step a: Apply RoPE if configured (RoPE applies to Q and K only, not V)
     let (q_proc, k_proc) = if config.position_type == PositionType::RoPE {
-        let (q_rot, k_rot) = backend.rope(
-            &q, &k, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
-        );
-        (q_rot, k_rot)
+        if config.rope_neox {
+            let (q_rot, k_rot) = backend.rope_neox(
+                &q, &k, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
+            );
+            (q_rot, k_rot)
+        } else {
+            let (q_rot, k_rot) = backend.rope(
+                &q, &k, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
+            );
+            (q_rot, k_rot)
+        }
     } else {
         (q, k)
     };
@@ -618,6 +625,14 @@ pub fn model_forward(
         }
     }
 
+    // 4b. Add token type embeddings (BERT only — hardcoded type 0 = "Sentence A")
+    if let Some(ref type_emb) = weights.token_type_embedding {
+        // Look up row 0 for every token (all same type)
+        let type_ids = vec![0u32; seq_len];
+        let type_embeddings = backend.embedding_lookup(type_emb, &type_ids);
+        hidden = backend.add(&hidden, &type_embeddings);
+    }
+
     // 5. Embedding normalization (BERT only)
     if let Some(ref norm_w) = weights.embedding_norm_w {
         hidden = normalize(
@@ -681,9 +696,15 @@ fn multi_head_attention_cached(
 
     // Step a: Apply RoPE to Q and K_new with pos_offset
     let (q_proc, k_proc) = if config.position_type == PositionType::RoPE {
-        backend.rope(
-            &q, &k_new, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
-        )
+        if config.rope_neox {
+            backend.rope_neox(
+                &q, &k_new, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
+            )
+        } else {
+            backend.rope(
+                &q, &k_new, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
+            )
+        }
     } else {
         (q, k_new)
     };
@@ -953,6 +974,7 @@ mod tests {
             position_type: PositionType::RoPE,
             rope_freq_base: 10000.0,
             rope_dim: head_dim,
+            rope_neox: false,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -983,6 +1005,7 @@ mod tests {
             position_type: PositionType::Learned,
             rope_freq_base: 10000.0,
             rope_dim: head_dim,
+            rope_neox: false,
             causal: false,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -1510,6 +1533,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
@@ -1545,6 +1569,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: Some(dt(Tensor::new(vec![max_seq_len, hidden_size], pos_emb_data))),
+            token_type_embedding: None,
             embedding_norm_w: Some(ones_weight(hidden_size)),
             embedding_norm_b: Some(zeros_bias(hidden_size)),
             layers: vec![bert_layer_weights(hidden_size, ffn_hidden)],
@@ -1585,6 +1610,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
@@ -1621,6 +1647,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![
@@ -1657,6 +1684,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
@@ -1835,6 +1863,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
@@ -1875,6 +1904,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
@@ -1908,6 +1938,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
@@ -1948,6 +1979,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
@@ -1994,6 +2026,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![
@@ -2069,6 +2102,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![layer],
@@ -2209,6 +2243,7 @@ mod tests {
             position_type: PositionType::RoPE,
             rope_freq_base: 10000.0,
             rope_dim: head_dim,
+            rope_neox: false,
             causal: false,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -2429,6 +2464,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: Some(dt(Tensor::new(vec![max_seq_len, hidden_size], pos_emb_data))),
+            token_type_embedding: None,
             embedding_norm_w: Some(ones_weight(hidden_size)),
             embedding_norm_b: Some(zeros_bias(hidden_size)),
             layers: vec![bert_layer_weights(hidden_size, ffn_hidden)],
@@ -2467,6 +2503,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![layer],
@@ -2492,6 +2529,7 @@ mod tests {
         let weights2 = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data2)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![layer2],
@@ -2542,6 +2580,7 @@ mod tests {
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![layer],

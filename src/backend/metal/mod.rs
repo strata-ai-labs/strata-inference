@@ -676,7 +676,9 @@ impl ComputeBackend for MetalBackend {
                 trace!(shape = ?shape, "Metal download F16");
                 Tensor::from_f16(shape, data)
             }
-            TensorDtype::Q8_0 | TensorDtype::Q4_0 => {
+            TensorDtype::Q8_0 | TensorDtype::Q4_0
+            | TensorDtype::Q4_1 | TensorDtype::Q5_0 | TensorDtype::Q5_1
+            | TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => {
                 let n_elements: usize = shape.iter().product();
                 let block_size = dtype.block_size();
                 let block_byte_size = dtype.block_byte_size();

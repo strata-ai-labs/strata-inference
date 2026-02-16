@@ -77,6 +77,9 @@ pub struct ModelConfig {
     pub position_type: PositionType,
     pub rope_freq_base: f32,
     pub rope_dim: usize,
+    /// NeoX-style RoPE (pairs offset by n_rot/2) vs standard (consecutive pairs).
+    /// Gemma, Qwen, Falcon, etc. use NeoX; LLaMA uses standard.
+    pub rope_neox: bool,
 
     // Attention
     pub causal: bool,
@@ -197,7 +200,7 @@ impl ModelConfig {
         };
 
         // ---- Architecture-specific defaults ----
-        let (norm_type, activation, position_type, has_ffn_gate, has_bias, embedding_scale, default_causal, pre_norm) =
+        let (norm_type, activation, position_type, has_ffn_gate, has_bias, embedding_scale, default_causal, pre_norm, rope_neox) =
             match arch {
                 ModelArch::Gemma3 | ModelArch::Gemma2 => (
                     NormType::RMSNorm,
@@ -208,6 +211,7 @@ impl ModelConfig {
                     (hidden_size as f32).sqrt(), // embedding_scale = sqrt(hidden_size)
                     true,  // default causal (overridden by metadata if present)
                     true,  // pre_norm (norm-before)
+                    true,  // rope_neox (Gemma uses NeoX-style RoPE)
                 ),
                 ModelArch::LLaMA => (
                     NormType::RMSNorm,
@@ -218,6 +222,7 @@ impl ModelConfig {
                     1.0,   // embedding_scale
                     true,  // default causal
                     true,  // pre_norm
+                    false, // rope_neox (LLaMA uses standard/normal RoPE)
                 ),
                 ModelArch::GemmaEmbedding => (
                     NormType::RMSNorm,
@@ -228,6 +233,7 @@ impl ModelConfig {
                     (hidden_size as f32).sqrt(), // embedding_scale = sqrt(hidden_size)
                     false, // default causal (bidirectional)
                     true,  // pre_norm (norm-before)
+                    true,  // rope_neox (Gemma uses NeoX-style RoPE)
                 ),
                 ModelArch::Bert => (
                     NormType::LayerNorm,
@@ -238,6 +244,7 @@ impl ModelConfig {
                     1.0,   // embedding_scale
                     false, // default causal
                     false, // post_norm (norm-after)
+                    false, // rope_neox (BERT uses learned position, no RoPE)
                 ),
             };
 
@@ -284,6 +291,7 @@ impl ModelConfig {
             position_type,
             rope_freq_base,
             rope_dim,
+            rope_neox,
             causal,
             attn_logit_softcap,
             attn_scale,
