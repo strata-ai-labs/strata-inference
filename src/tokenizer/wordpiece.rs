@@ -5,10 +5,14 @@
 //!
 //! 1. Normalizes text: lowercase, NFD decomposition, strip accents.
 //! 2. Splits on whitespace and punctuation.
-//! 3. For each word, greedily finds the longest prefix match in the vocabulary.
-//! 4. Continues with the remainder using the `##` continuation prefix.
-//! 5. If no match is found, emits the UNK token.
-//! 6. Wraps the result with [CLS] and [SEP] special tokens.
+//! 3. For each word, prepends `▁` (U+2581) and greedily finds the longest
+//!    matching substring in the vocabulary from left to right.
+//! 4. If any position has no match, emits a single UNK for the whole word.
+//! 5. Wraps the result with [CLS] and [SEP] special tokens.
+//!
+//! Uses the GGUF/SentencePiece vocabulary convention where word-initial tokens
+//! are stored with a `▁` prefix (e.g. `▁hello`) and continuation tokens are
+//! bare (e.g. `ing`).
 //!
 //! Ported and adapted from `strata-core/crates/intelligence/src/embed/tokenizer.rs`.
 
@@ -19,8 +23,10 @@ use unicode_normalization::UnicodeNormalization;
 
 use super::Tokenizer;
 
-/// The continuation prefix for WordPiece subwords.
-const CONTINUATION_PREFIX: &str = "##";
+/// Phantom space character used as word-boundary prefix in GGUF/SentencePiece
+/// vocabularies. Word-initial tokens are stored as `▁word`, continuation tokens
+/// as bare strings.
+const SPIECE_UNDERLINE: char = '\u{2581}';
 
 /// Default maximum sequence length (including special tokens).
 const DEFAULT_MAX_SEQ_LEN: usize = 512;
@@ -171,55 +177,57 @@ impl WordPieceTokenizer {
 
     /// Apply WordPiece subword tokenization to a single word.
     ///
-    /// Greedily finds the longest prefix match in the vocabulary, then continues
-    /// with the remainder using the `##` continuation prefix. If no match is found
-    /// for any character, emits UNK.
+    /// Prepends the phantom space character U+2581 (`▁`) to the word, then
+    /// greedily finds the longest matching substring in the vocabulary from left
+    /// to right. The first match includes the `▁` prefix (word-initial token);
+    /// subsequent matches are bare substrings (continuation tokens).
+    ///
+    /// This matches the GGUF/SentencePiece vocabulary convention used by BERT
+    /// models converted via llama.cpp / HuggingFace, where word-initial tokens
+    /// are stored as `▁hello` and continuations as `ing`.
+    ///
+    /// If any position has no match at all, the entire word is discarded and a
+    /// single UNK token is emitted (matching llama.cpp behavior).
     fn wordpiece_tokenize(&self, word: &str, output: &mut Vec<u32>) {
         if word.is_empty() {
             return;
         }
 
-        // Try whole word first (common case for short words).
-        if let Some(&id) = self.vocab.get(word) {
-            output.push(id);
-            return;
-        }
+        // Prepend phantom space (U+2581) — the vocab stores word-initial tokens
+        // with this prefix (e.g. "▁hello"), and continuation tokens bare (e.g. "ing").
+        let word_with_space = format!("\u{2581}{}", word);
 
-        let chars: Vec<char> = word.chars().collect();
-        let mut start = 0;
-        let mut is_first = true;
+        let bytes = word_with_space.as_bytes();
+        let n = bytes.len();
+        let checkpoint = output.len();
 
-        while start < chars.len() {
-            let mut end = chars.len();
+        let mut i = 0;
+        while i < n {
+            // Find the longest substring match starting at position i.
             let mut found = false;
-
-            while start < end {
-                let substr: String = if is_first {
-                    chars[start..end].iter().collect()
-                } else {
-                    format!(
-                        "{}{}",
-                        CONTINUATION_PREFIX,
-                        chars[start..end].iter().collect::<String>()
-                    )
-                };
-
-                if let Some(&id) = self.vocab.get(&substr) {
+            let mut j = n;
+            while j > i {
+                // Only split on UTF-8 character boundaries.
+                if !word_with_space.is_char_boundary(j) {
+                    j -= 1;
+                    continue;
+                }
+                let substr = &word_with_space[i..j];
+                if let Some(&id) = self.vocab.get(substr) {
                     output.push(id);
                     found = true;
-                    start = end;
-                    is_first = false;
+                    i = j;
                     break;
                 }
-
-                end -= 1;
+                j -= 1;
             }
 
             if !found {
-                // No match for this character at all; emit UNK and move on.
+                // No match for this position — discard all tokens for this word
+                // and emit a single UNK.
+                output.truncate(checkpoint);
                 output.push(self.unk_id);
-                start += 1;
-                is_first = false;
+                return;
             }
         }
     }
@@ -266,21 +274,23 @@ impl Tokenizer for WordPieceTokenizer {
             if id == self.cls_id || id == self.sep_id || id == self.pad_id {
                 continue;
             }
-            if let Some(token) = self.id_to_token.get(id as usize) {
-                if let Some(suffix) = token.strip_prefix(CONTINUATION_PREFIX) {
-                    // Continuation token: append directly to the previous word
-                    // (no space).
-                    if let Some(last) = pieces.last_mut() {
-                        let s: &mut String = last;
-                        s.push_str(suffix);
-                    } else {
-                        pieces.push(suffix.to_string());
-                    }
-                } else {
-                    pieces.push(token.clone());
-                }
-            } else if id == self.unk_id {
+            if id == self.unk_id {
                 pieces.push("[UNK]".to_string());
+                continue;
+            }
+            if let Some(token) = self.id_to_token.get(id as usize) {
+                if let Some(word) = token.strip_prefix(SPIECE_UNDERLINE) {
+                    // Word-initial token: starts a new word.
+                    pieces.push(word.to_string());
+                } else {
+                    // Continuation token (bare, no ▁ prefix): append to the
+                    // previous word without a space.
+                    if let Some(last) = pieces.last_mut() {
+                        last.push_str(token);
+                    } else {
+                        pieces.push(token.clone());
+                    }
+                }
             }
         }
         pieces.join(" ")
@@ -624,40 +634,43 @@ mod tests {
 
     /// Build a minimal BERT-like vocabulary for testing.
     ///
+    /// Uses GGUF/SentencePiece convention: word-initial tokens have `▁` prefix,
+    /// continuation tokens are bare strings.
+    ///
     /// Token layout:
     ///   0: [PAD]
     ///   1-99: (filler)
     ///  100: [UNK]
     ///  101: [CLS]
     ///  102: [SEP]
-    ///  103: hello
-    ///  104: world
-    ///  105: ##ing
-    ///  106: test
-    ///  107: ,
-    ///  108: the
-    ///  109: ##s
-    ///  110: run
-    ///  111: ##ning
-    ///  112: a
-    ///  113: cafe  (will match "cafe" after accent stripping from "cafe")
+    ///  103: ▁hello
+    ///  104: ▁world
+    ///  105: ing       (continuation)
+    ///  106: ▁test
+    ///  107: ▁,
+    ///  108: ▁the
+    ///  109: s         (continuation)
+    ///  110: ▁run
+    ///  111: ning      (continuation)
+    ///  112: ▁a
+    ///  113: ▁cafe
     fn make_test_vocab() -> Vec<String> {
         let mut tokens: Vec<String> = (0..100).map(|_| "[PAD]".to_string()).collect();
         tokens[0] = "[PAD]".to_string();
-        tokens.push("[UNK]".to_string());   // 100
-        tokens.push("[CLS]".to_string());   // 101
-        tokens.push("[SEP]".to_string());   // 102
-        tokens.push("hello".to_string());   // 103
-        tokens.push("world".to_string());   // 104
-        tokens.push("##ing".to_string());   // 105
-        tokens.push("test".to_string());    // 106
-        tokens.push(",".to_string());       // 107
-        tokens.push("the".to_string());     // 108
-        tokens.push("##s".to_string());     // 109
-        tokens.push("run".to_string());     // 110
-        tokens.push("##ning".to_string());  // 111
-        tokens.push("a".to_string());       // 112
-        tokens.push("cafe".to_string());    // 113
+        tokens.push("[UNK]".to_string());        // 100
+        tokens.push("[CLS]".to_string());        // 101
+        tokens.push("[SEP]".to_string());        // 102
+        tokens.push("\u{2581}hello".to_string()); // 103
+        tokens.push("\u{2581}world".to_string()); // 104
+        tokens.push("ing".to_string());          // 105
+        tokens.push("\u{2581}test".to_string());  // 106
+        tokens.push("\u{2581},".to_string());     // 107
+        tokens.push("\u{2581}the".to_string());   // 108
+        tokens.push("s".to_string());            // 109
+        tokens.push("\u{2581}run".to_string());   // 110
+        tokens.push("ning".to_string());         // 111
+        tokens.push("\u{2581}a".to_string());     // 112
+        tokens.push("\u{2581}cafe".to_string());  // 113
         tokens
     }
 
@@ -689,8 +702,8 @@ mod tests {
     fn test_encode_subword() {
         let tok = make_tokenizer();
         let ids = tok.encode("testing", true);
-        // "testing" -> "test" + "##ing"
-        // [CLS]=101, test=106, ##ing=105, [SEP]=102
+        // "testing" -> ▁test + ing
+        // [CLS]=101, ▁test=106, ing=105, [SEP]=102
         assert_eq!(ids, vec![101, 106, 105, 102]);
     }
 
@@ -698,14 +711,9 @@ mod tests {
     fn test_encode_unknown_word() {
         let tok = make_tokenizer();
         let ids = tok.encode("xyz", true);
-        // "xyz" is not in vocab; each char is unknown.
-        // [CLS], UNK, UNK, UNK, [SEP]  (one UNK per char since no single-char matches)
-        assert_eq!(ids[0], 101); // CLS
-        assert_eq!(*ids.last().unwrap(), 102); // SEP
-        // Middle tokens are all UNK.
-        for &id in &ids[1..ids.len() - 1] {
-            assert_eq!(id, 100);
-        }
+        // "xyz" is not in vocab — single UNK emitted for the whole word.
+        // [CLS]=101, [UNK]=100, [SEP]=102
+        assert_eq!(ids, vec![101, 100, 102]);
     }
 
     #[test]
@@ -756,8 +764,8 @@ mod tests {
     fn test_punctuation_split() {
         let tok = make_tokenizer();
         let ids = tok.encode("hello,world", true);
-        // "hello" , "," , "world"
-        // [CLS]=101, hello=103, ","=107, world=104, [SEP]=102
+        // "hello" , "," , "world" → ▁hello, ▁,, ▁world
+        // [CLS]=101, ▁hello=103, ▁,=107, ▁world=104, [SEP]=102
         assert_eq!(ids, vec![101, 103, 107, 104, 102]);
     }
 
@@ -769,8 +777,8 @@ mod tests {
     fn test_multiple_subwords() {
         let tok = make_tokenizer();
         let ids = tok.encode("running", true);
-        // "running" -> "run" + "##ning"
-        // [CLS]=101, run=110, ##ning=111, [SEP]=102
+        // "running" -> ▁run + ning
+        // [CLS]=101, ▁run=110, ning=111, [SEP]=102
         assert_eq!(ids, vec![101, 110, 111, 102]);
     }
 
@@ -810,7 +818,7 @@ mod tests {
     fn test_decode_subwords() {
         let tok = make_tokenizer();
         let text = tok.decode(&[101, 106, 105, 102]);
-        // "test" + "##ing" → "testing"
+        // "▁test" + "ing" → "testing"
         assert_eq!(text, "testing");
     }
 
@@ -867,15 +875,15 @@ mod tests {
         lines[100] = "[UNK]";
         lines.push("[CLS]"); // 101
         lines.push("[SEP]"); // 102
-        lines.push("hello"); // 103
-        lines.push("world"); // 104
+        lines.push("\u{2581}hello"); // 103
+        lines.push("\u{2581}world"); // 104
         let vocab_text = lines.join("\n");
 
         let tok = WordPieceTokenizer::from_vocab_text(&vocab_text);
         let ids = tok.encode("hello world", true);
         assert_eq!(ids[0], 101); // CLS
-        assert_eq!(ids[1], 103); // hello
-        assert_eq!(ids[2], 104); // world
+        assert_eq!(ids[1], 103); // ▁hello
+        assert_eq!(ids[2], 104); // ▁world
         assert_eq!(*ids.last().unwrap(), 102); // SEP
     }
 
@@ -959,14 +967,14 @@ mod tests {
 
     #[test]
     fn test_max_sequence_length() {
-        // Build a vocab with single-letter tokens.
+        // Build a vocab with single-letter tokens (▁-prefixed).
         let mut tokens: Vec<String> = (0..101).map(|_| "[PAD]".to_string()).collect();
         tokens[0] = "[PAD]".to_string();
         tokens[100] = "[UNK]".to_string();
         tokens.push("[CLS]".to_string()); // 101
         tokens.push("[SEP]".to_string()); // 102
         for c in b'a'..=b'z' {
-            tokens.push(String::from(c as char));
+            tokens.push(format!("\u{2581}{}", c as char));
         }
         let tok = WordPieceTokenizer::new(tokens, 101, 102, 100, 0);
 
@@ -985,10 +993,10 @@ mod tests {
 
     #[test]
     fn test_encode_multiple_unknowns() {
-        // Each character of "xyz" has no vocab entry, producing 3 UNKs.
+        // "xyz" has no vocab entry — single UNK for the whole word.
         let tok = make_tokenizer();
         let ids = tok.encode("xyz", false);
-        assert_eq!(ids, vec![100, 100, 100]);
+        assert_eq!(ids, vec![100]);
     }
 
     #[test]
@@ -1001,26 +1009,20 @@ mod tests {
 
     #[test]
     fn test_decode_continuation_at_start() {
-        // If a continuation token appears first (no preceding word), it should
+        // If a continuation token (bare, no ▁) appears first, it should
         // still produce output rather than crash.
         let tok = make_tokenizer();
-        let text = tok.decode(&[105]); // "##ing" with no preceding word
+        let text = tok.decode(&[105]); // "ing" with no preceding word
         assert_eq!(text, "ing");
     }
 
     #[test]
     fn test_encode_mixed_known_unknown() {
         let tok = make_tokenizer();
-        // "hello xyz world" -> hello=103, x=UNK, y=UNK, z=UNK, world=104
+        // "hello xyz world" -> ▁hello=103, [UNK]=100, ▁world=104
         let ids = tok.encode("hello xyz world", true);
-        assert_eq!(ids[0], 101); // CLS
-        assert_eq!(ids[1], 103); // hello
-        // xyz -> 3 UNKs
-        assert_eq!(ids[2], 100);
-        assert_eq!(ids[3], 100);
-        assert_eq!(ids[4], 100);
-        assert_eq!(ids[5], 104); // world
-        assert_eq!(ids[6], 102); // SEP
+        // [CLS]=101, ▁hello=103, [UNK]=100, ▁world=104, [SEP]=102
+        assert_eq!(ids, vec![101, 103, 100, 104, 102]);
     }
 
     #[test]
@@ -1054,7 +1056,7 @@ mod tests {
 
     #[test]
     fn test_wordpiece_multiple_continuations() {
-        // "tests" -> "test" + "##s"
+        // "tests" -> ▁test + s
         let tok = make_tokenizer();
         let ids = tok.encode("tests", true);
         assert_eq!(ids, vec![101, 106, 109, 102]);
@@ -1125,7 +1127,7 @@ mod tests {
 
     #[test]
     fn test_encode_long_word_with_subwords() {
-        // "runnings" -> "run" + "##ning" + "##s"
+        // "runnings" -> ▁run + ning + s
         let tok = make_tokenizer();
         let ids = tok.encode("runnings", true);
         assert_eq!(ids, vec![101, 110, 111, 109, 102]);
@@ -1145,14 +1147,14 @@ mod tests {
 
     #[test]
     fn test_wordpiece_custom_max_seq_len() {
-        // Build a vocab with single-letter tokens.
+        // Build a vocab with single-letter tokens (▁-prefixed).
         let mut tokens: Vec<String> = (0..101).map(|_| "[PAD]".to_string()).collect();
         tokens[0] = "[PAD]".to_string();
         tokens[100] = "[UNK]".to_string();
         tokens.push("[CLS]".to_string()); // 101
         tokens.push("[SEP]".to_string()); // 102
         for c in b'a'..=b'z' {
-            tokens.push(String::from(c as char));
+            tokens.push(format!("\u{2581}{}", c as char));
         }
         let tok = WordPieceTokenizer::new(tokens, 101, 102, 100, 0)
             .with_max_seq_len(10);
