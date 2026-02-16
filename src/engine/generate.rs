@@ -21,6 +21,41 @@ use crate::tokenizer::{create_tokenizer_from_gguf, Tokenizer};
 
 use super::sampler::{SamplingConfig, XorShiftRng, sample_token};
 
+/// Why generation stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// Generated an end-of-sequence or explicit stop token.
+    StopToken,
+    /// Reached the `max_tokens` limit.
+    MaxTokens,
+    /// Filled the model's context window.
+    ContextLength,
+    /// Streaming callback returned `false`.
+    Cancelled,
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopReason::StopToken => write!(f, "eos"),
+            StopReason::MaxTokens => write!(f, "max_tokens"),
+            StopReason::ContextLength => write!(f, "context_length"),
+            StopReason::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+/// Output from text generation, including metadata.
+#[derive(Debug, Clone)]
+pub struct GenerationOutput {
+    /// Generated token IDs (not including the prompt).
+    pub token_ids: Vec<u32>,
+    /// Why generation stopped.
+    pub stop_reason: StopReason,
+    /// Number of prompt tokens (for timing calculations).
+    pub prompt_tokens: usize,
+}
+
 /// Configuration for text generation.
 #[derive(Debug, Clone)]
 pub struct GenerationConfig {
@@ -205,6 +240,18 @@ impl GenerationEngine {
         Ok(self.tokenizer.decode(&generated_ids))
     }
 
+    /// Generate text with full metadata (stop reason, prompt token count).
+    ///
+    /// Same as [`generate`] but returns a [`GenerationOutput`] with metadata
+    /// useful for timing and reporting.
+    pub fn generate_full(
+        &self,
+        prompt: &str,
+        gen_config: &GenerationConfig,
+    ) -> Result<GenerationOutput, InferenceError> {
+        self.generate_stream_full(prompt, gen_config, |_| true)
+    }
+
     /// Generate text with streaming: invokes callback for each generated token.
     ///
     /// The callback receives each token ID as it's generated. Return `false`
@@ -213,8 +260,19 @@ impl GenerationEngine {
         &self,
         prompt: &str,
         gen_config: &GenerationConfig,
-        mut callback: impl FnMut(u32) -> bool,
+        callback: impl FnMut(u32) -> bool,
     ) -> Result<Vec<u32>, InferenceError> {
+        let output = self.generate_stream_full(prompt, gen_config, callback)?;
+        Ok(output.token_ids)
+    }
+
+    /// Generate with streaming and full metadata (stop reason, prompt token count).
+    pub fn generate_stream_full(
+        &self,
+        prompt: &str,
+        gen_config: &GenerationConfig,
+        mut callback: impl FnMut(u32) -> bool,
+    ) -> Result<GenerationOutput, InferenceError> {
         if !self.config.causal {
             return Err(InferenceError::Generation(
                 "generation requires a causal model (not bidirectional)".to_string(),
@@ -222,6 +280,7 @@ impl GenerationEngine {
         }
 
         let prompt_ids = self.tokenizer.encode(prompt, true);
+        let prompt_tokens = prompt_ids.len();
 
         if prompt_ids.is_empty() {
             return Err(InferenceError::Generation(
@@ -260,19 +319,24 @@ impl GenerationEngine {
         let logits = self.project_to_logits(&hidden, prompt_ids.len() - 1);
         let mut next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
 
-        // Decode loop
+        // Decode loop — track why we stopped
+        let mut stop_reason = StopReason::MaxTokens; // default if loop exhausts
+
         for _ in 0..gen_config.max_tokens {
             if stop_tokens.contains(&next_token) {
+                stop_reason = StopReason::StopToken;
                 break;
             }
 
             if cache.len() >= self.config.max_seq_len {
+                stop_reason = StopReason::ContextLength;
                 break;
             }
 
             generated_ids.push(next_token);
 
             if !callback(next_token) {
+                stop_reason = StopReason::Cancelled;
                 break;
             }
 
@@ -288,7 +352,11 @@ impl GenerationEngine {
             next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
         }
 
-        Ok(generated_ids)
+        Ok(GenerationOutput {
+            token_ids: generated_ids,
+            stop_reason,
+            prompt_tokens,
+        })
     }
 
     /// Project a hidden state row to vocabulary logits.
@@ -323,6 +391,11 @@ impl GenerationEngine {
     /// The vocabulary size of the loaded model.
     pub fn vocab_size(&self) -> usize {
         self.config.vocab_size
+    }
+
+    /// Decode token IDs back to text.
+    pub fn decode(&self, ids: &[u32]) -> String {
+        self.tokenizer.decode(ids)
     }
 }
 
@@ -794,5 +867,154 @@ mod tests {
             text_result, stream_text,
             "generate() and generate_stream() should produce identical output"
         );
+    }
+
+    #[test]
+    fn test_stop_reason_display() {
+        assert_eq!(StopReason::StopToken.to_string(), "eos");
+        assert_eq!(StopReason::MaxTokens.to_string(), "max_tokens");
+        assert_eq!(StopReason::ContextLength.to_string(), "context_length");
+        assert_eq!(StopReason::Cancelled.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn test_generate_full_returns_metadata() {
+        let config = gen_config(4);
+        let engine = build_gen_engine(config);
+        let gen_cfg = GenerationConfig {
+            max_tokens: 5,
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let output = engine.generate_full("hello", &gen_cfg).unwrap();
+        // prompt "hello" with BOS = 2 tokens
+        assert_eq!(output.prompt_tokens, 2);
+        assert!(!output.token_ids.is_empty() || output.stop_reason == StopReason::StopToken);
+    }
+
+    #[test]
+    fn test_generate_stream_full_cancelled() {
+        let config = gen_config(4);
+        let weights = gen_weights(&config);
+        let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
+        let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
+        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+
+        let gen_cfg = GenerationConfig {
+            max_tokens: 100,
+            stop_tokens: vec![],
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                ..Default::default()
+            },
+        };
+
+        let output = engine.generate_stream_full("hello", &gen_cfg, |_| false).unwrap();
+        assert_eq!(output.stop_reason, StopReason::Cancelled);
+        // Only 1 token should be generated before callback cancels
+        assert_eq!(output.token_ids.len(), 1);
+    }
+
+    #[test]
+    fn test_generate_full_max_tokens_stop_reason() {
+        let config = gen_config(4);
+        let weights = gen_weights(&config);
+        let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
+        let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
+        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+
+        let gen_cfg = GenerationConfig {
+            max_tokens: 3,
+            stop_tokens: vec![],
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                ..Default::default()
+            },
+        };
+
+        let output = engine.generate_full("hello", &gen_cfg).unwrap();
+        assert_eq!(output.stop_reason, StopReason::MaxTokens);
+        assert_eq!(output.token_ids.len(), 3);
+    }
+
+    #[test]
+    fn test_generate_full_stop_token_via_explicit_stop() {
+        let config = gen_config(4);
+        let engine = build_gen_engine(config);
+
+        // First, do a greedy run to find out what the first generated token is
+        let probe = engine.generate_full("hello", &GenerationConfig {
+            max_tokens: 1,
+            stop_tokens: vec![],
+            sampling: SamplingConfig { temperature: 0.0, ..Default::default() },
+        }).unwrap();
+
+        assert!(!probe.token_ids.is_empty(), "Need at least one token to test stop");
+        let first_token = probe.token_ids[0];
+
+        // Now run again with that token as a stop token — it should be produced
+        // as the first decode token and trigger StopToken
+        let output = engine.generate_full("hello", &GenerationConfig {
+            max_tokens: 100,
+            stop_tokens: vec![first_token],
+            sampling: SamplingConfig { temperature: 0.0, ..Default::default() },
+        }).unwrap();
+
+        assert_eq!(output.stop_reason, StopReason::StopToken);
+        // The stop token is NOT included in the output
+        assert!(output.token_ids.is_empty());
+    }
+
+    #[test]
+    fn test_generate_full_context_length_stop_reason() {
+        let mut config = gen_config(4);
+        config.max_seq_len = 5; // very short: prompt(2) + max 3 decode steps
+        let weights = gen_weights(&config);
+        let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
+        let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
+        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+
+        let gen_cfg = GenerationConfig {
+            max_tokens: 100,
+            stop_tokens: vec![],
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                ..Default::default()
+            },
+        };
+
+        let output = engine.generate_full("hello", &gen_cfg).unwrap();
+        assert_eq!(output.stop_reason, StopReason::ContextLength);
+    }
+
+    #[test]
+    fn test_generate_stream_full_tokens_match_stream() {
+        let config = gen_config(4);
+        let engine1 = build_gen_engine(config.clone());
+        let engine2 = build_gen_engine(config);
+        let gen_cfg = GenerationConfig {
+            max_tokens: 5,
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let stream_ids = engine1.generate_stream("hello", &gen_cfg, |_| true).unwrap();
+        let full_output = engine2.generate_stream_full("hello", &gen_cfg, |_| true).unwrap();
+        assert_eq!(stream_ids, full_output.token_ids);
+    }
+
+    #[test]
+    fn test_decode_method() {
+        let config = gen_config(4);
+        let engine = build_gen_engine(config);
+        assert_eq!(engine.decode(&[3, 4]), "hello world");
+        assert_eq!(engine.decode(&[]), "");
     }
 }

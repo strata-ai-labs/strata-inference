@@ -12,11 +12,32 @@ half = { version = "2", features = ["std"] }
 memmap2 = "0.9"
 unicode-normalization = "0.1"
 
+# CLI-only dependencies (behind "cli" feature)
+clap = { version = "4", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
 [dev-dependencies]
-tracing-subscriber = "0.3"
 tempfile = "3"
 
 [features]
 default = []
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:tracing-subscriber"]
 metal = []
 cuda = []
+
+[[bin]]
+name = "strata-tokenize"
+path = "src/bin/tokenize.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "strata-embed"
+path = "src/bin/embed.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "strata-generate"
+path = "src/bin/generate.rs"
+required-features = ["cli"]

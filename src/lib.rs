@@ -5,6 +5,8 @@ pub mod tensor;
 pub mod backend;
 pub mod model;
 pub mod engine;
+#[cfg(feature = "cli")]
+pub mod cli;
 
 pub use error::InferenceError;
 pub use engine::EmbeddingEngine;
