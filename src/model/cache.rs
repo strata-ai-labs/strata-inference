@@ -166,6 +166,7 @@ mod tests {
             position_type: PositionType::RoPE,
             rope_freq_base: 10000.0,
             rope_dim: 4,
+            rope_neox: false,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,

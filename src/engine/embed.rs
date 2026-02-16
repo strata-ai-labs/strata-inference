@@ -311,6 +311,7 @@ mod tests {
             position_type: PositionType::RoPE,
             rope_freq_base: 10000.0,
             rope_dim: hidden_size,
+            rope_neox: false,
             causal: false, // bidirectional for embedding
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -367,6 +368,7 @@ mod tests {
         ModelWeights {
             token_embedding: dt(Tensor::new(vec![v, h], emb_data)),
             position_embedding: None,
+            token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
             layers: vec![layer],

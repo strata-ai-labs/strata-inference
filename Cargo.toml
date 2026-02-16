@@ -9,6 +9,7 @@ license = "MIT"
 thiserror = "2"
 tracing = "0.1"
 half = { version = "2", features = ["std"] }
+libm = "0.2"
 memmap2 = "0.9"
 unicode-normalization = "0.1"
 fancy-regex = "0.14"
