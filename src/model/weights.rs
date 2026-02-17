@@ -254,6 +254,41 @@ fn split_qkv_bias(
     )
 }
 
+/// Split a fused gate+up FFN weight tensor into separate gate and up tensors.
+///
+/// Some architectures (Phi-3) store `ffn_gate` and `ffn_up` as a single tensor
+/// with shape `[2*ffn_hidden, hidden_size]`. The first half is the gate
+/// projection, the second half is the up projection.
+///
+/// For quantized tensors, we dequantize to f32 first, split, then keep as f32.
+fn split_gate_up(
+    fused: &DeviceTensor,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+) -> (DeviceTensor, DeviceTensor) {
+    let tensor = backend.download(fused);
+    let f32_tensor = tensor.to_f32();
+    let f32_data = f32_tensor.as_f32();
+
+    let n_ff = config.ffn_hidden;
+    let n_embd = config.hidden_size;
+    let expected = 2 * n_ff * n_embd;
+    assert_eq!(
+        f32_data.len(),
+        expected,
+        "fused gate+up weight has {} elements, expected {} = 2 * {} * {}",
+        f32_data.len(), expected, n_ff, n_embd,
+    );
+
+    let gate_data = f32_data[..n_ff * n_embd].to_vec();
+    let up_data = f32_data[n_ff * n_embd..].to_vec();
+
+    (
+        backend.upload(&Tensor::new(vec![n_ff, n_embd], gate_data)),
+        backend.upload(&Tensor::new(vec![n_ff, n_embd], up_data)),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // ModelWeights loading
 // ---------------------------------------------------------------------------
@@ -455,7 +490,7 @@ impl ModelWeights {
                 };
 
             // FFN projections
-            let ffn_up = load_tensor(
+            let ffn_up_raw = load_tensor(
                 gguf,
                 &format!("{}.ffn_up.weight", prefix),
                 backend,
@@ -466,15 +501,33 @@ impl ModelWeights {
                 backend,
             )?;
 
-            // FFN gate (SwiGLU architectures only: Gemma, LLaMA)
-            let ffn_gate = if config.has_ffn_gate {
-                Some(load_tensor(
-                    gguf,
-                    &format!("{}.ffn_gate.weight", prefix),
-                    backend,
-                )?)
+            // FFN gate (SwiGLU architectures only: Gemma, LLaMA, Phi-3, Mistral3)
+            // Some models (Phi-3) fuse gate+up into a single ffn_up tensor.
+            let (ffn_up, ffn_gate) = if config.has_ffn_gate {
+                if gguf.find_tensor(&format!("{}.ffn_gate.weight", prefix)).is_some() {
+                    // Separate gate tensor — load normally
+                    let gate = load_tensor(
+                        gguf,
+                        &format!("{}.ffn_gate.weight", prefix),
+                        backend,
+                    )?;
+                    (ffn_up_raw, Some(gate))
+                } else if ffn_up_raw.shape()[0] == 2 * config.ffn_hidden {
+                    // No separate gate — ffn_up has doubled width (fused [gate, up])
+                    debug!(
+                        prefix = prefix,
+                        "Splitting fused gate+up from ffn_up.weight"
+                    );
+                    let (gate, up) = split_gate_up(&ffn_up_raw, config, backend);
+                    (up, Some(gate))
+                } else {
+                    // Neither separate gate nor fused — missing tensor
+                    return Err(InferenceError::TensorNotFound(
+                        format!("{}.ffn_gate.weight", prefix),
+                    ));
+                }
             } else {
-                None
+                (ffn_up_raw, None)
             };
 
             // FFN biases (BERT only)
@@ -2142,5 +2195,220 @@ mod tests {
 
         std::fs::remove_file(&path_llama).ok();
         std::fs::remove_file(&path_gpt2).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Fused gate+up FFN tests (Phi-3 style)
+    // -----------------------------------------------------------------------
+
+    /// Build a Phi3-style config: RMSNorm, SwiGLU, RoPE, fused QKV, has_ffn_gate=true, has_bias=true.
+    fn phi3_config(num_layers: usize, hidden_size: usize) -> ModelConfig {
+        ModelConfig {
+            arch: ModelArch::Phi3,
+            arch_name: "phi3".to_string(),
+            hidden_size,
+            num_layers,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: hidden_size / 4,
+            ffn_hidden: hidden_size * 2, // e.g., h=32 → ffn=64
+            vocab_size: 64,
+            max_seq_len: 128,
+            norm_type: NormType::RMSNorm,
+            norm_eps: 1e-5,
+            activation: Activation::SwiGLU,
+            position_type: PositionType::RoPE,
+            rope_freq_base: 10000.0,
+            rope_dim: hidden_size / 4,
+            rope_neox: true,
+            causal: true,
+            attn_logit_softcap: 0.0,
+            attn_scale: None,
+            embedding_scale: 1.0,
+            pooling_type: PoolingType::Mean,
+            has_ffn_gate: true,
+            has_bias: true,
+            pre_norm: true,
+        }
+    }
+
+    /// Build Phi3-style tensors with fused QKV and fused gate+up FFN.
+    fn build_phi3_tensors(config: &ModelConfig) -> Vec<(String, Vec<u64>, u32, Vec<u8>)> {
+        let h = config.hidden_size;
+        let ffn = config.ffn_hidden;
+        let v = config.vocab_size;
+        let n_kv = config.num_kv_heads * config.head_dim;
+
+        let mut tensors = Vec::new();
+
+        // Token embedding
+        tensors.push((
+            "token_embd.weight".to_string(),
+            vec![h as u64, v as u64],
+            0,
+            f32_tensor_data(&vec![0.1f32; v * h]),
+        ));
+
+        // Output norm
+        tensors.push((
+            "output_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+
+        for i in 0..config.num_layers {
+            let prefix = format!("blk.{}", i);
+
+            // Pre-norm weights
+            tensors.push((
+                format!("{}.attn_norm.weight", prefix),
+                vec![h as u64],
+                0,
+                f32_tensor_data(&vec![1.0f32; h]),
+            ));
+            tensors.push((
+                format!("{}.ffn_norm.weight", prefix),
+                vec![h as u64],
+                0,
+                f32_tensor_data(&vec![1.0f32; h]),
+            ));
+
+            // Fused QKV: [h, h + 2*n_kv] in GGUF dims
+            let qkv_cols = h + 2 * n_kv;
+            tensors.push((
+                format!("{}.attn_qkv.weight", prefix),
+                vec![h as u64, qkv_cols as u64],
+                0,
+                f32_tensor_data(&vec![0.01f32; qkv_cols * h]),
+            ));
+
+            // Attention output
+            tensors.push((
+                format!("{}.attn_output.weight", prefix),
+                vec![h as u64, h as u64],
+                0,
+                f32_tensor_data(&vec![0.01f32; h * h]),
+            ));
+
+            // Fused gate+up: [h, 2*ffn] in GGUF dims — NO separate ffn_gate
+            tensors.push((
+                format!("{}.ffn_up.weight", prefix),
+                vec![h as u64, (2 * ffn) as u64],
+                0,
+                {
+                    // Fill gate half with 1.0 and up half with 2.0 for verification
+                    let mut data = vec![1.0f32; ffn * h];
+                    data.extend(vec![2.0f32; ffn * h]);
+                    f32_tensor_data(&data)
+                },
+            ));
+
+            // FFN down
+            tensors.push((
+                format!("{}.ffn_down.weight", prefix),
+                vec![ffn as u64, h as u64],
+                0,
+                f32_tensor_data(&vec![0.01f32; h * ffn]),
+            ));
+        }
+
+        tensors
+    }
+
+    #[test]
+    fn test_fused_gate_up_split_produces_correct_shapes() {
+        // Phi3-style: ffn_up.weight has shape [2*ffn, h] — no separate ffn_gate
+        let config = phi3_config(1, 32);
+        let tensor_specs = build_phi3_tensors(&config);
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("phi3_fused_gate_up", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        let h = config.hidden_size;   // 32
+        let ffn = config.ffn_hidden;  // 64
+
+        let layer = &weights.layers[0];
+
+        // ffn_gate should exist (split from fused tensor)
+        assert!(layer.ffn_gate.is_some(), "ffn_gate should exist after fused split");
+
+        // Shapes: gate=[ffn, h], up=[ffn, h], down=[h, ffn] (GGUF dims reversed)
+        assert_eq!(layer.ffn_gate.as_ref().unwrap().shape(), &[ffn, h]);
+        assert_eq!(layer.ffn_up.shape(), &[ffn, h]);
+        assert_eq!(layer.ffn_down.shape(), &[h, ffn]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_fused_gate_up_split_produces_correct_data() {
+        // Verify the split puts gate data in ffn_gate and up data in ffn_up
+        let config = phi3_config(1, 32);
+        let tensor_specs = build_phi3_tensors(&config);
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("phi3_fused_data", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        let layer = &weights.layers[0];
+
+        // Gate was filled with 1.0, up was filled with 2.0 in build_phi3_tensors
+        let gate_data = layer.ffn_gate.as_ref().unwrap().as_tensor().as_f32();
+        let up_data = layer.ffn_up.as_tensor().as_f32();
+
+        assert!(gate_data.iter().all(|&v| (v - 1.0).abs() < 1e-6),
+            "gate data should be all 1.0");
+        assert!(up_data.iter().all(|&v| (v - 2.0).abs() < 1e-6),
+            "up data should be all 2.0");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_separate_gate_still_works_when_fused_fallback_exists() {
+        // Verify that models with separate ffn_gate (Gemma/LLaMA) still load
+        // correctly after the fused gate+up fallback was added.
+        let config = gemma_config(1, 32);
+        let tensor_specs = build_gemma_tensors(&config);
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("gemma_after_fused_change", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        let h = config.hidden_size;   // 32
+        let ffn = config.ffn_hidden;  // 128
+
+        let layer = &weights.layers[0];
+        assert!(layer.ffn_gate.is_some());
+        assert_eq!(layer.ffn_gate.as_ref().unwrap().shape(), &[ffn, h]);
+        assert_eq!(layer.ffn_up.shape(), &[ffn, h]);
+
+        std::fs::remove_file(&path).ok();
     }
 }
