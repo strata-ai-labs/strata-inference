@@ -324,10 +324,10 @@ fn pre_norm_layer_forward(
 
     // Per-head Q/K RMSNorm (Qwen3)
     let q = if let Some(ref qn_w) = layer.attn_q_norm_w {
-        rms_norm_per_head(&q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
+        rms_norm_per_head(q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
     } else { q };
     let k = if let Some(ref kn_w) = layer.attn_k_norm_w {
-        rms_norm_per_head(&k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
+        rms_norm_per_head(k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
     } else { k };
 
     // 3. Multi-head attention
@@ -432,8 +432,12 @@ fn post_norm_layer_forward(
 /// For each head slice [seq_len, head_dim], we compute RMSNorm independently
 /// (since RMSNorm normalizes over the last dimension, we must split by head
 /// to get the correct mean-of-squares over head_dim, not total_dim).
+///
+/// Implementation: reshape [seq_len, num_heads * head_dim] to
+/// [seq_len * num_heads, head_dim], apply rms_norm (which operates on last dim
+/// per row), then reshape back. Single GPU dispatch, no CPU roundtrip.
 fn rms_norm_per_head(
-    input: &DeviceTensor,
+    mut input: DeviceTensor,
     weight: &DeviceTensor,
     num_heads: usize,
     head_dim: usize,
@@ -441,28 +445,15 @@ fn rms_norm_per_head(
     backend: &dyn ComputeBackend,
 ) -> DeviceTensor {
     let seq_len = input.shape()[0];
-    let input_host = backend.download(input);
-    let input_data = input_host.as_f32();
     let total_dim = num_heads * head_dim;
+    debug_assert_eq!(input.shape()[1], total_dim);
 
-    let mut result_data = vec![0.0f32; seq_len * total_dim];
-
-    for h in 0..num_heads {
-        let head_tensor = extract_head(input_data, seq_len, total_dim, h, head_dim);
-        let head_dev = backend.upload(&head_tensor);
-        let normed = backend.rms_norm(&head_dev, weight, eps);
-        let normed_host = backend.download(&normed);
-        let normed_data = normed_host.as_f32();
-
-        for pos in 0..seq_len {
-            let src_offset = pos * head_dim;
-            let dst_offset = pos * total_dim + h * head_dim;
-            result_data[dst_offset..dst_offset + head_dim]
-                .copy_from_slice(&normed_data[src_offset..src_offset + head_dim]);
-        }
-    }
-
-    backend.upload(&Tensor::new(vec![seq_len, total_dim], result_data))
+    // Reshape to [seq_len * num_heads, head_dim] so rms_norm treats each head
+    // as a separate row, normalizing over head_dim independently.
+    input.reshape(vec![seq_len * num_heads, head_dim]);
+    let mut normed = backend.rms_norm(&input, weight, eps);
+    normed.reshape(vec![seq_len, total_dim]);
+    normed
 }
 
 /// GemmaEmbedding layer forward pass.
@@ -502,12 +493,12 @@ fn gemma_embedding_layer_forward(
 
     // 3-4. Per-head Q/K RMSNorm
     let q = if let Some(ref qn_w) = layer.attn_q_norm_w {
-        rms_norm_per_head(&q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
+        rms_norm_per_head(q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
     } else {
         q
     };
     let k = if let Some(ref kn_w) = layer.attn_k_norm_w {
-        rms_norm_per_head(&k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
+        rms_norm_per_head(k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
     } else {
         k
     };
@@ -724,10 +715,40 @@ fn multi_head_attention_cached(
         (q, k_new)
     };
 
-    // Step b: Download K_new and V_new, append to cache
+    // =====================================================================
+    // GPU FAST PATH: single-token decode with GPU-resident KV cache
+    // =====================================================================
+    if n_new == 1 && cache.is_gpu() {
+        let total_len = pos_offset + n_new;
+        let attn_scale = config.attn_scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
+
+        // Append K_new/V_new to GPU cache (no CPU roundtrip)
+        cache.append_gpu(layer_idx, &k_proc, &v_new, n_new, backend)?;
+
+        // Single GPU kernel: fused Q@K^T + softmax + @V across all heads
+        let k_full = cache.get_k_gpu(layer_idx);
+        let v_full = cache.get_v_gpu(layer_idx);
+
+        return Ok(backend.grouped_attention_decode(
+            &q_proc, k_full, v_full, total_len,
+            num_heads, num_kv_heads, head_dim,
+            attn_scale, config.attn_logit_softcap,
+        ));
+    }
+
+    // =====================================================================
+    // SLOW PATH: prefill (n_new > 1) or CPU-resident cache
+    // =====================================================================
+
+    // Step b: Download K_new and V_new, append to CPU cache
     let k_host = backend.download(&k_proc);
     let v_host = backend.download(&v_new);
     cache.append(layer_idx, k_host.as_f32(), v_host.as_f32(), n_new)?;
+
+    // Also update GPU cache if present (for subsequent decode steps)
+    if cache.is_gpu() {
+        cache.append_gpu(layer_idx, &k_proc, &v_new, n_new, backend)?;
+    }
 
     // Step c: Read full cached K/V
     let total_len = pos_offset + n_new;
@@ -837,10 +858,10 @@ fn transformer_layer_forward_cached(
 
         // Per-head Q/K RMSNorm (Qwen3)
         let q = if let Some(ref qn_w) = layer.attn_q_norm_w {
-            rms_norm_per_head(&q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
+            rms_norm_per_head(q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
         } else { q };
         let k = if let Some(ref kn_w) = layer.attn_k_norm_w {
-            rms_norm_per_head(&k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
+            rms_norm_per_head(k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
         } else { k };
 
         let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend)?;
@@ -2164,7 +2185,7 @@ mod tests {
         let input = dt(Tensor::new(vec![2, head_dim], input_data));
         let weight = ones_weight(head_dim);
 
-        let result = rms_norm_per_head(&input, &weight, 1, head_dim, 1e-6, &b);
+        let result = rms_norm_per_head(input.clone(), &weight, 1, head_dim, 1e-6, &b);
         let expected = b.rms_norm(&input, &weight, 1e-6);
 
         assert_eq!(result.shape(), expected.shape());
@@ -2192,7 +2213,7 @@ mod tests {
         let input = dt(Tensor::new(vec![1, total_dim], vec![3.0, 4.0, 0.1, 0.1]));
         let weight = ones_weight(head_dim);
 
-        let per_head = rms_norm_per_head(&input, &weight, num_heads, head_dim, 1e-6, &b);
+        let per_head = rms_norm_per_head(input.clone(), &weight, num_heads, head_dim, 1e-6, &b);
 
         // Full rms_norm over [4] dims (would use RMS of [3.0, 4.0, 0.1, 0.1])
         let full_weight = ones_weight(total_dim);
@@ -2231,7 +2252,7 @@ mod tests {
         let input = dt(Tensor::new(vec![seq_len, total_dim], input_data));
         let weight = ones_weight(head_dim);
 
-        let result = rms_norm_per_head(&input, &weight, num_heads, head_dim, 1e-6, &b);
+        let result = rms_norm_per_head(input, &weight, num_heads, head_dim, 1e-6, &b);
         assert_eq!(result.shape(), &[seq_len, total_dim]);
 
         // All values should be finite

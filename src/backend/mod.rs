@@ -87,6 +87,20 @@ impl DeviceTensor {
         &self.shape
     }
 
+    /// Reshape this tensor in place (no data copy).
+    ///
+    /// The new shape must have the same total number of elements.
+    pub fn reshape(&mut self, new_shape: Vec<usize>) {
+        let old_count: usize = self.shape.iter().product();
+        let new_count: usize = new_shape.iter().product();
+        assert_eq!(
+            old_count, new_count,
+            "reshape: element count mismatch {} vs {}",
+            old_count, new_count
+        );
+        self.shape = new_shape;
+    }
+
     /// Returns the data type of this tensor.
     pub fn dtype(&self) -> TensorDtype {
         self.dtype
@@ -126,6 +140,13 @@ impl DeviceTensor {
 /// All backends operate on [`DeviceTensor`] values, which wrap tensors
 /// stored on the relevant device.
 pub trait ComputeBackend: Send + Sync {
+    /// Whether this backend supports GPU-resident operations (Metal, CUDA).
+    ///
+    /// Used to decide whether to allocate GPU KV cache buffers.
+    fn is_gpu(&self) -> bool {
+        false
+    }
+
     /// Upload a host tensor to the device.
     fn upload(&self, tensor: &Tensor) -> DeviceTensor;
 
@@ -236,6 +257,41 @@ pub trait ComputeBackend: Send + Sync {
         head_dim: usize,
         rope_dim: usize,
     ) -> (DeviceTensor, DeviceTensor);
+
+    /// Copy src rows into dest at a row offset.
+    ///
+    /// dest must be pre-allocated as `[max_rows, cols]`.
+    /// src: `[n_rows, cols]`.
+    /// Writes src into `dest[dest_row_offset..dest_row_offset + n_rows]`.
+    fn copy_rows_into(
+        &self,
+        dest: &DeviceTensor,
+        src: &DeviceTensor,
+        dest_row_offset: usize,
+    );
+
+    /// Grouped-query attention for single-token decode.
+    ///
+    /// Fuses Q@K^T, scaling, optional softcap, softmax, and @V into a single
+    /// operation across all heads.
+    ///
+    /// - `q`: `[1, num_heads * head_dim]`
+    /// - `k`: `[max_len, num_kv_heads * head_dim]` (GPU KV cache, read first `total_len` rows)
+    /// - `v`: `[max_len, num_kv_heads * head_dim]` (GPU KV cache, read first `total_len` rows)
+    ///
+    /// Returns: `[1, num_heads * head_dim]`
+    fn grouped_attention_decode(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        total_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        attn_scale: f32,
+        softcap: f32,
+    ) -> DeviceTensor;
 }
 
 /// Auto-detect and return the best available compute backend.

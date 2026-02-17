@@ -1582,6 +1582,30 @@ impl ComputeBackend for CudaBackend {
 
         (q_out, k_out)
     }
+
+    fn copy_rows_into(
+        &self,
+        _dest: &DeviceTensor,
+        _src: &DeviceTensor,
+        _dest_row_offset: usize,
+    ) {
+        todo!("CUDA copy_rows_into not yet implemented");
+    }
+
+    fn grouped_attention_decode(
+        &self,
+        _q: &DeviceTensor,
+        _k: &DeviceTensor,
+        _v: &DeviceTensor,
+        _total_len: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _attn_scale: f32,
+        _softcap: f32,
+    ) -> DeviceTensor {
+        todo!("CUDA grouped_attention_decode not yet implemented");
+    }
 }
 
 // ---------------------------------------------------------------------------

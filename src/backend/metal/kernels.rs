@@ -1022,4 +1022,148 @@ kernel void embedding_lookup(
     uint token_id = ids[i];
     output[i * hidden + j] = table[token_id * hidden + j];
 }
+
+// -----------------------------------------------------------------------
+// 14. grouped_attn_decode — Fused grouped-query attention for single-token decode
+//
+//   Computes attention for all Q heads in a single kernel dispatch.
+//   One threadgroup per Q head, 256 threads each.
+//
+//   Q: [1, num_heads * head_dim]       (single query token)
+//   K: [max_len, num_kv_heads * head_dim]  (KV cache, first total_len rows valid)
+//   V: [max_len, num_kv_heads * head_dim]  (KV cache, first total_len rows valid)
+//   output: [1, num_heads * head_dim]
+//
+//   For GQA, kv_head = h * num_kv_heads / num_heads.
+//
+//   Two-pass tiled approach:
+//   Pass 1: threads parallel over positions → compute Q@K scores, find global max
+//   Pass 2: process positions in tiles of 256. Within each tile:
+//     - All threads compute one score each → store exp(score-max) as prob in shared
+//     - Threads switch to parallel over head_dim dimensions, accumulate prob*V
+//     - Also accumulate sum_exp for final normalization
+//   Final: normalize V accumulation by 1/sum_exp
+// -----------------------------------------------------------------------
+kernel void grouped_attn_decode(
+    device const float* Q       [[buffer(0)]],
+    device const float* K       [[buffer(1)]],
+    device const float* V       [[buffer(2)]],
+    device       float* output  [[buffer(3)]],
+    constant     uint&  num_heads    [[buffer(4)]],
+    constant     uint&  num_kv_heads [[buffer(5)]],
+    constant     uint&  head_dim     [[buffer(6)]],
+    constant     uint&  total_len    [[buffer(7)]],
+    constant     float& attn_scale   [[buffer(8)]],
+    constant     float& softcap      [[buffer(9)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tpg  [[threads_per_threadgroup]])
+{
+    uint h = gid;
+    if (h >= num_heads) return;
+
+    uint kv_dim = num_kv_heads * head_dim;
+    uint kv_head = h * num_kv_heads / num_heads;
+    device const float* q_head = Q + h * head_dim;
+    uint kv_off = kv_head * head_dim;
+
+    threadgroup float shared[256];
+
+    // ---- Pass 1: find global max of attention scores ----
+    // Threads parallel over positions
+    float local_max = -INFINITY;
+    for (uint j = lid; j < total_len; j += tpg) {
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) {
+            dot += q_head[d] * K[j * kv_dim + kv_off + d];
+        }
+        float s = dot * attn_scale;
+        if (softcap > 0.0f) {
+            s = softcap * precise::tanh(s / softcap);
+        }
+        local_max = max(local_max, s);
+    }
+
+    // Reduce max across threadgroup
+    shared[lid] = local_max;
+    for (uint stride = tpg / 2; stride > 0; stride >>= 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < stride) {
+            shared[lid] = max(shared[lid], shared[lid + stride]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gmax = shared[0];
+
+    // ---- Pass 2: tiled score + V accumulation ----
+    // Process positions in tiles of tpg. Within each tile:
+    //   1. Each thread computes score for one position → store weight in shared
+    //   2. Threads switch to parallel over head_dim, accumulate weight * V
+    //   3. Each thread also accumulates partial sum_exp
+    device float* out_head = output + h * head_dim;
+
+    // Each thread owns one output dimension (lid < head_dim) and accumulates in register
+    float v_acc = 0.0f;
+    float local_sum_exp = 0.0f;
+
+    for (uint tile = 0; tile < total_len; tile += tpg) {
+        uint j = tile + lid;
+
+        // Step A: each thread computes exp(score - max) for one position
+        float w = 0.0f;
+        if (j < total_len) {
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; ++d) {
+                dot += q_head[d] * K[j * kv_dim + kv_off + d];
+            }
+            float s = dot * attn_scale;
+            if (softcap > 0.0f) {
+                s = softcap * precise::tanh(s / softcap);
+            }
+            w = exp(s - gmax);
+        }
+        local_sum_exp += w;
+        shared[lid] = w;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step B: threads parallel over dimensions, accumulate weight * V
+        uint active = min(tpg, total_len - tile);
+        if (lid < head_dim) {
+            for (uint t = 0; t < active; ++t) {
+                v_acc += shared[t] * V[(tile + t) * kv_dim + kv_off + lid];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Reduce sum_exp across threadgroup
+    shared[lid] = local_sum_exp;
+    for (uint stride = tpg / 2; stride > 0; stride >>= 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < stride) {
+            shared[lid] += shared[lid + stride];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = (shared[0] > 0.0f) ? (1.0f / shared[0]) : 0.0f;
+
+    // Write normalized output
+    if (lid < head_dim) {
+        out_head[lid] = v_acc * inv_sum;
+    }
+}
+
+// 15. copy_buffer — Copy N floats from src to dest at a float offset.
+//     Used for appending to GPU KV cache without CPU stalls.
+kernel void copy_buffer(
+    device const float* src     [[buffer(0)]],
+    device       float* dest    [[buffer(1)]],
+    constant     uint&  count   [[buffer(2)]],
+    constant     uint&  dest_offset [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) {
+        dest[dest_offset + gid] = src[gid];
+    }
+}
 "#;
