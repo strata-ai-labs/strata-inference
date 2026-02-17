@@ -1153,6 +1153,275 @@ kernel void grouped_attn_decode(
     }
 }
 
+// =========================================================================
+// K-quant kernels: Q4_K, Q5_K, Q6_K fused dequant + matrix-vector multiply
+// =========================================================================
+
+// K-quant constants
+constant constexpr uint QK_K = 256;
+constant constexpr uint Q4_K_BLOCK_SIZE = 144;
+constant constexpr uint Q5_K_BLOCK_SIZE = 176;
+constant constexpr uint Q6_K_BLOCK_SIZE = 210;
+
+// Tiling constants for K-quant kernels (same for Q4_K, Q5_K, Q6_K)
+constant constexpr short N_R0_KQ = 2;  // rows per simdgroup
+constant constexpr short N_SG_KQ = 2;  // simdgroups per threadgroup (64 threads)
+
+// -----------------------------------------------------------------------
+// 15. quantized_matmul_q4_k — Fused Q4_K dequant + matrix-vector multiply
+//
+//   Q4_K block (144 bytes per 256 values):
+//     d:      f16  (2B)   super-block scale
+//     dmin:   f16  (2B)   super-block min scale
+//     scales: u8[12]      8 pairs of 6-bit (scale, min) packed
+//     qs:     u8[128]     4-bit quantized values
+//
+//   Dequant: y = d * scale_j * (q & 0xF) - dmin * min_j
+//   8 sub-blocks of 32 values each.
+//
+//   Ported from llama.cpp's kernel_mul_mv_q4_K_f32_impl.
+//   Grid: (N + N_R0_KQ*N_SG_KQ - 1) / (N_R0_KQ*N_SG_KQ) threadgroups, 64 threads.
+// -----------------------------------------------------------------------
+kernel void quantized_matmul_q4_k(
+    device const char*  weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  N       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint nb = K / QK_K;
+    const uint first_row = (tgpig.x * N_SG_KQ + sgitg) * N_R0_KQ;
+
+    constexpr ushort kmask1 = 0x3f3f;
+    constexpr ushort kmask2 = 0x0f0f;
+    constexpr ushort kmask3 = 0xc0c0;
+
+    const short ix = tiisg / 8;   // 0..3: which block chunk
+    const short it = tiisg % 8;
+    const short iq = it / 4;      // 0 or 1: first or second 128 values
+    const short ir = it % 4;      // 0..3: which 8-element group
+
+    float sumf[N_R0_KQ] = {0.f};
+
+    device const float * y4 = input + ix * QK_K + 64 * iq + 8 * ir;
+
+    ushort sc16[4];
+    thread const uchar * sc8 = (thread const uchar *)sc16;
+
+    float yl[16];
+    float yh[16];
+
+    for (int ib = ix; ib < (int)nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+
+        for (short row = 0; row < N_R0_KQ; ++row) {
+            uint actual_row = first_row + row;
+            if (actual_row >= N) continue;
+
+            device const uchar*  bp = (device const uchar*)(weights + actual_row * nb * Q4_K_BLOCK_SIZE + ib * Q4_K_BLOCK_SIZE);
+            device const half*   dh = (device const half*)bp;
+            device const ushort* sc = (device const ushort*)(bp + 4) + iq;
+            device const ushort* q1 = (device const ushort*)(bp + 16) + 16 * iq + 4 * ir;
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const ushort * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += float(dh[0]) * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                          (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                          (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                          (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         float(dh[1]) * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+
+        y4 += 4 * QK_K;
+    }
+
+    for (short row = 0; row < N_R0_KQ; ++row) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && (first_row + row) < N) {
+            output[first_row + row] = tot;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// 16. quantized_matmul_q5_k — Fused Q5_K dequant + matrix-vector multiply
+//
+//   Q5_K block (176 bytes per 256 values):
+//     d:      f16  (2B), dmin: f16 (2B), scales: u8[12], qh: u8[32], qs: u8[128]
+//   Dequant: y = d * scale * ((q & 0xF) + high_bit*16) - dmin * min
+//   32 threads × 8 elements = 256 values per block.
+// -----------------------------------------------------------------------
+kernel void quantized_matmul_q5_k(
+    device const char*  weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  N       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint nb = K / QK_K;
+    const uint first_row = (tgpig.x * N_SG_KQ + sgitg) * N_R0_KQ;
+
+    const short elem_offset = tiisg * 8;
+    const short sb   = elem_offset / 32;
+    const short pos  = elem_offset % 32;
+    const short pair = sb / 2;
+    const bool  is_high = (sb & 1);
+    const uchar qh_bit  = uchar(1 << sb);
+
+    float sumf[N_R0_KQ] = {0.f};
+
+    for (int ib = 0; ib < (int)nb; ib++) {
+        device const float* y = input + ib * QK_K + elem_offset;
+        float yl[8];
+        for (short i = 0; i < 8; i++) yl[i] = y[i];
+
+        for (short row = 0; row < N_R0_KQ; ++row) {
+            uint actual_row = first_row + row;
+            if (actual_row >= N) continue;
+
+            device const uchar* bp = (device const uchar*)(weights + actual_row * nb * Q5_K_BLOCK_SIZE + ib * Q5_K_BLOCK_SIZE);
+            float d_val    = float(*(device const half*)(bp));
+            float dmin_val = float(*(device const half*)(bp + 2));
+            device const uchar* sa = bp + 4;
+            device const uchar* qh_arr = bp + 16;
+            device const uchar* qs_arr = bp + 48;
+
+            uchar sc_val, m_val;
+            if (sb < 4) {
+                sc_val = sa[sb] & 63;
+                m_val  = sa[sb + 4] & 63;
+            } else {
+                sc_val = (sa[sb + 4] & 0xF) | ((sa[sb - 4] >> 6) << 4);
+                m_val  = (sa[sb + 4] >> 4)  | ((sa[sb]     >> 6) << 4);
+            }
+            float sc_f = d_val * float(sc_val);
+            float m_f  = dmin_val * float(m_val);
+
+            float partial = 0.f;
+            for (short i = 0; i < 8; i++) {
+                short l = pos + i;
+                uchar q_low  = is_high ? (qs_arr[pair * 32 + l] >> 4)
+                                       : (qs_arr[pair * 32 + l] & 0xF);
+                uchar q_high = (qh_arr[l] & qh_bit) ? 16 : 0;
+                partial += (sc_f * float(q_low + q_high) - m_f) * yl[i];
+            }
+            sumf[row] += partial;
+        }
+    }
+
+    for (short row = 0; row < N_R0_KQ; ++row) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && (first_row + row) < N) {
+            output[first_row + row] = tot;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// 17. quantized_matmul_q6_k — Fused Q6_K dequant + matrix-vector multiply
+//
+//   Q6_K block (210 bytes per 256 values):
+//     ql: u8[128], qh: u8[64], scales: i8[16], d: f16 (2B)
+//   Dequant: y = d * scale * (6bit_val - 32)
+//   32 threads × 8 elements = 256 values per block.
+//   Layout: 2 halves of 128; each half = 4 groups of 32 values.
+// -----------------------------------------------------------------------
+kernel void quantized_matmul_q6_k(
+    device const char*  weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  N       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint nb = K / QK_K;
+    const uint first_row = (tgpig.x * N_SG_KQ + sgitg) * N_R0_KQ;
+
+    const short elem_offset = tiisg * 8;
+    const short half_idx    = elem_offset / 128;
+    const short within_half = elem_offset % 128;
+    const short group32     = within_half / 32;
+    const short pos         = within_half % 32;
+
+    const uint  ql_off   = half_idx * 64 + ((group32 & 1) ? 32 : 0);
+    const uint  qh_off   = half_idx * 32;
+    const short qh_shift = group32 * 2;
+    const bool  high_nib = (group32 >= 2);
+    const short sc_off   = half_idx * 8 + group32 * 2;
+
+    float sumf[N_R0_KQ] = {0.f};
+
+    for (int ib = 0; ib < (int)nb; ib++) {
+        device const float* y = input + ib * QK_K + elem_offset;
+        float yl[8];
+        for (short i = 0; i < 8; i++) yl[i] = y[i];
+
+        for (short row = 0; row < N_R0_KQ; ++row) {
+            uint actual_row = first_row + row;
+            if (actual_row >= N) continue;
+
+            device const uchar* bp = (device const uchar*)(weights + actual_row * nb * Q6_K_BLOCK_SIZE + ib * Q6_K_BLOCK_SIZE);
+            device const uchar* ql = bp;
+            device const uchar* qh = bp + 128;
+            device const char*  sc = (device const char*)(bp + 192);
+            float d = float(*(device const half*)(bp + 208));
+
+            float partial = 0.f;
+            for (short i = 0; i < 8; i++) {
+                short l = pos + i;
+                uchar ql_byte = ql[ql_off + l];
+                uchar qh_byte = qh[qh_off + l];
+                uchar q_low   = high_nib ? (ql_byte >> 4) : (ql_byte & 0xF);
+                uchar q_high  = (qh_byte >> qh_shift) & 3;
+                int   q_val   = int(q_low | (q_high << 4)) - 32;
+                char  scale   = sc[sc_off + (l / 16)];
+                partial += d * float(scale) * float(q_val) * yl[i];
+            }
+            sumf[row] += partial;
+        }
+    }
+
+    for (short row = 0; row < N_R0_KQ; ++row) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && (first_row + row) < N) {
+            output[first_row + row] = tot;
+        }
+    }
+}
+
 // 15. copy_buffer — Copy N floats from src to dest at a float offset.
 //     Used for appending to GPU KV cache without CPU stalls.
 kernel void copy_buffer(
