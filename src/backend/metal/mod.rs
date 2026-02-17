@@ -73,7 +73,7 @@ pub struct MetalBackend {
     device: Id,
     command_queue: Id,
     sels: Selectors,
-    // Pipeline state objects — f32 kernels only (22 total)
+    // Pipeline state objects — f32 kernels only (27 total)
     pso_gemm: Id,
     pso_gemm_transpose: Id,
     pso_gelu: Id,
@@ -98,6 +98,9 @@ pub struct MetalBackend {
     pso_embedding_lookup: Id,
     pso_grouped_attn_decode: Id,
     pso_copy_buffer: Id,
+    pso_quantized_matmul_q4_k: Id,
+    pso_quantized_matmul_q5_k: Id,
+    pso_quantized_matmul_q6_k: Id,
     /// Active command buffer and compute encoder for deferred dispatch.
     /// `None` means no open command buffer; dispatches create one lazily.
     active_cmd: Mutex<Option<(Id, Id)>>,
@@ -141,6 +144,9 @@ impl Drop for MetalBackend {
                 self.pso_embedding_lookup,
                 self.pso_grouped_attn_decode,
                 self.pso_copy_buffer,
+                self.pso_quantized_matmul_q4_k,
+                self.pso_quantized_matmul_q5_k,
+                self.pso_quantized_matmul_q6_k,
             ] {
                 if pso != NIL {
                     msg_send_void(pso, rel);
@@ -231,9 +237,12 @@ impl MetalBackend {
                 "embedding_lookup",
                 "grouped_attn_decode",
                 "copy_buffer",
+                "quantized_matmul_q4_k",
+                "quantized_matmul_q5_k",
+                "quantized_matmul_q6_k",
             ];
 
-            let mut psos = [NIL; 24];
+            let mut psos = [NIL; 27];
             for (i, name) in kernel_names.iter().enumerate() {
                 let ns_name = ns_string(name);
                 let func =
@@ -283,7 +292,7 @@ impl MetalBackend {
 
             msg_send_void(library, sels.release);
 
-            debug!("MetalBackend initialized with 24 PSOs");
+            debug!("MetalBackend initialized with 27 PSOs");
 
             Ok(Self {
                 device,
@@ -313,6 +322,9 @@ impl MetalBackend {
                 pso_embedding_lookup: psos[21],
                 pso_grouped_attn_decode: psos[22],
                 pso_copy_buffer: psos[23],
+                pso_quantized_matmul_q4_k: psos[24],
+                pso_quantized_matmul_q5_k: psos[25],
+                pso_quantized_matmul_q6_k: psos[26],
                 active_cmd: Mutex::new(None),
             })
         }
@@ -615,12 +627,7 @@ impl MetalBackend {
 
 impl ComputeBackend for MetalBackend {
     fn is_gpu(&self) -> bool {
-        // Disabled: GPU KV cache + attention decode kernel produces correct
-        // results, but copy_rows_into requires flush() (CPU stall) which makes
-        // the GPU path slower than the CPU per-head attention loop.
-        // Re-enable after implementing async GPU buffer copies (blit encoder
-        // or dedicated copy command buffer).
-        false
+        true
     }
 
     fn upload(&self, tensor: &Tensor) -> DeviceTensor {
@@ -787,9 +794,9 @@ impl ComputeBackend for MetalBackend {
             k, weight_shape[1]
         );
 
-        // For K-quant and other types without native GPU kernels, fall back to
+        // For types without native GPU kernels, fall back to
         // dequantizing on CPU and using regular F32 matmul_transpose.
-        if dtype != TensorDtype::Q8_0 && dtype != TensorDtype::Q4_0 {
+        if !matches!(dtype, TensorDtype::Q8_0 | TensorDtype::Q4_0 | TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K) {
             tracing::debug!(
                 ?dtype,
                 "Metal quantized_matmul: no native kernel for {:?}, using dequant fallback",
@@ -834,6 +841,45 @@ impl ComputeBackend for MetalBackend {
                         self.set_u32(enc, n as u32, 3);
                         self.set_u32(enc, k as u32, 4);
                         let threadgroups = (n + 7) / 8;
+                        msg_send_dispatch(
+                            enc, self.sels.dispatch_threadgroups,
+                            threadgroups, 1, 1, 64, 1, 1,
+                        );
+                    }
+                    TensorDtype::Q4_K => {
+                        let enc = self.ensure_encoder(self.pso_quantized_matmul_q4_k);
+                        self.set_buffer(enc, weight_buf_id, 0);
+                        self.set_buffer(enc, input_buf_id, 1);
+                        self.set_buffer(enc, out_buf.buffer, 2);
+                        self.set_u32(enc, n as u32, 3);
+                        self.set_u32(enc, k as u32, 4);
+                        let threadgroups = (n + 3) / 4;
+                        msg_send_dispatch(
+                            enc, self.sels.dispatch_threadgroups,
+                            threadgroups, 1, 1, 64, 1, 1,
+                        );
+                    }
+                    TensorDtype::Q5_K => {
+                        let enc = self.ensure_encoder(self.pso_quantized_matmul_q5_k);
+                        self.set_buffer(enc, weight_buf_id, 0);
+                        self.set_buffer(enc, input_buf_id, 1);
+                        self.set_buffer(enc, out_buf.buffer, 2);
+                        self.set_u32(enc, n as u32, 3);
+                        self.set_u32(enc, k as u32, 4);
+                        let threadgroups = (n + 3) / 4;
+                        msg_send_dispatch(
+                            enc, self.sels.dispatch_threadgroups,
+                            threadgroups, 1, 1, 64, 1, 1,
+                        );
+                    }
+                    TensorDtype::Q6_K => {
+                        let enc = self.ensure_encoder(self.pso_quantized_matmul_q6_k);
+                        self.set_buffer(enc, weight_buf_id, 0);
+                        self.set_buffer(enc, input_buf_id, 1);
+                        self.set_buffer(enc, out_buf.buffer, 2);
+                        self.set_u32(enc, n as u32, 3);
+                        self.set_u32(enc, k as u32, 4);
+                        let threadgroups = (n + 3) / 4;
                         msg_send_dispatch(
                             enc, self.sels.dispatch_threadgroups,
                             threadgroups, 1, 1, 64, 1, 1,
@@ -899,6 +945,35 @@ impl ComputeBackend for MetalBackend {
                         self.set_u32(enc, k as u32, 4);
 
                         let threadgroups = (n + 7) / 8;
+                        msg_send_dispatch(
+                            enc,
+                            self.sels.dispatch_threadgroups,
+                            threadgroups, 1, 1,
+                            64, 1, 1,
+                        );
+                    }
+                    TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => {
+                        let pso = match dtype {
+                            TensorDtype::Q4_K => self.pso_quantized_matmul_q4_k,
+                            TensorDtype::Q5_K => self.pso_quantized_matmul_q5_k,
+                            TensorDtype::Q6_K => self.pso_quantized_matmul_q6_k,
+                            _ => unreachable!(),
+                        };
+                        let enc = self.ensure_encoder(pso);
+
+                        self.set_buffer(enc, weight_buf_id, 0);
+                        self.set_buffer(enc, input_row_buf.buffer, 1);
+                        msg_send_set_buffer(
+                            enc,
+                            self.sels.set_buffer,
+                            out_buf.buffer,
+                            row_out_offset * std::mem::size_of::<f32>(),
+                            2,
+                        );
+                        self.set_u32(enc, n as u32, 3);
+                        self.set_u32(enc, k as u32, 4);
+
+                        let threadgroups = (n + 3) / 4;
                         msg_send_dispatch(
                             enc,
                             self.sels.dispatch_threadgroups,
@@ -1324,31 +1399,27 @@ impl ComputeBackend for MetalBackend {
         src: &DeviceTensor,
         dest_row_offset: usize,
     ) {
+        debug_assert_eq!(src.dtype(), TensorDtype::F32, "copy_rows_into: src must be F32");
+        debug_assert_eq!(dest.dtype(), TensorDtype::F32, "copy_rows_into: dest must be F32");
         let cols = dest.shape().last().copied().unwrap_or(0);
         let n_rows = src.shape()[0];
-        let byte_offset = dest_row_offset * cols * std::mem::size_of::<f32>();
-        let copy_bytes = n_rows * cols * std::mem::size_of::<f32>();
+        let count = n_rows * cols; // number of f32 elements to copy
+        let dest_offset = dest_row_offset * cols; // f32 element offset into dest
 
-        if copy_bytes == 0 {
+        if count == 0 {
             return;
         }
 
         unsafe {
-            // Flush pending compute work so src data is available in shared memory
-            self.flush();
-
-            let dest_buf = Self::buf_id(dest);
-            let src_buf = Self::buf_id(src);
-
-            // memcpy on shared-mode buffers (CPU-accessible).
-            let dest_ptr = msg_send_ptr(dest_buf, self.sels.contents) as *mut u8;
-            let src_ptr = msg_send_ptr(src_buf, self.sels.contents) as *const u8;
-
-            std::ptr::copy_nonoverlapping(
-                src_ptr,
-                dest_ptr.add(byte_offset),
-                copy_bytes,
-            );
+            // GPU-side copy using the copy_buffer kernel.
+            // The memory barrier in ensure_encoder() ensures prior kernel
+            // writes to src are visible — no flush needed.
+            let enc = self.ensure_encoder(self.pso_copy_buffer);
+            self.set_buffer(enc, Self::buf_id(src), 0);
+            self.set_buffer(enc, Self::buf_id(dest), 1);
+            self.set_u32(enc, count as u32, 2);
+            self.set_u32(enc, dest_offset as u32, 3);
+            self.dispatch_1d(enc, count);
         }
     }
 
@@ -1982,6 +2053,365 @@ mod tests {
 
         assert_vecs_close(gpu_q_d.as_f32(), cpu_q_d.as_f32(), 1e-3, "rope partial Q");
         assert_vecs_close(gpu_k_d.as_f32(), cpu_k_d.as_f32(), 1e-3, "rope partial K");
+    }
+
+    #[test]
+    fn test_copy_rows_into_gpu() {
+        let metal = backend();
+
+        // Dest: [4, 3] zeros
+        let dest_data = vec![0.0f32; 12];
+        let dest_t = Tensor::new(vec![4, 3], dest_data);
+        let dest_gpu = metal.upload(&dest_t);
+
+        // Src: [2, 3] with known data
+        let src_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let src_t = Tensor::new(vec![2, 3], src_data.clone());
+        let src_gpu = metal.upload(&src_t);
+
+        // Copy src into dest at row offset 1 (rows 1-2)
+        metal.copy_rows_into(&dest_gpu, &src_gpu, 1);
+
+        let result = metal.download(&dest_gpu);
+        let data = result.as_f32();
+
+        // Row 0 should remain zero
+        assert_vecs_close(&data[0..3], &[0.0, 0.0, 0.0], 1e-6, "copy_rows row 0");
+        // Rows 1-2 should match src
+        assert_vecs_close(&data[3..6], &src_data[0..3], 1e-6, "copy_rows row 1");
+        assert_vecs_close(&data[6..9], &src_data[3..6], 1e-6, "copy_rows row 2");
+        // Row 3 should remain zero
+        assert_vecs_close(&data[9..12], &[0.0, 0.0, 0.0], 1e-6, "copy_rows row 3");
+    }
+
+    #[test]
+    fn test_quantized_matmul_q4_k_vs_cpu() {
+        use crate::gguf::quant::{BlockQ4K, f32_to_f16};
+
+        let metal = backend();
+        let cpu_be = cpu();
+
+        // Asymmetric nibbles (low=0xA, high=0x3), non-zero dmin, varied scales
+        let mut block = BlockQ4K {
+            d: f32_to_f16(0.75),
+            dmin: f32_to_f16(0.25),
+            scales: [0; 12],
+            qs: [0; 128],
+        };
+        // Vary qs bytes: alternate 0x3A (low=0xA, high=3), 0x7C (low=0xC, high=7)
+        for i in 0..128 {
+            block.qs[i] = if i % 2 == 0 { 0x3A } else { 0x7C };
+        }
+        // Set all 8 sub-block scales and mins (first 4 direct, last 4 packed)
+        block.scales[0] = 5;   // scale for sub-block 0
+        block.scales[1] = 10;  // scale for sub-block 1
+        block.scales[2] = 15;  // scale for sub-block 2
+        block.scales[3] = 20;  // scale for sub-block 3
+        block.scales[4] = 3;   // min for sub-block 0
+        block.scales[5] = 7;   // min for sub-block 1
+        block.scales[6] = 2;   // min for sub-block 2
+        block.scales[7] = 9;   // min for sub-block 3
+        // Packed scales for sub-blocks 4-7 (indices 8-11)
+        block.scales[8] = 0x42;  // scale4=2, min4=4 (low/high nibbles)
+        block.scales[9] = 0x53;  // scale5=3, min5=5
+        block.scales[10] = 0x86; // scale6=6, min6=8
+        block.scales[11] = 0xA7; // scale7=7, min7=10
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block.d.to_le_bytes());
+        raw.extend_from_slice(&block.dmin.to_le_bytes());
+        raw.extend_from_slice(&block.scales);
+        raw.extend_from_slice(&block.qs);
+        assert_eq!(raw.len(), 144);
+
+        let weights = Tensor::from_quantized(vec![1, 256], TensorDtype::Q4_K, raw);
+        // Diverse input: positive and negative, varied magnitudes
+        let input_data: Vec<f32> = (0..256).map(|i| {
+            let x = i as f32 * 0.02 - 2.56;  // range [-2.56, +2.54]
+            x
+        }).collect();
+        let input = Tensor::new(vec![1, 256], input_data);
+
+        let w_cpu = cpu_be.upload(&weights);
+        let i_cpu = cpu_be.upload(&input);
+        let out_cpu = cpu_be.download(&cpu_be.quantized_matmul(&w_cpu, &i_cpu));
+
+        let w_gpu = metal.upload(&weights);
+        let i_gpu = metal.upload(&input);
+        let out_gpu = metal.download(&metal.quantized_matmul(&w_gpu, &i_gpu));
+
+        assert_eq!(out_cpu.shape(), &[1, 1]);
+        assert_eq!(out_gpu.shape(), &[1, 1]);
+        assert_vecs_close(
+            out_gpu.as_f32(),
+            out_cpu.as_f32(),
+            0.1,
+            "quantized_matmul_q4_k",
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q5_k_vs_cpu() {
+        use crate::gguf::quant::{BlockQ5K, f32_to_f16};
+
+        let metal = backend();
+        let cpu_be = cpu();
+
+        // Non-zero qh (tests 5th bit), non-zero dmin, asymmetric nibbles, varied scales
+        let mut qs = [0u8; 128];
+        for i in 0..128 {
+            // Vary: low nibbles 0x0..0xF, high nibbles different
+            qs[i] = ((i as u8).wrapping_mul(3) & 0xF) | (((i as u8).wrapping_mul(7).wrapping_add(5) & 0xF) << 4);
+        }
+        let mut qh = [0u8; 32];
+        // Set alternating high-bit patterns: 0xAA = bits 1,3,5,7 set
+        for i in 0..32 {
+            qh[i] = if i % 2 == 0 { 0xAA } else { 0x55 };
+        }
+        let block = BlockQ5K {
+            d: f32_to_f16(0.5),
+            dmin: f32_to_f16(0.125),
+            scales: [4, 8, 12, 16, 3, 6, 9, 12, 0x31, 0x42, 0x53, 0x64],
+            qh,
+            qs,
+        };
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&block.d.to_le_bytes());
+        raw.extend_from_slice(&block.dmin.to_le_bytes());
+        raw.extend_from_slice(&block.scales);
+        raw.extend_from_slice(&block.qh);
+        raw.extend_from_slice(&block.qs);
+        assert_eq!(raw.len(), 176);
+
+        let weights = Tensor::from_quantized(vec![1, 256], TensorDtype::Q5_K, raw);
+        let input_data: Vec<f32> = (0..256).map(|i| {
+            let x = (i as f32) * 0.03 - 3.84;  // range [-3.84, +3.81]
+            x
+        }).collect();
+        let input = Tensor::new(vec![1, 256], input_data);
+
+        let w_cpu = cpu_be.upload(&weights);
+        let i_cpu = cpu_be.upload(&input);
+        let out_cpu = cpu_be.download(&cpu_be.quantized_matmul(&w_cpu, &i_cpu));
+
+        let w_gpu = metal.upload(&weights);
+        let i_gpu = metal.upload(&input);
+        let out_gpu = metal.download(&metal.quantized_matmul(&w_gpu, &i_gpu));
+
+        assert_eq!(out_cpu.shape(), &[1, 1]);
+        assert_eq!(out_gpu.shape(), &[1, 1]);
+        assert_vecs_close(
+            out_gpu.as_f32(),
+            out_cpu.as_f32(),
+            0.1,
+            "quantized_matmul_q5_k",
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q4_k_multi_row_vs_cpu() {
+        use crate::gguf::quant::{BlockQ4K, f32_to_f16};
+
+        let metal = backend();
+        let cpu_be = cpu();
+
+        // 5 rows x 256 cols — tests N=5 (not multiple of 4, exercises first_row < N guard)
+        let mut raw = Vec::new();
+        for row_idx in 0..5u8 {
+            let mut block = BlockQ4K {
+                d: f32_to_f16(0.5 + row_idx as f32 * 0.2),
+                dmin: f32_to_f16(0.1 * (row_idx + 1) as f32),
+                scales: [0; 12],
+                qs: [0; 128],
+            };
+            for i in 0..128 {
+                block.qs[i] = ((i as u8).wrapping_add(row_idx * 37)) | (((i as u8).wrapping_add(row_idx * 13)) << 4);
+            }
+            for s in 0..8 {
+                block.scales[s] = (s as u8 + 1) * (row_idx + 1);
+            }
+            raw.extend_from_slice(&block.d.to_le_bytes());
+            raw.extend_from_slice(&block.dmin.to_le_bytes());
+            raw.extend_from_slice(&block.scales);
+            raw.extend_from_slice(&block.qs);
+        }
+
+        let weights = Tensor::from_quantized(vec![5, 256], TensorDtype::Q4_K, raw);
+        let input_data: Vec<f32> = (0..256).map(|i| (i as f32) * 0.02 - 2.56).collect();
+        let input = Tensor::new(vec![1, 256], input_data);
+
+        let w_cpu = cpu_be.upload(&weights);
+        let i_cpu = cpu_be.upload(&input);
+        let out_cpu = cpu_be.download(&cpu_be.quantized_matmul(&w_cpu, &i_cpu));
+
+        let w_gpu = metal.upload(&weights);
+        let i_gpu = metal.upload(&input);
+        let out_gpu = metal.download(&metal.quantized_matmul(&w_gpu, &i_gpu));
+
+        assert_eq!(out_cpu.shape(), &[1, 5]);
+        assert_eq!(out_gpu.shape(), &[1, 5]);
+        assert_vecs_close(
+            out_gpu.as_f32(),
+            out_cpu.as_f32(),
+            0.5,
+            "quantized_matmul_q4_k_multi_row",
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q5_k_multi_row_vs_cpu() {
+        use crate::gguf::quant::{BlockQ5K, f32_to_f16};
+
+        let metal = backend();
+        let cpu_be = cpu();
+
+        // 5 rows — tests first_row < N guard with N not a multiple of 4
+        let mut raw = Vec::new();
+        for row_idx in 0..5u8 {
+            let mut qs = [0u8; 128];
+            let mut qh = [0u8; 32];
+            for i in 0..128 {
+                qs[i] = (i as u8).wrapping_add(row_idx * 41);
+            }
+            for i in 0..32 {
+                qh[i] = 0xCC_u8.wrapping_add(row_idx * 17 + i as u8);
+            }
+            let block = BlockQ5K {
+                d: f32_to_f16(0.4 + row_idx as f32 * 0.15),
+                dmin: f32_to_f16(0.05 * (row_idx + 1) as f32),
+                scales: [3, 6, 9, 12, 2, 5, 8, 11, 0x21, 0x43, 0x65, 0x87],
+                qh,
+                qs,
+            };
+            raw.extend_from_slice(&block.d.to_le_bytes());
+            raw.extend_from_slice(&block.dmin.to_le_bytes());
+            raw.extend_from_slice(&block.scales);
+            raw.extend_from_slice(&block.qh);
+            raw.extend_from_slice(&block.qs);
+        }
+
+        let weights = Tensor::from_quantized(vec![5, 256], TensorDtype::Q5_K, raw);
+        let input_data: Vec<f32> = (0..256).map(|i| (i as f32) * 0.025 - 3.2).collect();
+        let input = Tensor::new(vec![1, 256], input_data);
+
+        let w_cpu = cpu_be.upload(&weights);
+        let i_cpu = cpu_be.upload(&input);
+        let out_cpu = cpu_be.download(&cpu_be.quantized_matmul(&w_cpu, &i_cpu));
+
+        let w_gpu = metal.upload(&weights);
+        let i_gpu = metal.upload(&input);
+        let out_gpu = metal.download(&metal.quantized_matmul(&w_gpu, &i_gpu));
+
+        assert_eq!(out_cpu.shape(), &[1, 5]);
+        assert_eq!(out_gpu.shape(), &[1, 5]);
+        assert_vecs_close(
+            out_gpu.as_f32(),
+            out_cpu.as_f32(),
+            0.5,
+            "quantized_matmul_q5_k_multi_row",
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q6_k_vs_cpu() {
+        use crate::gguf::quant::f32_to_f16;
+
+        let metal = backend();
+        let cpu_be = cpu();
+
+        // Non-zero qh (tests high 2 bits), varied ql nibbles, varied scales
+        let mut ql = [0u8; 128];
+        for i in 0..128 {
+            // Asymmetric nibbles: low varies, high varies differently
+            ql[i] = ((i as u8).wrapping_mul(5).wrapping_add(3) & 0xF) | (((i as u8).wrapping_mul(11).wrapping_add(7) & 0xF) << 4);
+        }
+        let mut qh = [0u8; 64];
+        for i in 0..64 {
+            // Varied 2-bit patterns across all 4 shifts (bits 0-1, 2-3, 4-5, 6-7)
+            qh[i] = (i as u8).wrapping_mul(0x37).wrapping_add(0x29);
+        }
+        let scales: [i8; 16] = [3, -2, 5, -4, 7, -1, 6, -3, 2, -5, 4, -6, 8, -7, 1, -8];
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&ql);
+        raw.extend_from_slice(&qh);
+        raw.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(scales.as_ptr() as *const u8, 16)
+        });
+        raw.extend_from_slice(&f32_to_f16(0.6).to_le_bytes());
+        assert_eq!(raw.len(), 210);
+
+        let weights = Tensor::from_quantized(vec![1, 256], TensorDtype::Q6_K, raw);
+        let input_data: Vec<f32> = (0..256).map(|i| (i as f32) * 0.025 - 3.2).collect();
+        let input = Tensor::new(vec![1, 256], input_data);
+
+        let w_cpu = cpu_be.upload(&weights);
+        let i_cpu = cpu_be.upload(&input);
+        let out_cpu = cpu_be.download(&cpu_be.quantized_matmul(&w_cpu, &i_cpu));
+
+        let w_gpu = metal.upload(&weights);
+        let i_gpu = metal.upload(&input);
+        let out_gpu = metal.download(&metal.quantized_matmul(&w_gpu, &i_gpu));
+
+        assert_eq!(out_cpu.shape(), &[1, 1]);
+        assert_eq!(out_gpu.shape(), &[1, 1]);
+        assert_vecs_close(
+            out_gpu.as_f32(),
+            out_cpu.as_f32(),
+            0.1,
+            "quantized_matmul_q6_k",
+        );
+    }
+
+    #[test]
+    fn test_quantized_matmul_q6_k_multi_row_vs_cpu() {
+        use crate::gguf::quant::f32_to_f16;
+
+        let metal = backend();
+        let cpu_be = cpu();
+
+        // 5 rows — tests first_row < N guard with N not a multiple of 4
+        let mut raw = Vec::new();
+        for row_idx in 0..5u8 {
+            let mut ql = [0u8; 128];
+            let mut qh = [0u8; 64];
+            for i in 0..128 { ql[i] = (i as u8).wrapping_add(row_idx * 53); }
+            for i in 0..64 { qh[i] = (i as u8).wrapping_mul(0x2B).wrapping_add(row_idx * 19); }
+            let scales: [i8; 16] = [
+                (row_idx as i8 + 1), -(row_idx as i8 + 2), (row_idx as i8 + 3), -(row_idx as i8 + 1),
+                (row_idx as i8 + 4), -(row_idx as i8 + 3), (row_idx as i8 + 2), -(row_idx as i8 + 4),
+                (row_idx as i8 + 5), -(row_idx as i8 + 1), (row_idx as i8 + 6), -(row_idx as i8 + 2),
+                (row_idx as i8 + 7), -(row_idx as i8 + 5), (row_idx as i8 + 3), -(row_idx as i8 + 6),
+            ];
+            raw.extend_from_slice(&ql);
+            raw.extend_from_slice(&qh);
+            raw.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(scales.as_ptr() as *const u8, 16)
+            });
+            raw.extend_from_slice(&f32_to_f16(0.5 + row_idx as f32 * 0.1).to_le_bytes());
+        }
+
+        let weights = Tensor::from_quantized(vec![5, 256], TensorDtype::Q6_K, raw);
+        let input_data: Vec<f32> = (0..256).map(|i| (i as f32) * 0.025 - 3.2).collect();
+        let input = Tensor::new(vec![1, 256], input_data);
+
+        let w_cpu = cpu_be.upload(&weights);
+        let i_cpu = cpu_be.upload(&input);
+        let out_cpu = cpu_be.download(&cpu_be.quantized_matmul(&w_cpu, &i_cpu));
+
+        let w_gpu = metal.upload(&weights);
+        let i_gpu = metal.upload(&input);
+        let out_gpu = metal.download(&metal.quantized_matmul(&w_gpu, &i_gpu));
+
+        assert_eq!(out_cpu.shape(), &[1, 5]);
+        assert_eq!(out_gpu.shape(), &[1, 5]);
+        assert_vecs_close(
+            out_gpu.as_f32(),
+            out_cpu.as_f32(),
+            0.5,
+            "quantized_matmul_q6_k_multi_row",
+        );
     }
 
     #[test]
