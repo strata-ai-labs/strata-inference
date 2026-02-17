@@ -15,6 +15,9 @@ pub enum ModelArch {
     Bert,
     GPT2,
     Qwen3,
+    Mistral3,
+    Phi2,
+    Phi3,
 }
 
 /// Normalization type used by the model.
@@ -121,6 +124,9 @@ impl ModelConfig {
             "gpt2" => (ModelArch::GPT2, "gpt2"),
             "qwen3" => (ModelArch::Qwen3, "qwen3"),
             "gemma-embedding" => (ModelArch::GemmaEmbedding, "gemma-embedding"),
+            "mistral3" => (ModelArch::Mistral3, "mistral3"),
+            "phi2" => (ModelArch::Phi2, "phi2"),
+            "phi3" => (ModelArch::Phi3, "phi3"),
             other => {
                 return Err(InferenceError::UnsupportedArchitecture(other.to_string()));
             }
@@ -274,6 +280,39 @@ impl ModelConfig {
                     true,  // default causal (autoregressive)
                     true,  // pre_norm (norm BEFORE sublayers)
                     false, // rope_neox (no RoPE, uses learned positions)
+                ),
+                ModelArch::Mistral3 => (
+                    NormType::RMSNorm,
+                    Activation::SwiGLU,
+                    PositionType::RoPE,
+                    true,  // has_ffn_gate
+                    true,  // has_bias (optional, loaded via load_tensor_optional)
+                    1.0,   // embedding_scale
+                    true,  // default causal
+                    true,  // pre_norm
+                    false, // rope_neox (Mistral3 uses standard/NORM RoPE, like LLaMA)
+                ),
+                ModelArch::Phi2 => (
+                    NormType::LayerNorm,
+                    Activation::GELU,
+                    PositionType::RoPE,
+                    false, // has_ffn_gate (no SwiGLU gate)
+                    true,  // has_bias (all projections have bias)
+                    1.0,   // embedding_scale
+                    true,  // default causal
+                    true,  // pre_norm
+                    true,  // rope_neox (Phi2 uses NeoX-style RoPE)
+                ),
+                ModelArch::Phi3 => (
+                    NormType::RMSNorm,
+                    Activation::SwiGLU,
+                    PositionType::RoPE,
+                    true,  // has_ffn_gate
+                    true,  // has_bias (optional, loaded via load_tensor_optional)
+                    1.0,   // embedding_scale
+                    true,  // default causal
+                    true,  // pre_norm
+                    true,  // rope_neox (Phi3 uses NeoX-style RoPE)
                 ),
             };
 
@@ -1225,6 +1264,109 @@ mod tests {
         assert!(config.pre_norm);
         assert_eq!(config.pooling_type, PoolingType::Mean);
         assert!((config.embedding_scale - (768.0f32).sqrt()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_mistral3_config() {
+        let kv = vec![
+            ("general.architecture", kv_string("mistral3")),
+            ("mistral3.embedding_length", kv_u32(3072)),
+            ("mistral3.block_count", kv_u32(24)),
+            ("mistral3.attention.head_count", kv_u32(24)),
+            ("mistral3.attention.head_count_kv", kv_u32(8)),
+            ("mistral3.feed_forward_length", kv_u32(8192)),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let config = ModelConfig::from_gguf(&gguf).unwrap();
+
+        assert_eq!(config.arch, ModelArch::Mistral3);
+        assert_eq!(config.arch_name, "mistral3");
+        assert_eq!(config.hidden_size, 3072);
+        assert_eq!(config.num_layers, 24);
+        assert_eq!(config.num_heads, 24);
+        assert_eq!(config.num_kv_heads, 8);
+        assert_eq!(config.head_dim, 128); // 3072 / 24
+        assert_eq!(config.ffn_hidden, 8192);
+
+        // Mistral3 defaults
+        assert_eq!(config.norm_type, NormType::RMSNorm);
+        assert_eq!(config.activation, Activation::SwiGLU);
+        assert_eq!(config.position_type, PositionType::RoPE);
+        assert!(config.has_ffn_gate);
+        assert!(config.has_bias);
+        assert!(config.causal);
+        assert!(config.pre_norm);
+        assert!(!config.rope_neox); // Mistral3 uses standard/NORM RoPE (like LLaMA)
+        assert!((config.embedding_scale - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_phi2_config() {
+        let kv = vec![
+            ("general.architecture", kv_string("phi2")),
+            ("phi2.embedding_length", kv_u32(2560)),
+            ("phi2.block_count", kv_u32(32)),
+            ("phi2.attention.head_count", kv_u32(32)),
+            ("phi2.feed_forward_length", kv_u32(10240)),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let config = ModelConfig::from_gguf(&gguf).unwrap();
+
+        assert_eq!(config.arch, ModelArch::Phi2);
+        assert_eq!(config.arch_name, "phi2");
+        assert_eq!(config.hidden_size, 2560);
+        assert_eq!(config.num_layers, 32);
+        assert_eq!(config.num_heads, 32);
+        assert_eq!(config.head_dim, 80); // 2560 / 32
+        assert_eq!(config.ffn_hidden, 10240);
+
+        // Phi2 defaults
+        assert_eq!(config.norm_type, NormType::LayerNorm);
+        assert_eq!(config.activation, Activation::GELU);
+        assert_eq!(config.position_type, PositionType::RoPE);
+        assert!(!config.has_ffn_gate);
+        assert!(config.has_bias);
+        assert!(config.causal);
+        assert!(config.pre_norm);
+        assert!(config.rope_neox); // Phi2 uses NeoX-style RoPE
+        assert!((config.embedding_scale - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_phi3_config() {
+        let kv = vec![
+            ("general.architecture", kv_string("phi3")),
+            ("phi3.embedding_length", kv_u32(3072)),
+            ("phi3.block_count", kv_u32(32)),
+            ("phi3.attention.head_count", kv_u32(32)),
+            ("phi3.attention.head_count_kv", kv_u32(8)),
+            ("phi3.feed_forward_length", kv_u32(8192)),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let config = ModelConfig::from_gguf(&gguf).unwrap();
+
+        assert_eq!(config.arch, ModelArch::Phi3);
+        assert_eq!(config.arch_name, "phi3");
+        assert_eq!(config.hidden_size, 3072);
+        assert_eq!(config.num_layers, 32);
+        assert_eq!(config.num_heads, 32);
+        assert_eq!(config.num_kv_heads, 8);
+        assert_eq!(config.head_dim, 96); // 3072 / 32
+        assert_eq!(config.ffn_hidden, 8192);
+
+        // Phi3 defaults
+        assert_eq!(config.norm_type, NormType::RMSNorm);
+        assert_eq!(config.activation, Activation::SwiGLU);
+        assert_eq!(config.position_type, PositionType::RoPE);
+        assert!(config.has_ffn_gate);
+        assert!(config.has_bias);
+        assert!(config.causal);
+        assert!(config.pre_norm);
+        assert!(config.rope_neox);
+        assert!((config.embedding_scale - 1.0).abs() < 1e-6);
     }
 
     #[test]
