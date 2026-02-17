@@ -184,7 +184,11 @@ impl GenerationEngine {
         }
 
         let mut rng = XorShiftRng::new(gen_config.sampling.seed.unwrap_or(42));
-        let mut cache = KvCache::new(&self.config);
+        let mut cache = if self.backend.is_gpu() {
+            KvCache::new_gpu(&self.config, self.backend.as_ref())
+        } else {
+            KvCache::new(&self.config)
+        };
         let mut generated_ids: Vec<u32> = Vec::new();
 
         // Collect all stop tokens (explicit + EOS)
@@ -300,7 +304,11 @@ impl GenerationEngine {
         }
 
         let mut rng = XorShiftRng::new(gen_config.sampling.seed.unwrap_or(42));
-        let mut cache = KvCache::new(&self.config);
+        let mut cache = if self.backend.is_gpu() {
+            KvCache::new_gpu(&self.config, self.backend.as_ref())
+        } else {
+            KvCache::new(&self.config)
+        };
         let mut generated_ids: Vec<u32> = Vec::new();
 
         let mut stop_tokens = gen_config.stop_tokens.clone();
@@ -369,24 +377,35 @@ impl GenerationEngine {
     ///
     /// Uses `output_projection` weight if available, otherwise falls back to
     /// tied embeddings (`token_embedding`).
+    ///
+    /// For single-row tensors (decode), skips the download/upload roundtrip
+    /// since hidden is already `[1, hidden_size]` on the device.
     fn project_to_logits(&self, hidden: &DeviceTensor, row: usize) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
-        let hidden_host = self.backend.download(hidden);
-        let hidden_data = hidden_host.as_f32();
-        let start = row * hidden_size;
-        let row_data = &hidden_data[start..start + hidden_size];
-
-        let row_tensor = self.backend.upload(
-            &Tensor::new(vec![1, hidden_size], row_data.to_vec()),
-        );
+        let n_rows = hidden.shape()[0];
 
         // Use output_projection if available, otherwise tied embeddings
         let proj_weight = self.weights.output_projection.as_ref()
             .unwrap_or(&self.weights.token_embedding);
 
-        let logits_tensor = linear_forward(&row_tensor, proj_weight, None, self.backend.as_ref());
-        let logits_host = self.backend.download(&logits_tensor);
-        logits_host.as_f32().to_vec()
+        if n_rows == 1 {
+            // Decode: hidden is already [1, hidden_size] — use directly, no roundtrip
+            let logits_tensor = linear_forward(hidden, proj_weight, None, self.backend.as_ref());
+            let logits_host = self.backend.download(&logits_tensor);
+            logits_host.as_f32().to_vec()
+        } else {
+            // Prefill: extract the requested row via CPU
+            let hidden_host = self.backend.download(hidden);
+            let hidden_data = hidden_host.as_f32();
+            let start = row * hidden_size;
+            let row_data = &hidden_data[start..start + hidden_size];
+            let row_tensor = self.backend.upload(
+                &Tensor::new(vec![1, hidden_size], row_data.to_vec()),
+            );
+            let logits_tensor = linear_forward(&row_tensor, proj_weight, None, self.backend.as_ref());
+            let logits_host = self.backend.download(&logits_tensor);
+            logits_host.as_f32().to_vec()
+        }
     }
 
     /// The model configuration.

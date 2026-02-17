@@ -2,8 +2,14 @@
 //
 // Stores cached K and V projections for each layer, enabling efficient
 // single-token decode steps without recomputing past K/V values.
+//
+// Supports two storage modes:
+// - CPU-resident (Vec<f32>) — used with CpuBackend
+// - GPU-resident (DeviceTensor) — used with Metal/CUDA for zero-copy attention
 
+use crate::backend::{ComputeBackend, DeviceTensor};
 use crate::error::InferenceError;
+use crate::tensor::Tensor;
 use super::config::ModelConfig;
 
 /// Per-layer KV cache for autoregressive generation.
@@ -11,11 +17,19 @@ use super::config::ModelConfig;
 /// Pre-allocates buffers for `max_seq_len` positions across all layers.
 /// During generation, new K/V values are appended after each forward step,
 /// and the full cached K/V is read for attention computation.
+///
+/// When created with `new_gpu()`, buffers live on the GPU device and attention
+/// can be computed without any CPU-GPU data transfers.
 pub struct KvCache {
     /// Per-layer K cache: each Vec has capacity for max_seq_len * kv_dim.
     k_cache: Vec<Vec<f32>>,
     /// Per-layer V cache: each Vec has capacity for max_seq_len * kv_dim.
     v_cache: Vec<Vec<f32>>,
+    /// GPU K cache buffers: pre-allocated [max_seq_len, kv_dim] per layer.
+    /// `None` for CPU-only mode.
+    k_gpu: Option<Vec<DeviceTensor>>,
+    /// GPU V cache buffers: pre-allocated [max_seq_len, kv_dim] per layer.
+    v_gpu: Option<Vec<DeviceTensor>>,
     /// Number of positions filled so far (same across all layers).
     pos: usize,
     /// Maximum sequence length this cache supports.
@@ -27,7 +41,7 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    /// Create a new KV cache pre-allocated for the given model configuration.
+    /// Create a new CPU-resident KV cache pre-allocated for the given model configuration.
     pub fn new(config: &ModelConfig) -> Self {
         let kv_dim = config.num_kv_heads * config.head_dim;
         let num_layers = config.num_layers;
@@ -40,6 +54,8 @@ impl KvCache {
         Self {
             k_cache,
             v_cache,
+            k_gpu: None,
+            v_gpu: None,
             pos: 0,
             max_seq_len,
             kv_dim,
@@ -47,7 +63,48 @@ impl KvCache {
         }
     }
 
-    /// Append new K/V values for a single layer.
+    /// Create a GPU-resident KV cache with pre-allocated device buffers.
+    ///
+    /// Each layer gets a `[max_seq_len, kv_dim]` buffer for K and V.
+    /// CPU vecs are still maintained as a fallback for prefill.
+    pub fn new_gpu(config: &ModelConfig, backend: &dyn ComputeBackend) -> Self {
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let num_layers = config.num_layers;
+        let max_seq_len = config.max_seq_len;
+        let capacity = max_seq_len * kv_dim;
+
+        let k_cache: Vec<Vec<f32>> = (0..num_layers).map(|_| Vec::with_capacity(capacity)).collect();
+        let v_cache: Vec<Vec<f32>> = (0..num_layers).map(|_| Vec::with_capacity(capacity)).collect();
+
+        // Pre-allocate GPU buffers (zero-filled)
+        let zeros = vec![0.0f32; max_seq_len * kv_dim];
+        let zero_tensor = Tensor::new(vec![max_seq_len, kv_dim], zeros);
+
+        let k_gpu: Vec<DeviceTensor> = (0..num_layers)
+            .map(|_| backend.upload(&zero_tensor))
+            .collect();
+        let v_gpu: Vec<DeviceTensor> = (0..num_layers)
+            .map(|_| backend.upload(&zero_tensor))
+            .collect();
+
+        Self {
+            k_cache,
+            v_cache,
+            k_gpu: Some(k_gpu),
+            v_gpu: Some(v_gpu),
+            pos: 0,
+            max_seq_len,
+            kv_dim,
+            num_layers,
+        }
+    }
+
+    /// Whether this cache has GPU-resident buffers.
+    pub fn is_gpu(&self) -> bool {
+        self.k_gpu.is_some()
+    }
+
+    /// Append new K/V values for a single layer (CPU path).
     ///
     /// `k_new` and `v_new` should each contain `n_tokens * kv_dim` elements.
     pub fn append(
@@ -79,6 +136,53 @@ impl KvCache {
         self.k_cache[layer].extend_from_slice(k_new);
         self.v_cache[layer].extend_from_slice(v_new);
         Ok(())
+    }
+
+    /// Append new K/V device tensors to GPU cache for a single layer.
+    ///
+    /// `k_new` and `v_new` should be `[n_tokens, kv_dim]` on the GPU.
+    /// Uses `backend.copy_rows_into()` to write into the pre-allocated buffers.
+    pub fn append_gpu(
+        &mut self,
+        layer: usize,
+        k_new: &DeviceTensor,
+        v_new: &DeviceTensor,
+        n_tokens: usize,
+        backend: &dyn ComputeBackend,
+    ) -> Result<(), InferenceError> {
+        if layer >= self.num_layers {
+            return Err(InferenceError::Generation(format!(
+                "KV cache layer index {} out of bounds (num_layers={})",
+                layer, self.num_layers
+            )));
+        }
+        if self.pos + n_tokens > self.max_seq_len {
+            return Err(InferenceError::Generation(format!(
+                "KV cache overflow: pos={} + n_tokens={} > max_seq_len={}",
+                self.pos, n_tokens, self.max_seq_len
+            )));
+        }
+
+        let k_bufs = self.k_gpu.as_ref().expect("append_gpu requires GPU KV cache");
+        let v_bufs = self.v_gpu.as_ref().expect("append_gpu requires GPU KV cache");
+
+        backend.copy_rows_into(&k_bufs[layer], k_new, self.pos);
+        backend.copy_rows_into(&v_bufs[layer], v_new, self.pos);
+
+        Ok(())
+    }
+
+    /// Get the GPU K cache buffer for a layer.
+    ///
+    /// The returned tensor is `[max_seq_len, kv_dim]` — the caller must
+    /// only read the first `self.len() + n_new` rows.
+    pub fn get_k_gpu(&self, layer: usize) -> &DeviceTensor {
+        &self.k_gpu.as_ref().expect("get_k_gpu requires GPU KV cache")[layer]
+    }
+
+    /// Get the GPU V cache buffer for a layer.
+    pub fn get_v_gpu(&self, layer: usize) -> &DeviceTensor {
+        &self.v_gpu.as_ref().expect("get_v_gpu requires GPU KV cache")[layer]
     }
 
     /// Read cached K values for a layer.
@@ -125,6 +229,7 @@ impl KvCache {
         for v in &mut self.v_cache {
             v.clear();
         }
+        // GPU buffers don't need clearing — we track via `pos` how much is valid
     }
 
     /// The KV dimension (num_kv_heads * head_dim).
@@ -187,6 +292,7 @@ mod tests {
         assert_eq!(cache.kv_dim(), 8); // 2 heads * 4 dim
         assert_eq!(cache.num_layers(), 2);
         assert_eq!(cache.max_seq_len(), 64);
+        assert!(!cache.is_gpu());
     }
 
     #[test]

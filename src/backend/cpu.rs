@@ -1182,6 +1182,108 @@ impl ComputeBackend for CpuBackend {
             DeviceTensor::new(Tensor::new(k_shape.to_vec(), k_rot)),
         )
     }
+
+    fn copy_rows_into(
+        &self,
+        dest: &DeviceTensor,
+        src: &DeviceTensor,
+        dest_row_offset: usize,
+    ) {
+        let dest_data = dest.as_tensor().as_f32();
+        let src_data = src.as_tensor().as_f32();
+        let cols = dest.shape().last().copied().unwrap_or(0);
+        let n_rows = src.shape()[0];
+
+        let mut result = dest_data.to_vec();
+        let byte_offset = dest_row_offset * cols;
+        let copy_len = n_rows * cols;
+        result[byte_offset..byte_offset + copy_len].copy_from_slice(&src_data[..copy_len]);
+
+        // Mutate in place by replacing storage (CPU tensors are cheap)
+        // Since DeviceTensor is immutable, we can't truly mutate —
+        // but KvCache will handle the indirection.
+        // For CPU this is a no-op pattern; the caller keeps the new data.
+        // Actually: this doesn't work with immutable DeviceTensor.
+        // We need a different approach for CPU: just let KvCache hold the data.
+        // This method is primarily useful for GPU backends.
+        // For CPU, the KvCache will keep using Vec<f32> storage.
+        panic!("copy_rows_into is only used with GPU KV cache; CPU uses Vec<f32> directly");
+    }
+
+    fn grouped_attention_decode(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        total_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        attn_scale: f32,
+        softcap: f32,
+    ) -> DeviceTensor {
+        let q_data = q.as_tensor().as_f32();
+        let k_data = k.as_tensor().as_f32();
+        let v_data = v.as_tensor().as_f32();
+        let kv_dim = num_kv_heads * head_dim;
+        let total_dim = num_heads * head_dim;
+        let heads_per_kv = num_heads / num_kv_heads;
+
+        let mut output = vec![0.0f32; total_dim];
+
+        for h in 0..num_heads {
+            let kv_head = h / heads_per_kv;
+            let q_offset = h * head_dim;
+
+            // Compute attention scores: dot(q_head, k[j, kv_head]) * scale
+            let mut scores = vec![0.0f32; total_len];
+            let mut max_score = f32::NEG_INFINITY;
+
+            for j in 0..total_len {
+                let k_offset = j * kv_dim + kv_head * head_dim;
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q_data[q_offset + d] * k_data[k_offset + d];
+                }
+                let mut score = dot * attn_scale;
+
+                // Softcap
+                if softcap > 0.0 {
+                    score = softcap * (score / softcap).tanh();
+                }
+
+                scores[j] = score;
+                if score > max_score {
+                    max_score = score;
+                }
+            }
+
+            // Softmax
+            let mut sum_exp = 0.0f32;
+            for j in 0..total_len {
+                scores[j] = (scores[j] - max_score).exp();
+                sum_exp += scores[j];
+            }
+            if sum_exp > 0.0 {
+                let inv_sum = 1.0 / sum_exp;
+                for j in 0..total_len {
+                    scores[j] *= inv_sum;
+                }
+            }
+
+            // Weighted sum of V
+            for d in 0..head_dim {
+                let mut val = 0.0f32;
+                for j in 0..total_len {
+                    let v_offset = j * kv_dim + kv_head * head_dim;
+                    val += scores[j] * v_data[v_offset + d];
+                }
+                output[q_offset + d] = val;
+            }
+        }
+
+        DeviceTensor::new(Tensor::new(vec![1, total_dim], output))
+    }
 }
 
 #[cfg(test)]
@@ -3079,5 +3181,154 @@ mod tests {
         let dt = backend.upload(&t);
         let result = backend.download(&dt);
         assert_eq!(result.as_f32(), &[1.0, 2.0, 3.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // grouped_attention_decode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_grouped_attention_decode_basic() {
+        // Simple MHA: 2 heads, 2 KV heads, head_dim=2, total_len=3
+        let b = backend();
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 2;
+        let total_len = 3;
+
+        // Q: [1, 4] (2 heads * 2 dim)
+        let q = dt(Tensor::new(vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]));
+        // K: [3, 4], V: [3, 4]
+        let k = dt(Tensor::new(vec![3, 4], vec![
+            1.0, 0.0, 0.0, 1.0,   // pos 0
+            0.0, 1.0, 1.0, 0.0,   // pos 1
+            1.0, 1.0, 1.0, 1.0,   // pos 2
+        ]));
+        let v = dt(Tensor::new(vec![3, 4], vec![
+            1.0, 0.0, 0.0, 1.0,
+            0.0, 1.0, 1.0, 0.0,
+            0.5, 0.5, 0.5, 0.5,
+        ]));
+
+        let result = b.grouped_attention_decode(
+            &q, &k, &v, total_len, num_heads, num_kv_heads, head_dim,
+            1.0 / (head_dim as f32).sqrt(), 0.0,
+        );
+
+        assert_eq!(result.shape(), &[1, 4]);
+        let out = b.download(&result).as_f32().to_vec();
+        // Just verify shape and finite values
+        assert_eq!(out.len(), 4);
+        for &val in &out {
+            assert!(val.is_finite(), "output contains non-finite value: {}", val);
+        }
+    }
+
+    #[test]
+    fn test_grouped_attention_decode_gqa() {
+        // GQA: 4 Q heads, 2 KV heads, head_dim=2, total_len=2
+        let b = backend();
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 2;
+        let total_len = 2;
+
+        // Q: [1, 8] (4 heads * 2 dim)
+        let q = dt(Tensor::new(vec![1, 8], vec![
+            1.0, 0.0,  // head 0 (maps to kv_head 0)
+            0.0, 1.0,  // head 1 (maps to kv_head 0)
+            1.0, 1.0,  // head 2 (maps to kv_head 1)
+            -1.0, 0.0, // head 3 (maps to kv_head 1)
+        ]));
+        // K: [2, 4] (2 kv_heads * 2 dim)
+        let k = dt(Tensor::new(vec![2, 4], vec![
+            1.0, 0.0, 0.0, 1.0,
+            0.0, 1.0, 1.0, 0.0,
+        ]));
+        // V: [2, 4]
+        let v = dt(Tensor::new(vec![2, 4], vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+        ]));
+
+        let result = b.grouped_attention_decode(
+            &q, &k, &v, total_len, num_heads, num_kv_heads, head_dim,
+            1.0 / (head_dim as f32).sqrt(), 0.0,
+        );
+
+        assert_eq!(result.shape(), &[1, 8]);
+        let out = b.download(&result).as_f32().to_vec();
+        assert_eq!(out.len(), 8);
+        for &val in &out {
+            assert!(val.is_finite(), "output contains non-finite value: {}", val);
+        }
+
+        // Heads 0 and 1 share kv_head 0, heads 2 and 3 share kv_head 1
+        // Probabilities should sum to 1 per head (softmax property)
+        // Head 0 (q=[1,0]) with K kv_head 0: scores are [1*1+0*0, 1*0+0*1]=[1,0]
+        // After softmax with scale 1/sqrt(2): should attend more to pos 0
+    }
+
+    #[test]
+    fn test_grouped_attention_decode_softcap() {
+        // Test softcap: should limit attention scores
+        let b = backend();
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let head_dim = 2;
+        let total_len = 2;
+
+        // Large Q to produce large dot products
+        let q = dt(Tensor::new(vec![1, 2], vec![10.0, 10.0]));
+        let k = dt(Tensor::new(vec![2, 2], vec![
+            10.0, 10.0,
+            -10.0, -10.0,
+        ]));
+        let v = dt(Tensor::new(vec![2, 2], vec![
+            1.0, 0.0,
+            0.0, 1.0,
+        ]));
+
+        // Without softcap
+        let result_no_cap = b.grouped_attention_decode(
+            &q, &k, &v, total_len, num_heads, num_kv_heads, head_dim,
+            1.0, 0.0,
+        );
+        let out_no_cap = b.download(&result_no_cap).as_f32().to_vec();
+
+        // With softcap=1.0 (aggressive capping)
+        let result_cap = b.grouped_attention_decode(
+            &q, &k, &v, total_len, num_heads, num_kv_heads, head_dim,
+            1.0, 1.0,
+        );
+        let out_cap = b.download(&result_cap).as_f32().to_vec();
+
+        // With softcap, the distribution should be more uniform
+        // (scores are capped so the gap between pos 0 and pos 1 is smaller)
+        let diff_no_cap = (out_no_cap[0] - out_no_cap[1]).abs();
+        let diff_cap = (out_cap[0] - out_cap[1]).abs();
+        assert!(
+            diff_cap < diff_no_cap,
+            "Softcap should make output more uniform: diff_no_cap={}, diff_cap={}",
+            diff_no_cap, diff_cap
+        );
+    }
+
+    #[test]
+    fn test_grouped_attention_decode_single_token() {
+        // With total_len=1, softmax gives probability 1.0 to the only position
+        let b = backend();
+        let q = dt(Tensor::new(vec![1, 4], vec![1.0, 2.0, 3.0, 4.0]));
+        let k = dt(Tensor::new(vec![1, 4], vec![0.5, 0.5, 0.5, 0.5]));
+        let v = dt(Tensor::new(vec![1, 4], vec![10.0, 20.0, 30.0, 40.0]));
+
+        let result = b.grouped_attention_decode(
+            &q, &k, &v, 1, 2, 2, 2,
+            1.0 / (2.0f32).sqrt(), 0.0,
+        );
+
+        let out = b.download(&result).as_f32().to_vec();
+        // With a single position, output should equal V (softmax = 1.0)
+        assert_close(&out, &[10.0, 20.0, 30.0, 40.0], 1e-5, "single token attention");
     }
 }

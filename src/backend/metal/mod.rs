@@ -96,6 +96,8 @@ pub struct MetalBackend {
     pso_tanh_kernel: Id,
     pso_l2_normalize: Id,
     pso_embedding_lookup: Id,
+    pso_grouped_attn_decode: Id,
+    pso_copy_buffer: Id,
     /// Active command buffer and compute encoder for deferred dispatch.
     /// `None` means no open command buffer; dispatches create one lazily.
     active_cmd: Mutex<Option<(Id, Id)>>,
@@ -137,6 +139,8 @@ impl Drop for MetalBackend {
                 self.pso_tanh_kernel,
                 self.pso_l2_normalize,
                 self.pso_embedding_lookup,
+                self.pso_grouped_attn_decode,
+                self.pso_copy_buffer,
             ] {
                 if pso != NIL {
                     msg_send_void(pso, rel);
@@ -225,9 +229,11 @@ impl MetalBackend {
                 "tanh_kernel",
                 "l2_normalize",
                 "embedding_lookup",
+                "grouped_attn_decode",
+                "copy_buffer",
             ];
 
-            let mut psos = [NIL; 22];
+            let mut psos = [NIL; 24];
             for (i, name) in kernel_names.iter().enumerate() {
                 let ns_name = ns_string(name);
                 let func =
@@ -277,7 +283,7 @@ impl MetalBackend {
 
             msg_send_void(library, sels.release);
 
-            debug!("MetalBackend initialized with 22 PSOs");
+            debug!("MetalBackend initialized with 24 PSOs");
 
             Ok(Self {
                 device,
@@ -305,6 +311,8 @@ impl MetalBackend {
                 pso_tanh_kernel: psos[19],
                 pso_l2_normalize: psos[20],
                 pso_embedding_lookup: psos[21],
+                pso_grouped_attn_decode: psos[22],
+                pso_copy_buffer: psos[23],
                 active_cmd: Mutex::new(None),
             })
         }
@@ -606,6 +614,15 @@ impl MetalBackend {
 // ---------------------------------------------------------------------------
 
 impl ComputeBackend for MetalBackend {
+    fn is_gpu(&self) -> bool {
+        // Disabled: GPU KV cache + attention decode kernel produces correct
+        // results, but copy_rows_into requires flush() (CPU stall) which makes
+        // the GPU path slower than the CPU per-head attention loop.
+        // Re-enable after implementing async GPU buffer copies (blit encoder
+        // or dedicated copy command buffer).
+        false
+    }
+
     fn upload(&self, tensor: &Tensor) -> DeviceTensor {
         let shape = tensor.shape().to_vec();
         let dtype = tensor.dtype();
@@ -790,6 +807,44 @@ impl ComputeBackend for MetalBackend {
             let out_buf = self.create_buffer_empty(out_bytes);
             let weight_buf_id = Self::buf_id(weights);
 
+            // Fast path: M=1 with GPU-resident input — bind the buffer directly,
+            // no flush or copy needed. The quantized kernels expect a flat f32
+            // input vector, which is exactly what a [1, K] GPU tensor is.
+            if m == 1 && input.gpu_inner::<MetalBuffer>().is_some() {
+                let input_buf_id = Self::buf_id(input);
+                match dtype {
+                    TensorDtype::Q8_0 => {
+                        let enc = self.ensure_encoder(self.pso_quantized_matmul_q8_0);
+                        self.set_buffer(enc, weight_buf_id, 0);
+                        self.set_buffer(enc, input_buf_id, 1);
+                        self.set_buffer(enc, out_buf.buffer, 2);
+                        self.set_u32(enc, n as u32, 3);
+                        self.set_u32(enc, k as u32, 4);
+                        let threadgroups = (n + 7) / 8;
+                        msg_send_dispatch(
+                            enc, self.sels.dispatch_threadgroups,
+                            threadgroups, 1, 1, 128, 1, 1,
+                        );
+                    }
+                    TensorDtype::Q4_0 => {
+                        let enc = self.ensure_encoder(self.pso_quantized_matmul_q4_0);
+                        self.set_buffer(enc, weight_buf_id, 0);
+                        self.set_buffer(enc, input_buf_id, 1);
+                        self.set_buffer(enc, out_buf.buffer, 2);
+                        self.set_u32(enc, n as u32, 3);
+                        self.set_u32(enc, k as u32, 4);
+                        let threadgroups = (n + 7) / 8;
+                        msg_send_dispatch(
+                            enc, self.sels.dispatch_threadgroups,
+                            threadgroups, 1, 1, 64, 1, 1,
+                        );
+                    }
+                    _ => unreachable!("handled by fallback above"),
+                }
+                return Self::wrap(out_buf, vec![1, n], TensorDtype::F32);
+            }
+
+            // General path: per-row dispatch
             for row in 0..m {
                 let input_row_data = if let Some(tensor) = input.try_as_tensor() {
                     let f32_data = tensor.as_f32();
@@ -1261,6 +1316,82 @@ impl ComputeBackend for MetalBackend {
         let k_out =
             unsafe { self.dispatch_rope(self.pso_rope_neox, k, pos_offset, freq_base, head_dim, rope_dim) };
         (q_out, k_out)
+    }
+
+    fn copy_rows_into(
+        &self,
+        dest: &DeviceTensor,
+        src: &DeviceTensor,
+        dest_row_offset: usize,
+    ) {
+        let cols = dest.shape().last().copied().unwrap_or(0);
+        let n_rows = src.shape()[0];
+        let byte_offset = dest_row_offset * cols * std::mem::size_of::<f32>();
+        let copy_bytes = n_rows * cols * std::mem::size_of::<f32>();
+
+        if copy_bytes == 0 {
+            return;
+        }
+
+        unsafe {
+            // Flush pending compute work so src data is available in shared memory
+            self.flush();
+
+            let dest_buf = Self::buf_id(dest);
+            let src_buf = Self::buf_id(src);
+
+            // memcpy on shared-mode buffers (CPU-accessible).
+            let dest_ptr = msg_send_ptr(dest_buf, self.sels.contents) as *mut u8;
+            let src_ptr = msg_send_ptr(src_buf, self.sels.contents) as *const u8;
+
+            std::ptr::copy_nonoverlapping(
+                src_ptr,
+                dest_ptr.add(byte_offset),
+                copy_bytes,
+            );
+        }
+    }
+
+    fn grouped_attention_decode(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        total_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        attn_scale: f32,
+        softcap: f32,
+    ) -> DeviceTensor {
+        let total_dim = num_heads * head_dim;
+        let out_bytes = total_dim * std::mem::size_of::<f32>();
+
+        unsafe {
+            let out_buf = self.create_buffer_empty(out_bytes);
+            let enc = self.ensure_encoder(self.pso_grouped_attn_decode);
+
+            self.set_buffer(enc, Self::buf_id(q), 0);
+            self.set_buffer(enc, Self::buf_id(k), 1);
+            self.set_buffer(enc, Self::buf_id(v), 2);
+            self.set_buffer(enc, out_buf.buffer, 3);
+            self.set_u32(enc, num_heads as u32, 4);
+            self.set_u32(enc, num_kv_heads as u32, 5);
+            self.set_u32(enc, head_dim as u32, 6);
+            self.set_u32(enc, total_len as u32, 7);
+            self.set_f32(enc, attn_scale, 8);
+            self.set_f32(enc, softcap, 9);
+
+            // One threadgroup per Q head, 256 threads each
+            msg_send_dispatch(
+                enc,
+                self.sels.dispatch_threadgroups,
+                num_heads, 1, 1,
+                256, 1, 1,
+            );
+
+            Self::wrap(out_buf, vec![1, total_dim], TensorDtype::F32)
+        }
     }
 }
 
