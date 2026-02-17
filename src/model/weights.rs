@@ -46,7 +46,7 @@ pub struct LayerWeights {
     pub ffn_up_bias: Option<DeviceTensor>,
     pub ffn_down_bias: Option<DeviceTensor>,
 
-    // Per-head Q/K normalization (GemmaEmbedding only)
+    // Per-head Q/K normalization (GemmaEmbedding, Qwen3)
     pub attn_q_norm_w: Option<DeviceTensor>,
     pub attn_k_norm_w: Option<DeviceTensor>,
 
@@ -497,9 +497,9 @@ impl ModelWeights {
                 None
             };
 
-            // GemmaEmbedding-specific per-layer tensors
-            let (attn_q_norm_w, attn_k_norm_w, attn_post_norm_w, ffn_post_norm_w) =
-                if config.arch == ModelArch::GemmaEmbedding {
+            // Per-head Q/K normalization (GemmaEmbedding, Qwen3)
+            let (attn_q_norm_w, attn_k_norm_w) =
+                if config.arch == ModelArch::GemmaEmbedding || config.arch == ModelArch::Qwen3 {
                     let qn = load_tensor_optional(
                         gguf,
                         &format!("{}.attn_q_norm.weight", prefix),
@@ -510,6 +510,14 @@ impl ModelWeights {
                         &format!("{}.attn_k_norm.weight", prefix),
                         backend,
                     )?;
+                    (qn, kn)
+                } else {
+                    (None, None)
+                };
+
+            // Post-projection norms (GemmaEmbedding only)
+            let (attn_post_norm_w, ffn_post_norm_w) =
+                if config.arch == ModelArch::GemmaEmbedding {
                     let apn = load_tensor_optional(
                         gguf,
                         &format!("{}.post_attention_norm.weight", prefix),
@@ -520,9 +528,9 @@ impl ModelWeights {
                         &format!("{}.post_ffw_norm.weight", prefix),
                         backend,
                     )?;
-                    (qn, kn, apn, fpn)
+                    (apn, fpn)
                 } else {
-                    (None, None, None, None)
+                    (None, None)
                 };
 
             layers.push(LayerWeights {

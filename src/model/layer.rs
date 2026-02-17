@@ -322,6 +322,14 @@ fn pre_norm_layer_forward(
     let k = linear_forward(&normed, &layer.attn_k, layer.attn_k_bias.as_ref(), backend);
     let v = linear_forward(&normed, &layer.attn_v, layer.attn_v_bias.as_ref(), backend);
 
+    // Per-head Q/K RMSNorm (Qwen3)
+    let q = if let Some(ref qn_w) = layer.attn_q_norm_w {
+        rms_norm_per_head(&q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
+    } else { q };
+    let k = if let Some(ref kn_w) = layer.attn_k_norm_w {
+        rms_norm_per_head(&k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
+    } else { k };
+
     // 3. Multi-head attention
     let attn_out = multi_head_attention(q, k, v, config, backend, pos_offset, attention_mask);
 
@@ -826,6 +834,14 @@ fn transformer_layer_forward_cached(
         let q = linear_forward(&normed, &layer.attn_q, layer.attn_q_bias.as_ref(), backend);
         let k = linear_forward(&normed, &layer.attn_k, layer.attn_k_bias.as_ref(), backend);
         let v = linear_forward(&normed, &layer.attn_v, layer.attn_v_bias.as_ref(), backend);
+
+        // Per-head Q/K RMSNorm (Qwen3)
+        let q = if let Some(ref qn_w) = layer.attn_q_norm_w {
+            rms_norm_per_head(&q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
+        } else { q };
+        let k = if let Some(ref kn_w) = layer.attn_k_norm_w {
+            rms_norm_per_head(&k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
+        } else { k };
 
         let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend)?;
 
@@ -2607,5 +2623,270 @@ mod tests {
         let d2 = out2.as_tensor().as_f32();
         let pos0_differs = (0..hidden_size).any(|j| (d1[j] - d2[j]).abs() > 1e-6);
         assert!(pos0_differs, "Bidirectional: changing token at pos 2 should affect output at pos 0");
+    }
+
+    // ====================================================================
+    // Qwen3 (pre-norm with per-head Q/K norms) tests
+    // ====================================================================
+
+    /// Create a Qwen3-style config for testing.
+    fn qwen3_config(
+        hidden_size: usize, num_heads: usize, num_kv_heads: usize,
+        head_dim: usize, ffn_hidden: usize,
+    ) -> ModelConfig {
+        ModelConfig {
+            arch: ModelArch::Qwen3,
+            arch_name: "qwen3".to_string(),
+            hidden_size,
+            num_layers: 1,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            ffn_hidden,
+            vocab_size: 16,
+            max_seq_len: 128,
+            norm_type: NormType::RMSNorm,
+            norm_eps: 1e-6,
+            activation: Activation::SwiGLU,
+            position_type: PositionType::RoPE,
+            rope_freq_base: 10000.0,
+            rope_dim: head_dim,
+            rope_neox: true,
+            causal: true,
+            attn_logit_softcap: 0.0,
+            attn_scale: None,
+            embedding_scale: 1.0,
+            pooling_type: PoolingType::None,
+            has_ffn_gate: true,
+            has_bias: false,
+            pre_norm: true,
+        }
+    }
+
+    /// Create minimal LayerWeights for Qwen3 with per-head Q/K norms.
+    fn qwen3_layer_weights(
+        hidden_size: usize, num_kv_heads: usize, head_dim: usize, ffn_hidden: usize,
+    ) -> LayerWeights {
+        let kv_dim = num_kv_heads * head_dim;
+        LayerWeights {
+            attn_norm_w: Some(ones_weight(hidden_size)),
+            attn_norm_b: None,
+            ffn_norm_w: Some(ones_weight(hidden_size)),
+            ffn_norm_b: None,
+            attn_output_norm_w: None,
+            attn_output_norm_b: None,
+            ffn_output_norm_w: None,
+            ffn_output_norm_b: None,
+            attn_q: identity_weight(hidden_size),
+            attn_k: zero_weight(kv_dim, hidden_size),
+            attn_v: zero_weight(kv_dim, hidden_size),
+            attn_output: identity_weight(hidden_size),
+            attn_q_bias: None,
+            attn_k_bias: None,
+            attn_v_bias: None,
+            attn_output_bias: None,
+            ffn_up: zero_weight(ffn_hidden, hidden_size),
+            ffn_down: zero_weight(hidden_size, ffn_hidden),
+            ffn_gate: Some(zero_weight(ffn_hidden, hidden_size)),
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+            attn_q_norm_w: Some(ones_weight(head_dim)),
+            attn_k_norm_w: Some(ones_weight(head_dim)),
+            attn_post_norm_w: None,
+            ffn_post_norm_w: None,
+        }
+    }
+
+    #[test]
+    fn test_qwen3_layer_output_shape() {
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+
+        let config = qwen3_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        let layer = qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+
+        let seq_len = 3;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[seq_len, hidden_size]);
+
+        for &v in output.as_tensor().as_f32() {
+            assert!(v.is_finite(), "Qwen3 layer produced non-finite value: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_qwen3_per_head_norms_affect_output() {
+        // Verify Q/K norms in pre_norm_layer_forward actually change the output
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+
+        let config = qwen3_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+
+        let kv_dim = num_kv_heads * head_dim;
+        let kv_data: Vec<f32> = (0..kv_dim * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let attn_data: Vec<f32> = (0..hidden_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+
+        // Layer WITH per-head Q/K norms (weight=2.0)
+        let mut layer_with = qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        layer_with.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+        layer_with.attn_k = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
+        layer_with.attn_v = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
+        layer_with.attn_q_norm_w = Some(dt(Tensor::new(vec![head_dim], vec![2.0f32; head_dim])));
+        layer_with.attn_k_norm_w = Some(dt(Tensor::new(vec![head_dim], vec![2.0f32; head_dim])));
+
+        // Layer WITHOUT per-head norms (same attention weights)
+        let mut layer_without = qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        layer_without.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data));
+        layer_without.attn_k = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
+        layer_without.attn_v = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data));
+        layer_without.attn_q_norm_w = None;
+        layer_without.attn_k_norm_w = None;
+
+        let seq_len = 2;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output_with = transformer_layer_forward(&input, &layer_with, &config, &b, 0, &mask);
+        let output_without = transformer_layer_forward(&input, &layer_without, &config, &b, 0, &mask);
+
+        let data_w = output_with.as_tensor().as_f32();
+        let data_wo = output_without.as_tensor().as_f32();
+
+        let any_different = (0..data_w.len()).any(|i| (data_w[i] - data_wo[i]).abs() > 1e-6);
+        assert!(any_different,
+            "Per-head Q/K norms (weight=2.0) in pre_norm path should produce different output than no norms");
+    }
+
+    #[test]
+    fn test_qwen3_gqa_with_per_head_norms() {
+        // Qwen3-1.7B has 16 heads, 4 KV heads. Test the Q/K norm path with GQA.
+        let b = cpu();
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let hidden_size = num_heads * head_dim; // 16
+        let ffn_hidden = 32;
+
+        let config = qwen3_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        let layer = qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+
+        let seq_len = 3;
+        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
+        let mask = vec![1.0f32; seq_len];
+
+        let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask);
+        assert_eq!(output.shape(), &[seq_len, hidden_size]);
+
+        for &v in output.as_tensor().as_f32() {
+            assert!(v.is_finite(), "Qwen3 GQA with per-head norms produced non-finite value: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_qwen3_cached_forward_with_per_head_norms() {
+        // Test Q/K norms in the cached (generation) path
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+
+        let mut config = qwen3_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        config.num_layers = 1;
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            token_type_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden)],
+            output_norm_w: Some(ones_weight(hidden_size)),
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let mut cache = KvCache::new(&config);
+
+        // Prefill
+        let output = model_forward_step(&[1, 3, 5], &weights, &config, &b, &mut cache).unwrap();
+        assert_eq!(output.shape(), &[3, hidden_size]);
+        assert_eq!(cache.len(), 3);
+
+        // Decode single token
+        let output = model_forward_step(&[7], &weights, &config, &b, &mut cache).unwrap();
+        assert_eq!(output.shape(), &[1, hidden_size]);
+        assert_eq!(cache.len(), 4);
+
+        for &v in output.as_tensor().as_f32() {
+            assert!(v.is_finite(), "Qwen3 cached decode with per-head norms produced non-finite value");
+        }
+    }
+
+    #[test]
+    fn test_qwen3_cached_vs_uncached_prefill_match() {
+        // Verify cached and uncached paths produce the same result for Qwen3
+        // (both paths now have Q/K norm code — this catches mismatches)
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+
+        let mut config = qwen3_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        config.num_layers = 1;
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let weights = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            token_type_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden)],
+            output_norm_w: Some(ones_weight(hidden_size)),
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let input_ids = &[1u32, 3, 5];
+        let attention_mask = &[1.0f32, 1.0, 1.0];
+
+        // Uncached
+        let uncached = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
+
+        // Cached (prefill)
+        let mut cache = KvCache::new(&config);
+        let cached = model_forward_step(input_ids, &weights, &config, &b, &mut cache).unwrap();
+
+        let uncached_data = uncached.as_tensor().as_f32();
+        let cached_data = cached.as_tensor().as_f32();
+        assert_eq!(uncached_data.len(), cached_data.len());
+        for i in 0..uncached_data.len() {
+            assert!(
+                (uncached_data[i] - cached_data[i]).abs() < 1e-4,
+                "Qwen3 cached vs uncached mismatch at {}: uncached={} cached={}",
+                i, uncached_data[i], cached_data[i]
+            );
+        }
     }
 }
