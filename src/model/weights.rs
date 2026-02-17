@@ -180,6 +180,81 @@ fn load_tensor_optional(
 }
 
 // ---------------------------------------------------------------------------
+// Fused QKV splitting helpers
+// ---------------------------------------------------------------------------
+
+/// Split a fused QKV weight tensor into separate Q, K, V tensors.
+///
+/// The fused tensor has shape `[n_embd + 2*n_kv, n_embd]` (after GGUF dim
+/// reversal) where `n_kv = num_kv_heads * head_dim`. For standard MHA (GPT-2),
+/// `n_kv == n_embd` so the shape is `[3*n_embd, n_embd]`.
+///
+/// For quantized tensors (Q8_0, Q4_K, etc.), we dequantize to f32 first, split,
+/// then keep splits as f32. This is a one-time load cost.
+fn split_qkv(
+    qkv: &DeviceTensor,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+) -> (DeviceTensor, DeviceTensor, DeviceTensor) {
+    let tensor = backend.download(qkv);
+    let f32_tensor = tensor.to_f32();
+    let f32_data = f32_tensor.as_f32();
+
+    let n_embd = config.hidden_size;
+    let n_kv = config.num_kv_heads * config.head_dim;
+    let expected = (n_embd + 2 * n_kv) * n_embd;
+    assert_eq!(
+        f32_data.len(),
+        expected,
+        "fused QKV weight has {} elements, expected {} = ({} + 2*{}) * {}",
+        f32_data.len(), expected, n_embd, n_kv, n_embd,
+    );
+
+    let q_data = f32_data[..n_embd * n_embd].to_vec();
+    let k_data = f32_data[n_embd * n_embd..(n_embd + n_kv) * n_embd].to_vec();
+    let v_data = f32_data[(n_embd + n_kv) * n_embd..].to_vec();
+
+    (
+        backend.upload(&Tensor::new(vec![n_embd, n_embd], q_data)),
+        backend.upload(&Tensor::new(vec![n_kv, n_embd], k_data)),
+        backend.upload(&Tensor::new(vec![n_kv, n_embd], v_data)),
+    )
+}
+
+/// Split a fused QKV bias vector into separate Q, K, V biases.
+///
+/// The fused bias has shape `[n_embd + 2*n_kv]`.
+fn split_qkv_bias(
+    qkv_bias: &DeviceTensor,
+    config: &ModelConfig,
+    backend: &dyn ComputeBackend,
+) -> (DeviceTensor, DeviceTensor, DeviceTensor) {
+    let tensor = backend.download(qkv_bias);
+    let f32_tensor = tensor.to_f32();
+    let f32_data = f32_tensor.as_f32();
+
+    let n_embd = config.hidden_size;
+    let n_kv = config.num_kv_heads * config.head_dim;
+    let expected = n_embd + 2 * n_kv;
+    assert_eq!(
+        f32_data.len(),
+        expected,
+        "fused QKV bias has {} elements, expected {} = {} + 2*{}",
+        f32_data.len(), expected, n_embd, n_kv,
+    );
+
+    let q_data = f32_data[..n_embd].to_vec();
+    let k_data = f32_data[n_embd..n_embd + n_kv].to_vec();
+    let v_data = f32_data[n_embd + n_kv..].to_vec();
+
+    (
+        backend.upload(&Tensor::new(vec![n_embd], q_data)),
+        backend.upload(&Tensor::new(vec![n_kv], k_data)),
+        backend.upload(&Tensor::new(vec![n_kv], v_data)),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // ModelWeights loading
 // ---------------------------------------------------------------------------
 
@@ -248,68 +323,98 @@ impl ModelWeights {
                     &format!("{}.attn_norm.weight", prefix),
                     backend,
                 )?);
-                let b = None; // RMSNorm has no bias
+                let b = if config.has_bias {
+                    load_tensor_optional(
+                        gguf,
+                        &format!("{}.attn_norm.bias", prefix),
+                        backend,
+                    )?
+                } else {
+                    None
+                };
                 let fw = Some(load_tensor(
                     gguf,
                     &format!("{}.ffn_norm.weight", prefix),
                     backend,
                 )?);
-                let fb = None;
+                let fb = if config.has_bias {
+                    load_tensor_optional(
+                        gguf,
+                        &format!("{}.ffn_norm.bias", prefix),
+                        backend,
+                    )?
+                } else {
+                    None
+                };
                 (w, b, fw, fb)
             } else {
                 // BERT (post-norm): no pre-attention or pre-FFN norms
                 (None, None, None, None)
             };
 
-            // Attention projections
-            let attn_q = load_tensor(
-                gguf,
-                &format!("{}.attn_q.weight", prefix),
-                backend,
-            )?;
-            let attn_k = load_tensor(
-                gguf,
-                &format!("{}.attn_k.weight", prefix),
-                backend,
-            )?;
-            let attn_v = load_tensor(
-                gguf,
-                &format!("{}.attn_v.weight", prefix),
-                backend,
-            )?;
+            // Attention projections — try fused QKV first (GPT-2, StarCoder, etc.)
+            let (attn_q, attn_k, attn_v) =
+                if gguf.find_tensor(&format!("{}.attn_qkv.weight", prefix)).is_some() {
+                    let qkv = load_tensor(
+                        gguf,
+                        &format!("{}.attn_qkv.weight", prefix),
+                        backend,
+                    )?;
+                    split_qkv(&qkv, config, backend)
+                } else {
+                    let q = load_tensor(
+                        gguf,
+                        &format!("{}.attn_q.weight", prefix),
+                        backend,
+                    )?;
+                    let k = load_tensor(
+                        gguf,
+                        &format!("{}.attn_k.weight", prefix),
+                        backend,
+                    )?;
+                    let v = load_tensor(
+                        gguf,
+                        &format!("{}.attn_v.weight", prefix),
+                        backend,
+                    )?;
+                    (q, k, v)
+                };
             let attn_output = load_tensor(
                 gguf,
                 &format!("{}.attn_output.weight", prefix),
                 backend,
             )?;
 
-            // Attention biases (BERT only)
-            let attn_q_bias = if config.has_bias {
-                load_tensor_optional(
-                    gguf,
-                    &format!("{}.attn_q.bias", prefix),
-                    backend,
-                )?
+            // Attention biases — try fused QKV bias first, then separate
+            let (attn_q_bias, attn_k_bias, attn_v_bias) = if config.has_bias {
+                if gguf.find_tensor(&format!("{}.attn_qkv.bias", prefix)).is_some() {
+                    let qkv_bias = load_tensor(
+                        gguf,
+                        &format!("{}.attn_qkv.bias", prefix),
+                        backend,
+                    )?;
+                    let (q, k, v) = split_qkv_bias(&qkv_bias, config, backend);
+                    (Some(q), Some(k), Some(v))
+                } else {
+                    let q = load_tensor_optional(
+                        gguf,
+                        &format!("{}.attn_q.bias", prefix),
+                        backend,
+                    )?;
+                    let k = load_tensor_optional(
+                        gguf,
+                        &format!("{}.attn_k.bias", prefix),
+                        backend,
+                    )?;
+                    let v = load_tensor_optional(
+                        gguf,
+                        &format!("{}.attn_v.bias", prefix),
+                        backend,
+                    )?;
+                    (q, k, v)
+                }
             } else {
-                None
-            };
-            let attn_k_bias = if config.has_bias {
-                load_tensor_optional(
-                    gguf,
-                    &format!("{}.attn_k.bias", prefix),
-                    backend,
-                )?
-            } else {
-                None
-            };
-            let attn_v_bias = if config.has_bias {
-                load_tensor_optional(
-                    gguf,
-                    &format!("{}.attn_v.bias", prefix),
-                    backend,
-                )?
-            } else {
-                None
+                (None, None, None)
             };
             let attn_output_bias = if config.has_bias {
                 load_tensor_optional(
@@ -1542,5 +1647,492 @@ mod tests {
         assert!(weights.output_norm_b.is_none());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    // ====================================================================
+    // GPT-2 / fused QKV tests
+    // ====================================================================
+
+    /// Build a minimal GPT-2-style ModelConfig for testing.
+    fn gpt2_config(num_layers: usize, hidden_size: usize) -> ModelConfig {
+        ModelConfig {
+            arch: ModelArch::GPT2,
+            arch_name: "gpt2".to_string(),
+            hidden_size,
+            num_layers,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: hidden_size / 4,
+            ffn_hidden: hidden_size * 4,
+            vocab_size: 64,
+            max_seq_len: 128,
+            norm_type: NormType::LayerNorm,
+            norm_eps: 1e-5,
+            activation: Activation::GELU,
+            position_type: PositionType::Learned,
+            rope_freq_base: 0.0,
+            rope_dim: 0,
+            rope_neox: false,
+            causal: true,
+            attn_logit_softcap: 0.0,
+            attn_scale: None,
+            embedding_scale: 1.0,
+            pooling_type: PoolingType::None,
+            has_ffn_gate: false,
+            has_bias: true,
+            pre_norm: true,
+        }
+    }
+
+    /// Build all GPT-2-style tensors with fused QKV.
+    ///
+    /// Uses known data patterns so split results can be verified:
+    /// - Q rows filled with 0.1
+    /// - K rows filled with 0.2
+    /// - V rows filled with 0.3
+    fn build_gpt2_tensors(config: &ModelConfig) -> Vec<(String, Vec<u64>, u32, Vec<u8>)> {
+        let h = config.hidden_size;
+        let ffn = config.ffn_hidden;
+        let v = config.vocab_size;
+        let max_seq = config.max_seq_len;
+
+        let mut tensors = Vec::new();
+
+        // Token embedding: GGUF dims [hidden_size, vocab_size]
+        tensors.push((
+            "token_embd.weight".to_string(),
+            vec![h as u64, v as u64],
+            0,
+            f32_tensor_data(&vec![0.1f32; v * h]),
+        ));
+
+        // Position embedding: GGUF dims [hidden_size, max_seq_len]
+        tensors.push((
+            "position_embd.weight".to_string(),
+            vec![h as u64, max_seq as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; max_seq * h]),
+        ));
+
+        // Output norm + bias
+        tensors.push((
+            "output_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensors.push((
+            "output_norm.bias".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
+
+        for i in 0..config.num_layers {
+            let prefix = format!("blk.{}", i);
+
+            // Pre-norm weights + biases (GPT-2 uses LayerNorm before sublayers)
+            tensors.push((format!("{}.attn_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+            tensors.push((format!("{}.attn_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+            tensors.push((format!("{}.ffn_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+            tensors.push((format!("{}.ffn_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+
+            // Fused QKV weight: GGUF dims [hidden_size, 3*hidden_size]
+            // (reversed to [3*h, h] in our row-major layout)
+            // Fill Q region with 0.1, K region with 0.2, V region with 0.3
+            let mut qkv_data = Vec::with_capacity(3 * h * h);
+            qkv_data.extend(std::iter::repeat(0.1f32).take(h * h)); // Q
+            qkv_data.extend(std::iter::repeat(0.2f32).take(h * h)); // K
+            qkv_data.extend(std::iter::repeat(0.3f32).take(h * h)); // V
+            tensors.push((
+                format!("{}.attn_qkv.weight", prefix),
+                vec![h as u64, (3 * h) as u64],
+                0,
+                f32_tensor_data(&qkv_data),
+            ));
+
+            // Fused QKV bias: [3*h]
+            let mut qkv_bias = Vec::with_capacity(3 * h);
+            qkv_bias.extend(std::iter::repeat(1.0f32).take(h)); // Q bias
+            qkv_bias.extend(std::iter::repeat(2.0f32).take(h)); // K bias
+            qkv_bias.extend(std::iter::repeat(3.0f32).take(h)); // V bias
+            tensors.push((
+                format!("{}.attn_qkv.bias", prefix),
+                vec![(3 * h) as u64],
+                0,
+                f32_tensor_data(&qkv_bias),
+            ));
+
+            // attn_output + bias
+            tensors.push((format!("{}.attn_output.weight", prefix), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
+            tensors.push((format!("{}.attn_output.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+
+            // FFN up/down + biases (no gate for GPT-2)
+            tensors.push((format!("{}.ffn_up.weight", prefix), vec![h as u64, ffn as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
+            tensors.push((format!("{}.ffn_up.bias", prefix), vec![ffn as u64], 0, f32_tensor_data(&vec![0.0f32; ffn])));
+            tensors.push((format!("{}.ffn_down.weight", prefix), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
+            tensors.push((format!("{}.ffn_down.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        }
+
+        tensors
+    }
+
+    #[test]
+    fn test_load_gpt2_style_weights_with_fused_qkv() {
+        // Full GPT-2 weight loading: fused QKV, pre-norm with bias, learned positions
+        let config = gpt2_config(1, 32);
+        let tensor_specs = build_gpt2_tensors(&config);
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("gpt2_1layer", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        // GPT-2 structural checks
+        assert_eq!(weights.layers.len(), 1);
+        assert!(weights.position_embedding.is_some()); // Learned positions
+        assert!(weights.embedding_norm_w.is_none()); // GPT-2 has no embedding norm
+        assert!(weights.embedding_norm_b.is_none());
+        assert!(weights.output_norm_w.is_some());
+        assert!(weights.output_norm_b.is_some()); // LayerNorm bias
+        assert!(weights.output_projection.is_none()); // Tied embeddings
+
+        let layer = &weights.layers[0];
+
+        // Pre-norm weights AND biases should be present (LayerNorm, not RMSNorm)
+        assert!(layer.attn_norm_w.is_some());
+        assert!(layer.attn_norm_b.is_some(), "GPT-2 pre-norm must have attn_norm bias");
+        assert!(layer.ffn_norm_w.is_some());
+        assert!(layer.ffn_norm_b.is_some(), "GPT-2 pre-norm must have ffn_norm bias");
+
+        // Fused QKV should have been split into separate Q, K, V
+        assert_eq!(layer.attn_q.shape(), &[32, 32]);
+        assert_eq!(layer.attn_k.shape(), &[32, 32]);
+        assert_eq!(layer.attn_v.shape(), &[32, 32]);
+        assert_eq!(layer.attn_output.shape(), &[32, 32]);
+
+        // Attention biases from fused QKV bias
+        assert!(layer.attn_q_bias.is_some());
+        assert!(layer.attn_k_bias.is_some());
+        assert!(layer.attn_v_bias.is_some());
+        assert!(layer.attn_output_bias.is_some());
+
+        // No FFN gate (GPT-2 uses GELU, not SwiGLU)
+        assert!(layer.ffn_gate.is_none());
+
+        // FFN biases should be present
+        assert!(layer.ffn_up_bias.is_some());
+        assert!(layer.ffn_down_bias.is_some());
+
+        // Post-norm weights should be absent (GPT-2 uses pre-norm)
+        assert!(layer.attn_output_norm_w.is_none());
+        assert!(layer.attn_output_norm_b.is_none());
+        assert!(layer.ffn_output_norm_w.is_none());
+        assert!(layer.ffn_output_norm_b.is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_fused_qkv_split_produces_correct_data() {
+        // Verify that the Q/K/V data values are correct after splitting.
+        // Q region filled with 0.1, K with 0.2, V with 0.3.
+        let config = gpt2_config(1, 32);
+        let tensor_specs = build_gpt2_tensors(&config);
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("gpt2_qkv_data", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        let layer = &weights.layers[0];
+        let h = config.hidden_size;
+
+        // Download and verify Q data (should be all 0.1)
+        let q_tensor = backend.download(&layer.attn_q);
+        let q_data = q_tensor.as_f32();
+        assert_eq!(q_data.len(), h * h);
+        for (i, &val) in q_data.iter().enumerate() {
+            assert!(
+                (val - 0.1).abs() < 1e-6,
+                "Q[{}] = {}, expected 0.1", i, val,
+            );
+        }
+
+        // Download and verify K data (should be all 0.2)
+        let k_tensor = backend.download(&layer.attn_k);
+        let k_data = k_tensor.as_f32();
+        assert_eq!(k_data.len(), h * h);
+        for (i, &val) in k_data.iter().enumerate() {
+            assert!(
+                (val - 0.2).abs() < 1e-6,
+                "K[{}] = {}, expected 0.2", i, val,
+            );
+        }
+
+        // Download and verify V data (should be all 0.3)
+        let v_tensor = backend.download(&layer.attn_v);
+        let v_data = v_tensor.as_f32();
+        assert_eq!(v_data.len(), h * h);
+        for (i, &val) in v_data.iter().enumerate() {
+            assert!(
+                (val - 0.3).abs() < 1e-6,
+                "V[{}] = {}, expected 0.3", i, val,
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_fused_qkv_bias_split_produces_correct_data() {
+        // Verify bias values: Q bias = 1.0, K bias = 2.0, V bias = 3.0
+        let config = gpt2_config(1, 32);
+        let tensor_specs = build_gpt2_tensors(&config);
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("gpt2_qkv_bias_data", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        let layer = &weights.layers[0];
+        let h = config.hidden_size;
+
+        // Q bias = 1.0
+        let q_bias = backend.download(layer.attn_q_bias.as_ref().unwrap());
+        let q_bias_data = q_bias.as_f32();
+        assert_eq!(q_bias_data.len(), h);
+        assert!((q_bias_data[0] - 1.0).abs() < 1e-6, "Q bias[0] = {}", q_bias_data[0]);
+        assert!((q_bias_data[h - 1] - 1.0).abs() < 1e-6);
+
+        // K bias = 2.0
+        let k_bias = backend.download(layer.attn_k_bias.as_ref().unwrap());
+        let k_bias_data = k_bias.as_f32();
+        assert_eq!(k_bias_data.len(), h);
+        assert!((k_bias_data[0] - 2.0).abs() < 1e-6, "K bias[0] = {}", k_bias_data[0]);
+
+        // V bias = 3.0
+        let v_bias = backend.download(layer.attn_v_bias.as_ref().unwrap());
+        let v_bias_data = v_bias.as_f32();
+        assert_eq!(v_bias_data.len(), h);
+        assert!((v_bias_data[0] - 3.0).abs() < 1e-6, "V bias[0] = {}", v_bias_data[0]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_fused_qkv_q8_0_dequantizes_and_splits() {
+        // GPT-2 with Q8_0 fused QKV: verify dequant + split produces correct shapes
+        // and the result is F32 (since we dequantize before splitting).
+        let config = gpt2_config(1, 32);
+        let h = config.hidden_size;
+        let ffn = config.ffn_hidden;
+        let v = config.vocab_size;
+        let max_seq = config.max_seq_len;
+
+        let mut tensor_specs: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+
+        // Token + position embeddings (F32)
+        tensor_specs.push(("token_embd.weight".to_string(), vec![h as u64, v as u64], 0, f32_tensor_data(&vec![0.1f32; v * h])));
+        tensor_specs.push(("position_embd.weight".to_string(), vec![h as u64, max_seq as u64], 0, f32_tensor_data(&vec![0.01f32; max_seq * h])));
+        tensor_specs.push(("output_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensor_specs.push(("output_norm.bias".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+
+        // Layer 0 norms
+        tensor_specs.push(("blk.0.attn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensor_specs.push(("blk.0.attn_norm.bias".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push(("blk.0.ffn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensor_specs.push(("blk.0.ffn_norm.bias".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+
+        // Fused QKV as Q8_0 (dtype_id = 8)
+        let qkv_elements = 3 * h * h;
+        let q8_data = q8_0_tensor_data(qkv_elements);
+        tensor_specs.push((
+            "blk.0.attn_qkv.weight".to_string(),
+            vec![h as u64, (3 * h) as u64],
+            8, // Q8_0
+            q8_data,
+        ));
+
+        // Fused QKV bias (F32)
+        let qkv_bias_data: Vec<f32> = (0..3 * h).map(|i| i as f32 * 0.01).collect();
+        tensor_specs.push((
+            "blk.0.attn_qkv.bias".to_string(),
+            vec![(3 * h) as u64],
+            0,
+            f32_tensor_data(&qkv_bias_data),
+        ));
+
+        // attn_output + bias
+        tensor_specs.push(("blk.0.attn_output.weight".to_string(), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
+        tensor_specs.push(("blk.0.attn_output.bias".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+
+        // FFN
+        tensor_specs.push(("blk.0.ffn_up.weight".to_string(), vec![h as u64, ffn as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
+        tensor_specs.push(("blk.0.ffn_up.bias".to_string(), vec![ffn as u64], 0, f32_tensor_data(&vec![0.0f32; ffn])));
+        tensor_specs.push(("blk.0.ffn_down.weight".to_string(), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
+        tensor_specs.push(("blk.0.ffn_down.bias".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("gpt2_q8_qkv", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        let layer = &weights.layers[0];
+
+        // After splitting Q8_0 fused QKV, results should be F32 (dequantized)
+        assert_eq!(layer.attn_q.dtype(), TensorDtype::F32);
+        assert_eq!(layer.attn_k.dtype(), TensorDtype::F32);
+        assert_eq!(layer.attn_v.dtype(), TensorDtype::F32);
+
+        // Shapes should be correct
+        assert_eq!(layer.attn_q.shape(), &[h, h]);
+        assert_eq!(layer.attn_k.shape(), &[h, h]);
+        assert_eq!(layer.attn_v.shape(), &[h, h]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_gpt2_multiple_layers() {
+        let config = gpt2_config(3, 32);
+        let tensor_specs = build_gpt2_tensors(&config);
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("gpt2_3layers", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        assert_eq!(weights.layers.len(), 3);
+        for (i, layer) in weights.layers.iter().enumerate() {
+            // Every layer should have pre-norm biases (LayerNorm)
+            assert!(layer.attn_norm_b.is_some(), "layer {} missing attn_norm_b", i);
+            assert!(layer.ffn_norm_b.is_some(), "layer {} missing ffn_norm_b", i);
+
+            // Every layer should have split QKV
+            assert_eq!(layer.attn_q.shape(), &[32, 32], "layer {} Q shape wrong", i);
+            assert_eq!(layer.attn_k.shape(), &[32, 32], "layer {} K shape wrong", i);
+            assert_eq!(layer.attn_v.shape(), &[32, 32], "layer {} V shape wrong", i);
+
+            // Biases from fused QKV
+            assert!(layer.attn_q_bias.is_some(), "layer {} missing Q bias", i);
+            assert!(layer.attn_k_bias.is_some(), "layer {} missing K bias", i);
+            assert!(layer.attn_v_bias.is_some(), "layer {} missing V bias", i);
+
+            // No gate
+            assert!(layer.ffn_gate.is_none(), "layer {} has unexpected ffn_gate", i);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_separate_qkv_still_works_when_fused_absent() {
+        // Verify that models without fused QKV (LLaMA/Gemma) still load correctly
+        // after the fused-QKV fallback logic was added.
+        let config = gemma_config(1, 32);
+        let tensor_specs = build_gemma_tensors(&config);
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("gemma_after_qkv_change", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        let layer = &weights.layers[0];
+        assert_eq!(layer.attn_q.shape(), &[32, 32]);
+        assert_eq!(layer.attn_k.shape(), &[32, 32]);
+        assert_eq!(layer.attn_v.shape(), &[32, 32]);
+        // Gemma: no bias
+        assert!(layer.attn_q_bias.is_none());
+        assert!(layer.attn_norm_b.is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_pre_norm_with_bias_vs_without() {
+        // Verify that LLaMA (pre_norm=true, has_bias=false) gets None for norm bias
+        // while GPT-2 (pre_norm=true, has_bias=true) gets Some for norm bias.
+        let config_llama = gemma_config(1, 32); // has_bias=false, pre_norm=true
+        let tensors_llama = build_gemma_tensors(&config_llama);
+        let refs_llama: Vec<(&str, &[u64], u32, &[u8])> = tensors_llama
+            .iter()
+            .map(|(n, d, t, data)| (n.as_str(), d.as_slice(), *t, data.as_slice()))
+            .collect();
+        let bytes_llama = build_gguf_with_tensors(&refs_llama);
+        let path_llama = write_temp_gguf("prenorm_no_bias", &bytes_llama);
+
+        let gguf_llama = GgufFile::open(&path_llama).unwrap();
+        let backend = CpuBackend::new();
+        let weights_llama = ModelWeights::from_gguf(&gguf_llama, &config_llama, &backend).unwrap();
+
+        let config_gpt2 = gpt2_config(1, 32); // has_bias=true, pre_norm=true
+        let tensors_gpt2 = build_gpt2_tensors(&config_gpt2);
+        let refs_gpt2: Vec<(&str, &[u64], u32, &[u8])> = tensors_gpt2
+            .iter()
+            .map(|(n, d, t, data)| (n.as_str(), d.as_slice(), *t, data.as_slice()))
+            .collect();
+        let bytes_gpt2 = build_gguf_with_tensors(&refs_gpt2);
+        let path_gpt2 = write_temp_gguf("prenorm_with_bias", &bytes_gpt2);
+
+        let gguf_gpt2 = GgufFile::open(&path_gpt2).unwrap();
+        let weights_gpt2 = ModelWeights::from_gguf(&gguf_gpt2, &config_gpt2, &backend).unwrap();
+
+        // LLaMA: pre-norm weights present, biases absent
+        assert!(weights_llama.layers[0].attn_norm_w.is_some());
+        assert!(weights_llama.layers[0].attn_norm_b.is_none());
+        assert!(weights_llama.layers[0].ffn_norm_w.is_some());
+        assert!(weights_llama.layers[0].ffn_norm_b.is_none());
+
+        // GPT-2: pre-norm weights AND biases both present
+        assert!(weights_gpt2.layers[0].attn_norm_w.is_some());
+        assert!(weights_gpt2.layers[0].attn_norm_b.is_some());
+        assert!(weights_gpt2.layers[0].ffn_norm_w.is_some());
+        assert!(weights_gpt2.layers[0].ffn_norm_b.is_some());
+
+        std::fs::remove_file(&path_llama).ok();
+        std::fs::remove_file(&path_gpt2).ok();
     }
 }

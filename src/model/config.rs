@@ -13,6 +13,7 @@ pub enum ModelArch {
     GemmaEmbedding,
     LLaMA,
     Bert,
+    GPT2,
 }
 
 /// Normalization type used by the model.
@@ -116,6 +117,7 @@ impl ModelConfig {
             "gemma2" => (ModelArch::Gemma2, "gemma2"),
             "llama" => (ModelArch::LLaMA, "llama"),
             "bert" => (ModelArch::Bert, "bert"),
+            "gpt2" => (ModelArch::GPT2, "gpt2"),
             "gemma-embedding" => (ModelArch::GemmaEmbedding, "gemma-embedding"),
             other => {
                 return Err(InferenceError::UnsupportedArchitecture(other.to_string()));
@@ -248,6 +250,17 @@ impl ModelConfig {
                     false, // default causal
                     false, // post_norm (norm-after)
                     false, // rope_neox (BERT uses learned position, no RoPE)
+                ),
+                ModelArch::GPT2 => (
+                    NormType::LayerNorm,
+                    Activation::GELU,
+                    PositionType::Learned,
+                    false, // has_ffn_gate (no SwiGLU gate)
+                    true,  // has_bias (all projections + norms have bias)
+                    1.0,   // embedding_scale
+                    true,  // default causal (autoregressive)
+                    true,  // pre_norm (norm BEFORE sublayers)
+                    false, // rope_neox (no RoPE, uses learned positions)
                 ),
             };
 
@@ -1130,6 +1143,38 @@ mod tests {
         assert!(config.has_ffn_gate);
         assert!(!config.has_bias);
         assert!((config.embedding_scale - (768.0f32).sqrt()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_gpt2_config() {
+        let kv = vec![
+            ("general.architecture", kv_string("gpt2")),
+            ("gpt2.embedding_length", kv_u32(768)),
+            ("gpt2.block_count", kv_u32(12)),
+            ("gpt2.attention.head_count", kv_u32(12)),
+            ("gpt2.feed_forward_length", kv_u32(3072)),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let config = ModelConfig::from_gguf(&gguf).unwrap();
+
+        assert_eq!(config.arch, ModelArch::GPT2);
+        assert_eq!(config.arch_name, "gpt2");
+        assert_eq!(config.hidden_size, 768);
+        assert_eq!(config.num_layers, 12);
+        assert_eq!(config.num_heads, 12);
+        assert_eq!(config.head_dim, 64); // 768 / 12
+        assert_eq!(config.ffn_hidden, 3072);
+
+        // GPT-2 defaults
+        assert_eq!(config.norm_type, NormType::LayerNorm);
+        assert_eq!(config.activation, Activation::GELU);
+        assert_eq!(config.position_type, PositionType::Learned);
+        assert!(!config.has_ffn_gate);
+        assert!(config.has_bias);
+        assert!(config.causal);
+        assert!(config.pre_norm);
+        assert!((config.embedding_scale - 1.0).abs() < 1e-6);
     }
 
     #[test]
