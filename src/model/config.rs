@@ -14,6 +14,7 @@ pub enum ModelArch {
     LLaMA,
     Bert,
     GPT2,
+    Qwen3,
 }
 
 /// Normalization type used by the model.
@@ -118,6 +119,7 @@ impl ModelConfig {
             "llama" => (ModelArch::LLaMA, "llama"),
             "bert" => (ModelArch::Bert, "bert"),
             "gpt2" => (ModelArch::GPT2, "gpt2"),
+            "qwen3" => (ModelArch::Qwen3, "qwen3"),
             "gemma-embedding" => (ModelArch::GemmaEmbedding, "gemma-embedding"),
             other => {
                 return Err(InferenceError::UnsupportedArchitecture(other.to_string()));
@@ -228,6 +230,17 @@ impl ModelConfig {
                     true,  // default causal
                     true,  // pre_norm
                     false, // rope_neox (LLaMA uses standard/normal RoPE)
+                ),
+                ModelArch::Qwen3 => (
+                    NormType::RMSNorm,
+                    Activation::SwiGLU,
+                    PositionType::RoPE,
+                    true,  // has_ffn_gate
+                    false, // has_bias
+                    1.0,   // embedding_scale
+                    true,  // default causal
+                    true,  // pre_norm
+                    true,  // rope_neox (Qwen3 uses NeoX-style RoPE)
                 ),
                 ModelArch::GemmaEmbedding => (
                     NormType::RMSNorm,
@@ -1212,5 +1225,40 @@ mod tests {
         assert!(config.pre_norm);
         assert_eq!(config.pooling_type, PoolingType::Mean);
         assert!((config.embedding_scale - (768.0f32).sqrt()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_qwen3_config() {
+        let kv = vec![
+            ("general.architecture", kv_string("qwen3")),
+            ("qwen3.embedding_length", kv_u32(2048)),
+            ("qwen3.block_count", kv_u32(24)),
+            ("qwen3.attention.head_count", kv_u32(16)),
+            ("qwen3.attention.head_count_kv", kv_u32(4)),
+            ("qwen3.feed_forward_length", kv_u32(5632)),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+
+        let config = ModelConfig::from_gguf(&gguf).unwrap();
+
+        assert_eq!(config.arch, ModelArch::Qwen3);
+        assert_eq!(config.arch_name, "qwen3");
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.num_layers, 24);
+        assert_eq!(config.num_heads, 16);
+        assert_eq!(config.num_kv_heads, 4);
+        assert_eq!(config.head_dim, 128); // 2048 / 16
+        assert_eq!(config.ffn_hidden, 5632);
+
+        // Qwen3 defaults
+        assert_eq!(config.norm_type, NormType::RMSNorm);
+        assert_eq!(config.activation, Activation::SwiGLU);
+        assert_eq!(config.position_type, PositionType::RoPE);
+        assert!(config.has_ffn_gate);
+        assert!(!config.has_bias);
+        assert!(config.causal);
+        assert!(config.pre_norm);
+        assert!(config.rope_neox);
+        assert!((config.embedding_scale - 1.0).abs() < 1e-6);
     }
 }
