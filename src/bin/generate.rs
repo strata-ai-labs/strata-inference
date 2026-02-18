@@ -62,6 +62,10 @@ struct Args {
     /// Suppress all logging
     #[arg(long)]
     log_disable: bool,
+
+    /// Enable per-token profiling (prints to stderr)
+    #[arg(long)]
+    profile: bool,
 }
 
 fn validate_output_format(s: &str) -> Result<String, String> {
@@ -112,6 +116,9 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.profile {
+        unsafe { std::env::set_var("STRATA_PROFILE", "1"); }
+    }
     let input = cli::read_input(args.prompt.as_deref(), args.file.as_deref(), false)?;
 
     let total_start = Instant::now();

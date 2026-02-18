@@ -292,6 +292,59 @@ pub trait ComputeBackend: Send + Sync {
         attn_scale: f32,
         softcap: f32,
     ) -> DeviceTensor;
+
+    /// Batched causal attention for multi-token prefill.
+    ///
+    /// Computes fused Q@K^T + causal mask + softmax + @V for multiple query tokens
+    /// in a single GPU dispatch. Uses online softmax for numerical stability.
+    ///
+    /// - `q`: `[n_tokens, num_heads * head_dim]`
+    /// - `k_cache`: `[max_len, num_kv_heads * head_dim]` (GPU KV cache, read first `total_len` rows)
+    /// - `v_cache`: `[max_len, num_kv_heads * head_dim]` (GPU KV cache, read first `total_len` rows)
+    /// - `pos_offset`: absolute position of the first query token in the sequence
+    ///
+    /// Causal mask: query[i] attends to positions [0, pos_offset + i].
+    ///
+    /// Returns: `[n_tokens, num_heads * head_dim]`
+    ///
+    /// Default implementation panics — only GPU backends support this.
+    fn batched_causal_attention(
+        &self,
+        _q: &DeviceTensor,
+        _k_cache: &DeviceTensor,
+        _v_cache: &DeviceTensor,
+        _n_tokens: usize,
+        _total_len: usize,
+        _pos_offset: usize,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _attn_scale: f32,
+        _softcap: f32,
+    ) -> DeviceTensor {
+        panic!("batched_causal_attention is only supported on GPU backends");
+    }
+
+    /// Create an empty GPU buffer with the given byte size, shape, and dtype.
+    ///
+    /// Used for pre-allocating KV cache buffers (e.g., F16 buffers).
+    /// Default implementation panics — only GPU backends support this.
+    fn create_buffer_empty(
+        &self,
+        _byte_size: usize,
+        _shape: Vec<usize>,
+        _dtype: crate::tensor::TensorDtype,
+    ) -> DeviceTensor {
+        panic!("create_buffer_empty is only supported on GPU backends");
+    }
+
+    /// Reset profile counters (no-op for backends without profiling).
+    fn reset_profile(&self) {}
+
+    /// Return a summary string of profile counters since last reset.
+    fn profile_summary(&self) -> String {
+        String::new()
+    }
 }
 
 /// Auto-detect and return the best available compute backend.

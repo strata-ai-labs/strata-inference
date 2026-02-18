@@ -9,7 +9,7 @@
 
 use crate::backend::{ComputeBackend, DeviceTensor};
 use crate::error::InferenceError;
-use crate::tensor::Tensor;
+use crate::tensor::{Tensor, TensorDtype};
 use super::config::ModelConfig;
 
 /// Per-layer KV cache for autoregressive generation.
@@ -38,6 +38,8 @@ pub struct KvCache {
     kv_dim: usize,
     /// Number of transformer layers.
     num_layers: usize,
+    /// Data type of the GPU KV cache buffers (F32 or F16).
+    kv_dtype: TensorDtype,
 }
 
 impl KvCache {
@@ -60,10 +62,11 @@ impl KvCache {
             max_seq_len,
             kv_dim,
             num_layers,
+            kv_dtype: TensorDtype::F32,
         }
     }
 
-    /// Create a GPU-resident KV cache with pre-allocated device buffers.
+    /// Create a GPU-resident KV cache with pre-allocated F32 device buffers.
     ///
     /// Each layer gets a `[max_seq_len, kv_dim]` buffer for K and V.
     /// CPU vecs are still maintained as a fallback for prefill.
@@ -96,6 +99,48 @@ impl KvCache {
             max_seq_len,
             kv_dim,
             num_layers,
+            kv_dtype: TensorDtype::F32,
+        }
+    }
+
+    /// Create a GPU-resident KV cache with pre-allocated F16 device buffers.
+    ///
+    /// Halves memory bandwidth for attention compared to F32 cache.
+    /// Each layer gets a `[max_seq_len, kv_dim]` buffer at 2 bytes per element.
+    /// CPU vecs are still maintained as a fallback for prefill.
+    ///
+    /// # Safety
+    /// Requires the backend to support `create_buffer_empty()` for raw byte allocation.
+    /// The graph must use `copy_f32_to_f16` kernel instead of `copy_buffer` for cache writes,
+    /// and `grouped_attn_decode_f16` for attention reads.
+    pub fn new_gpu_f16(config: &ModelConfig, backend: &dyn ComputeBackend) -> Self {
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let num_layers = config.num_layers;
+        let max_seq_len = config.max_seq_len;
+        let capacity = max_seq_len * kv_dim;
+
+        let k_cache: Vec<Vec<f32>> = (0..num_layers).map(|_| Vec::with_capacity(capacity)).collect();
+        let v_cache: Vec<Vec<f32>> = (0..num_layers).map(|_| Vec::with_capacity(capacity)).collect();
+
+        // Pre-allocate F16 GPU buffers: 2 bytes per element instead of 4
+        let f16_bytes = max_seq_len * kv_dim * 2;
+        let k_gpu: Vec<DeviceTensor> = (0..num_layers)
+            .map(|_| backend.create_buffer_empty(f16_bytes, vec![max_seq_len, kv_dim], TensorDtype::F16))
+            .collect();
+        let v_gpu: Vec<DeviceTensor> = (0..num_layers)
+            .map(|_| backend.create_buffer_empty(f16_bytes, vec![max_seq_len, kv_dim], TensorDtype::F16))
+            .collect();
+
+        Self {
+            k_cache,
+            v_cache,
+            k_gpu: Some(k_gpu),
+            v_gpu: Some(v_gpu),
+            pos: 0,
+            max_seq_len,
+            kv_dim,
+            num_layers,
+            kv_dtype: TensorDtype::F16,
         }
     }
 
@@ -245,6 +290,11 @@ impl KvCache {
     /// The number of layers.
     pub fn num_layers(&self) -> usize {
         self.num_layers
+    }
+
+    /// The data type of GPU KV cache buffers (F32 or F16).
+    pub fn kv_dtype(&self) -> TensorDtype {
+        self.kv_dtype
     }
 }
 

@@ -737,7 +737,29 @@ fn multi_head_attention_cached(
     }
 
     // =====================================================================
-    // SLOW PATH: prefill (n_new > 1) or CPU-resident cache
+    // GPU FAST PATH: multi-token prefill with GPU-resident KV cache
+    // =====================================================================
+    if n_new > 1 && cache.is_gpu() {
+        let total_len = pos_offset + n_new;
+        let attn_scale = config.attn_scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
+
+        // Append K_new/V_new to GPU cache (no CPU roundtrip)
+        cache.append_gpu(layer_idx, &k_proc, &v_new, n_new, backend)?;
+
+        // Single GPU kernel: batched causal attention across all heads and tokens
+        let k_full = cache.get_k_gpu(layer_idx);
+        let v_full = cache.get_v_gpu(layer_idx);
+
+        return Ok(backend.batched_causal_attention(
+            &q_proc, k_full, v_full,
+            n_new, total_len, pos_offset,
+            num_heads, num_kv_heads, head_dim,
+            attn_scale, config.attn_logit_softcap,
+        ));
+    }
+
+    // =====================================================================
+    // SLOW PATH: prefill without GPU cache, or CPU-resident cache
     // =====================================================================
 
     // Step b: Download K_new and V_new, append to CPU cache

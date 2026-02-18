@@ -13,6 +13,7 @@
 //! - No batched ops, no head transpose/untranspose, no slice/scatter
 
 use std::sync::Mutex;
+use std::time::Instant;
 
 use tracing::{debug, trace};
 
@@ -34,12 +35,12 @@ const MTL_BARRIER_SCOPE_BUFFERS: NSUInteger = 1;
 // ---------------------------------------------------------------------------
 
 /// A buffer allocated on the Metal device with `StorageModeShared`.
-struct MetalBuffer {
+pub(crate) struct MetalBuffer {
     /// Raw `MTLBuffer` Objective-C object pointer.
-    buffer: Id,
+    pub(crate) buffer: Id,
     /// Size in bytes — retained for debugging / future introspection.
     #[allow(dead_code)]
-    len: usize,
+    pub(crate) len: usize,
 }
 
 // Metal shared-mode buffers can be read/written from any thread.
@@ -54,6 +55,19 @@ impl Drop for MetalBuffer {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ProfileCounters — lightweight instrumentation for diagnosing overhead
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct ProfileCounters {
+    flush_count: u64,
+    flush_time_us: u64,
+    alloc_count: u64,
+    alloc_bytes: u64,
+    dispatch_count: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -73,7 +87,7 @@ pub struct MetalBackend {
     device: Id,
     command_queue: Id,
     sels: Selectors,
-    // Pipeline state objects — f32 kernels only (27 total)
+    // Pipeline state objects
     pso_gemm: Id,
     pso_gemm_transpose: Id,
     pso_gelu: Id,
@@ -101,9 +115,14 @@ pub struct MetalBackend {
     pso_quantized_matmul_q4_k: Id,
     pso_quantized_matmul_q5_k: Id,
     pso_quantized_matmul_q6_k: Id,
+    pso_batched_causal_attention: Id,
+    pso_copy_f32_to_f16: Id,
+    pso_grouped_attn_decode_f16: Id,
     /// Active command buffer and compute encoder for deferred dispatch.
     /// `None` means no open command buffer; dispatches create one lazily.
     active_cmd: Mutex<Option<(Id, Id)>>,
+    /// Profile counters for diagnosing per-token overhead.
+    profile: Mutex<ProfileCounters>,
 }
 
 // We flush (waitUntilCompleted) before any CPU read, so the backend can
@@ -147,6 +166,9 @@ impl Drop for MetalBackend {
                 self.pso_quantized_matmul_q4_k,
                 self.pso_quantized_matmul_q5_k,
                 self.pso_quantized_matmul_q6_k,
+                self.pso_batched_causal_attention,
+                self.pso_copy_f32_to_f16,
+                self.pso_grouped_attn_decode_f16,
             ] {
                 if pso != NIL {
                     msg_send_void(pso, rel);
@@ -240,9 +262,12 @@ impl MetalBackend {
                 "quantized_matmul_q4_k",
                 "quantized_matmul_q5_k",
                 "quantized_matmul_q6_k",
+                "batched_causal_attention",
+                "copy_f32_to_f16",
+                "grouped_attn_decode_f16",
             ];
 
-            let mut psos = [NIL; 27];
+            let mut psos = [NIL; 30];
             for (i, name) in kernel_names.iter().enumerate() {
                 let ns_name = ns_string(name);
                 let func =
@@ -292,7 +317,7 @@ impl MetalBackend {
 
             msg_send_void(library, sels.release);
 
-            debug!("MetalBackend initialized with 27 PSOs");
+            debug!("MetalBackend initialized with 30 PSOs");
 
             Ok(Self {
                 device,
@@ -325,7 +350,11 @@ impl MetalBackend {
                 pso_quantized_matmul_q4_k: psos[24],
                 pso_quantized_matmul_q5_k: psos[25],
                 pso_quantized_matmul_q6_k: psos[26],
+                pso_batched_causal_attention: psos[27],
+                pso_copy_f32_to_f16: psos[28],
+                pso_grouped_attn_decode_f16: psos[29],
                 active_cmd: Mutex::new(None),
+                profile: Mutex::new(ProfileCounters::default()),
             })
         }
     }
@@ -369,6 +398,11 @@ impl MetalBackend {
 
     /// Create an uninitialised Metal buffer of `len` bytes.
     unsafe fn create_buffer_empty(&self, len: usize) -> MetalBuffer {
+        {
+            let mut p = self.profile.lock().unwrap();
+            p.alloc_count += 1;
+            p.alloc_bytes += len as u64;
+        }
         let buf = msg_send_new_buffer_length(
             self.device,
             self.sels.new_buffer_with_length,
@@ -420,6 +454,10 @@ impl MetalBackend {
     ///
     /// Returns the encoder to bind buffers/bytes and dispatch on.
     unsafe fn ensure_encoder(&self, pso: Id) -> Id {
+        {
+            let mut p = self.profile.lock().unwrap();
+            p.dispatch_count += 1;
+        }
         let mut guard = self.active_cmd.lock().unwrap();
         let (_, enc) = guard.get_or_insert_with(|| {
             let cmd = msg_send_id(self.command_queue, self.sels.command_buffer);
@@ -449,7 +487,12 @@ impl MetalBackend {
         if let Some((cmd, enc)) = guard.take() {
             msg_send_void(enc, self.sels.end_encoding);
             msg_send_void(cmd, self.sels.commit);
+            let t0 = Instant::now();
             msg_send_void(cmd, self.sels.wait_until_completed);
+            let elapsed_us = t0.elapsed().as_micros() as u64;
+            let mut p = self.profile.lock().unwrap();
+            p.flush_count += 1;
+            p.flush_time_us += elapsed_us;
         }
     }
 
@@ -628,6 +671,31 @@ impl MetalBackend {
 impl ComputeBackend for MetalBackend {
     fn is_gpu(&self) -> bool {
         true
+    }
+
+    fn reset_profile(&self) {
+        let mut p = self.profile.lock().unwrap();
+        *p = ProfileCounters::default();
+    }
+
+    fn profile_summary(&self) -> String {
+        let p = self.profile.lock().unwrap();
+        let flush_ms = p.flush_time_us as f64 / 1000.0;
+        let alloc_mb = p.alloc_bytes as f64 / (1024.0 * 1024.0);
+        format!(
+            "flushes={} flush_time={:.1}ms allocs={} alloc_bytes={:.1}MB dispatches={}",
+            p.flush_count, flush_ms, p.alloc_count, alloc_mb, p.dispatch_count,
+        )
+    }
+
+    fn create_buffer_empty(
+        &self,
+        byte_size: usize,
+        shape: Vec<usize>,
+        dtype: TensorDtype,
+    ) -> DeviceTensor {
+        let buf = unsafe { self.create_buffer_empty(byte_size) };
+        DeviceTensor::from_gpu(shape, dtype, Box::new(buf))
     }
 
     fn upload(&self, tensor: &Tensor) -> DeviceTensor {
@@ -1435,6 +1503,11 @@ impl ComputeBackend for MetalBackend {
         attn_scale: f32,
         softcap: f32,
     ) -> DeviceTensor {
+        assert!(
+            head_dim <= 256,
+            "grouped_attention_decode: head_dim {} exceeds max threadgroup size 256",
+            head_dim
+        );
         let total_dim = num_heads * head_dim;
         let out_bytes = total_dim * std::mem::size_of::<f32>();
 
@@ -1462,6 +1535,58 @@ impl ComputeBackend for MetalBackend {
             );
 
             Self::wrap(out_buf, vec![1, total_dim], TensorDtype::F32)
+        }
+    }
+
+    fn batched_causal_attention(
+        &self,
+        q: &DeviceTensor,
+        k_cache: &DeviceTensor,
+        v_cache: &DeviceTensor,
+        n_tokens: usize,
+        total_len: usize,
+        pos_offset: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        attn_scale: f32,
+        softcap: f32,
+    ) -> DeviceTensor {
+        assert!(
+            head_dim <= 256,
+            "batched_causal_attention: head_dim {} exceeds max threadgroup size 256",
+            head_dim
+        );
+        let total_dim = num_heads * head_dim;
+        let out_bytes = n_tokens * total_dim * std::mem::size_of::<f32>();
+
+        unsafe {
+            let out_buf = self.create_buffer_empty(out_bytes);
+            let enc = self.ensure_encoder(self.pso_batched_causal_attention);
+
+            self.set_buffer(enc, Self::buf_id(q), 0);
+            self.set_buffer(enc, Self::buf_id(k_cache), 1);
+            self.set_buffer(enc, Self::buf_id(v_cache), 2);
+            self.set_buffer(enc, out_buf.buffer, 3);
+            self.set_u32(enc, num_heads as u32, 4);
+            self.set_u32(enc, num_kv_heads as u32, 5);
+            self.set_u32(enc, head_dim as u32, 6);
+            self.set_u32(enc, n_tokens as u32, 7);
+            self.set_u32(enc, total_len as u32, 8);
+            self.set_u32(enc, pos_offset as u32, 9);
+            self.set_f32(enc, attn_scale, 10);
+            self.set_f32(enc, softcap, 11);
+
+            // One threadgroup per (head, query_token) pair, 256 threads each
+            // Flattened 1D: gid = q_idx * num_heads + h
+            msg_send_dispatch(
+                enc,
+                self.sels.dispatch_threadgroups,
+                num_heads * n_tokens, 1, 1,
+                256, 1, 1,
+            );
+
+            Self::wrap(out_buf, vec![n_tokens, total_dim], TensorDtype::F32)
         }
     }
 }
@@ -2436,5 +2561,684 @@ mod tests {
 
         assert_vecs_close(gpu_q_d.as_f32(), cpu_q_d.as_f32(), 1e-3, "rope_neox partial Q");
         assert_vecs_close(gpu_k_d.as_f32(), cpu_k_d.as_f32(), 1e-3, "rope_neox partial K");
+    }
+
+    #[test]
+    fn test_batched_causal_attention_vs_cpu_ref() {
+        // Simple test: 3 query tokens, 2 heads, 4-dim head, no GQA, no softcap
+        let metal = backend();
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let n_tokens = 3;
+        let total_len = 3; // all from this batch
+        let pos_offset = 0;
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Q: [3, 8]  (3 tokens, 2 heads * 4 head_dim)
+        let q_data: Vec<f32> = (0..n_tokens * num_heads * head_dim)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
+        // K: [3, 8]  (3 tokens in cache)
+        let k_data: Vec<f32> = (0..total_len * num_kv_heads * head_dim)
+            .map(|i| (i as f32) * 0.05 + 0.1)
+            .collect();
+        // V: [3, 8]
+        let v_data: Vec<f32> = (0..total_len * num_kv_heads * head_dim)
+            .map(|i| (i as f32) * 0.02)
+            .collect();
+
+        // CPU reference: per-head, per-query causal attention
+        let total_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let mut expected = vec![0.0f32; n_tokens * total_dim];
+
+        for q_idx in 0..n_tokens {
+            let max_attend = pos_offset + q_idx + 1;
+            for h in 0..num_heads {
+                let kv_head = h; // no GQA
+                let q_off = q_idx * total_dim + h * head_dim;
+                let kv_off = kv_head * head_dim;
+
+                // Compute scores
+                let mut scores: Vec<f32> = Vec::new();
+                for j in 0..max_attend {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_data[q_off + d] * k_data[j * kv_dim + kv_off + d];
+                    }
+                    scores.push(dot * attn_scale);
+                }
+
+                // Softmax
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                let sum_exp: f32 = exps.iter().sum();
+                let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+
+                // Weighted sum of V
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for j in 0..max_attend {
+                        acc += probs[j] * v_data[j * kv_dim + kv_off + d];
+                    }
+                    expected[q_idx * total_dim + h * head_dim + d] = acc;
+                }
+            }
+        }
+
+        // Run on Metal
+        let q_gpu = metal.upload(&Tensor::new(vec![n_tokens, total_dim], q_data));
+        let k_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], k_data));
+        let v_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], v_data));
+
+        let result = metal.batched_causal_attention(
+            &q_gpu, &k_gpu, &v_gpu,
+            n_tokens, total_len, pos_offset,
+            num_heads, num_kv_heads, head_dim,
+            attn_scale, 0.0,
+        );
+
+        let result_data = metal.download(&result);
+        assert_vecs_close(result_data.as_f32(), &expected, 1e-4, "batched_causal_attention");
+    }
+
+    #[test]
+    fn test_batched_causal_attention_gqa() {
+        // GQA test: 4 Q heads, 2 KV heads (groups of 2)
+        let metal = backend();
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let n_tokens = 2;
+        let total_len = 2;
+        let pos_offset = 0;
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+
+        let total_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let q_data: Vec<f32> = (0..n_tokens * total_dim)
+            .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
+            .collect();
+        let k_data: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 5) as f32) * 0.08)
+            .collect();
+        let v_data: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 3) as f32) * 0.15)
+            .collect();
+
+        // CPU reference with GQA
+        let mut expected = vec![0.0f32; n_tokens * total_dim];
+        let heads_per_kv = num_heads / num_kv_heads;
+
+        for q_idx in 0..n_tokens {
+            let max_attend = pos_offset + q_idx + 1;
+            for h in 0..num_heads {
+                let kv_head = h / heads_per_kv;
+                let q_off = q_idx * total_dim + h * head_dim;
+                let kv_off = kv_head * head_dim;
+
+                let mut scores: Vec<f32> = Vec::new();
+                for j in 0..max_attend {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_data[q_off + d] * k_data[j * kv_dim + kv_off + d];
+                    }
+                    scores.push(dot * attn_scale);
+                }
+
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                let sum_exp: f32 = exps.iter().sum();
+                let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for j in 0..max_attend {
+                        acc += probs[j] * v_data[j * kv_dim + kv_off + d];
+                    }
+                    expected[q_idx * total_dim + h * head_dim + d] = acc;
+                }
+            }
+        }
+
+        let q_gpu = metal.upload(&Tensor::new(vec![n_tokens, total_dim], q_data));
+        let k_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], k_data));
+        let v_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], v_data));
+
+        let result = metal.batched_causal_attention(
+            &q_gpu, &k_gpu, &v_gpu,
+            n_tokens, total_len, pos_offset,
+            num_heads, num_kv_heads, head_dim,
+            attn_scale, 0.0,
+        );
+
+        let result_data = metal.download(&result);
+        assert_vecs_close(result_data.as_f32(), &expected, 1e-4, "batched_causal_attention_gqa");
+    }
+
+    #[test]
+    fn test_batched_causal_attention_softcap() {
+        // Test softcap > 0: scores are clamped via tanh before softmax
+        let metal = backend();
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let n_tokens = 2;
+        let total_len = 2;
+        let pos_offset = 0;
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+        let softcap = 5.0f32;
+
+        let total_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        // Use larger values to make softcap meaningful
+        let q_data: Vec<f32> = (0..n_tokens * total_dim)
+            .map(|i| (i as f32) * 0.5 - 1.0)
+            .collect();
+        let k_data: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32) * 0.3 + 0.5)
+            .collect();
+        let v_data: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
+
+        // CPU reference with softcap
+        let mut expected = vec![0.0f32; n_tokens * total_dim];
+
+        for q_idx in 0..n_tokens {
+            let max_attend = pos_offset + q_idx + 1;
+            for h in 0..num_heads {
+                let kv_head = h * num_kv_heads / num_heads;
+                let q_off = q_idx * total_dim + h * head_dim;
+                let kv_off = kv_head * head_dim;
+
+                let mut scores: Vec<f32> = Vec::new();
+                for j in 0..max_attend {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_data[q_off + d] * k_data[j * kv_dim + kv_off + d];
+                    }
+                    let mut s = dot * attn_scale;
+                    // Apply softcap: softcap * tanh(s / softcap)
+                    s = softcap * (s / softcap).tanh();
+                    scores.push(s);
+                }
+
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                let sum_exp: f32 = exps.iter().sum();
+                let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for j in 0..max_attend {
+                        acc += probs[j] * v_data[j * kv_dim + kv_off + d];
+                    }
+                    expected[q_idx * total_dim + h * head_dim + d] = acc;
+                }
+            }
+        }
+
+        let q_gpu = metal.upload(&Tensor::new(vec![n_tokens, total_dim], q_data));
+        let k_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], k_data));
+        let v_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], v_data));
+
+        let result = metal.batched_causal_attention(
+            &q_gpu, &k_gpu, &v_gpu,
+            n_tokens, total_len, pos_offset,
+            num_heads, num_kv_heads, head_dim,
+            attn_scale, softcap,
+        );
+
+        let result_data = metal.download(&result);
+        assert_vecs_close(
+            result_data.as_f32(), &expected, 1e-4,
+            "batched_causal_attention_softcap",
+        );
+    }
+
+    #[test]
+    fn test_batched_causal_attention_pos_offset() {
+        // Test continuation: pos_offset > 0, simulating appending to existing KV cache
+        // Cache has 5 positions already, we add 3 more query tokens
+        let metal = backend();
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let n_tokens = 3;
+        let pos_offset = 5;
+        let total_len = pos_offset + n_tokens; // 8
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+
+        let total_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let q_data: Vec<f32> = (0..n_tokens * total_dim)
+            .map(|i| ((i % 11) as f32) * 0.1 - 0.5)
+            .collect();
+        // Full KV cache (8 positions)
+        let k_data: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 7) as f32) * 0.05 + 0.1)
+            .collect();
+        let v_data: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 13) as f32) * 0.02)
+            .collect();
+
+        // CPU reference
+        let mut expected = vec![0.0f32; n_tokens * total_dim];
+
+        for q_idx in 0..n_tokens {
+            // Causal: query at position (pos_offset + q_idx) attends to [0, pos_offset + q_idx]
+            let max_attend = pos_offset + q_idx + 1;
+            for h in 0..num_heads {
+                let kv_head = h * num_kv_heads / num_heads;
+                let q_off = q_idx * total_dim + h * head_dim;
+                let kv_off = kv_head * head_dim;
+
+                let mut scores: Vec<f32> = Vec::new();
+                for j in 0..max_attend {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_data[q_off + d] * k_data[j * kv_dim + kv_off + d];
+                    }
+                    scores.push(dot * attn_scale);
+                }
+
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                let sum_exp: f32 = exps.iter().sum();
+                let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for j in 0..max_attend {
+                        acc += probs[j] * v_data[j * kv_dim + kv_off + d];
+                    }
+                    expected[q_idx * total_dim + h * head_dim + d] = acc;
+                }
+            }
+        }
+
+        let q_gpu = metal.upload(&Tensor::new(vec![n_tokens, total_dim], q_data));
+        let k_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], k_data));
+        let v_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], v_data));
+
+        let result = metal.batched_causal_attention(
+            &q_gpu, &k_gpu, &v_gpu,
+            n_tokens, total_len, pos_offset,
+            num_heads, num_kv_heads, head_dim,
+            attn_scale, 0.0,
+        );
+
+        let result_data = metal.download(&result);
+        assert_vecs_close(
+            result_data.as_f32(), &expected, 1e-4,
+            "batched_causal_attention_pos_offset",
+        );
+    }
+
+    #[test]
+    fn test_copy_f32_to_f16() {
+        // Test F32→F16 conversion kernel
+        let metal = backend();
+        let count = 64usize;
+        let src_data: Vec<f32> = (0..count).map(|i| (i as f32) * 0.1 - 3.0).collect();
+
+        // Create F32 source buffer
+        let src_buf = metal.upload(&Tensor::new(vec![count], src_data.clone()));
+
+        // Create F16 dest buffer (2 bytes per element)
+        let dest_bytes = count * 2;
+        let dest_buf = unsafe {
+            let mb = metal.create_buffer_empty(dest_bytes);
+            DeviceTensor::from_gpu(vec![count], TensorDtype::F16, Box::new(mb))
+        };
+
+        // Dispatch copy kernel
+        unsafe {
+            let enc = metal.ensure_encoder(metal.pso_copy_f32_to_f16);
+            metal.set_buffer(enc, MetalBackend::buf_id(&src_buf), 0);
+            metal.set_buffer(enc, MetalBackend::buf_id(&dest_buf), 1);
+            metal.set_u32(enc, count as u32, 2);
+            metal.set_u32(enc, 0u32, 3); // dest_offset = 0
+            let threads = 256usize;
+            let groups = (count + threads - 1) / threads;
+            ffi::msg_send_dispatch(
+                enc,
+                metal.sels.dispatch_threadgroups,
+                groups, 1, 1,
+                threads, 1, 1,
+            );
+            metal.flush();
+        }
+
+        // Read back F16 data and verify
+        let mb = dest_buf.gpu_inner::<MetalBuffer>().unwrap();
+        let ptr = unsafe { ffi::msg_send_ptr(mb.buffer, metal.sels.contents) as *const u16 };
+        let f16_data: Vec<u16> = unsafe { std::slice::from_raw_parts(ptr, count).to_vec() };
+
+        for (i, &f16_val) in f16_data.iter().enumerate() {
+            let f32_back = half::f16::from_bits(f16_val).to_f32();
+            let expected = src_data[i];
+            assert!(
+                (f32_back - expected).abs() < 0.01,
+                "copy_f32_to_f16 mismatch at {}: got {} expected {} (diff {})",
+                i, f32_back, expected, (f32_back - expected).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_copy_f32_to_f16_with_offset() {
+        // Test F32→F16 conversion with non-zero dest_offset
+        let metal = backend();
+        let count = 16usize;
+        let dest_offset = 8usize;
+        let total_dest = dest_offset + count;
+
+        let src_data: Vec<f32> = (0..count).map(|i| (i as f32) * 0.5).collect();
+
+        let src_buf = metal.upload(&Tensor::new(vec![count], src_data.clone()));
+
+        // Create F16 dest buffer large enough for offset + data
+        let dest_bytes = total_dest * 2;
+        let dest_buf = unsafe {
+            let mb = metal.create_buffer_empty(dest_bytes);
+            DeviceTensor::from_gpu(vec![total_dest], TensorDtype::F16, Box::new(mb))
+        };
+
+        unsafe {
+            let enc = metal.ensure_encoder(metal.pso_copy_f32_to_f16);
+            metal.set_buffer(enc, MetalBackend::buf_id(&src_buf), 0);
+            metal.set_buffer(enc, MetalBackend::buf_id(&dest_buf), 1);
+            metal.set_u32(enc, count as u32, 2);
+            metal.set_u32(enc, dest_offset as u32, 3);
+            let threads = 256usize;
+            let groups = (count + threads - 1) / threads;
+            ffi::msg_send_dispatch(
+                enc,
+                metal.sels.dispatch_threadgroups,
+                groups, 1, 1,
+                threads, 1, 1,
+            );
+            metal.flush();
+        }
+
+        // Read back and verify only the offset portion
+        let mb = dest_buf.gpu_inner::<MetalBuffer>().unwrap();
+        let ptr = unsafe { ffi::msg_send_ptr(mb.buffer, metal.sels.contents) as *const u16 };
+        let f16_data: Vec<u16> =
+            unsafe { std::slice::from_raw_parts(ptr.add(dest_offset), count).to_vec() };
+
+        for (i, &f16_val) in f16_data.iter().enumerate() {
+            let f32_back = half::f16::from_bits(f16_val).to_f32();
+            let expected = src_data[i];
+            assert!(
+                (f32_back - expected).abs() < 0.01,
+                "copy_f32_to_f16 offset mismatch at {}: got {} expected {}",
+                i, f32_back, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_grouped_attn_decode_f16() {
+        // Test F16 KV cache attention against CPU reference (F32)
+        let metal = backend();
+        let num_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let total_len = 5;
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+
+        let total_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        // Q: [1, total_dim]
+        let q_data: Vec<f32> = (0..total_dim)
+            .map(|i| (i as f32) * 0.2 - 0.4)
+            .collect();
+        // K, V: [total_len, kv_dim] — will be converted to F16
+        let k_data: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 9) as f32) * 0.1 - 0.3)
+            .collect();
+        let v_data: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 5) as f32) * 0.15)
+            .collect();
+
+        // CPU reference
+        let mut expected = vec![0.0f32; total_dim];
+        for h in 0..num_heads {
+            let kv_head = h * num_kv_heads / num_heads;
+            let kv_off = kv_head * head_dim;
+
+            let mut scores: Vec<f32> = Vec::new();
+            for j in 0..total_len {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q_data[h * head_dim + d] * k_data[j * kv_dim + kv_off + d];
+                }
+                scores.push(dot * attn_scale);
+            }
+
+            let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+            let sum_exp: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for j in 0..total_len {
+                    acc += probs[j] * v_data[j * kv_dim + kv_off + d];
+                }
+                expected[h * head_dim + d] = acc;
+            }
+        }
+
+        // Upload Q as F32
+        let q_gpu = metal.upload(&Tensor::new(vec![1, total_dim], q_data));
+
+        // Convert K and V to F16 on GPU
+        let k_f32 = metal.upload(&Tensor::new(vec![total_len, kv_dim], k_data));
+        let v_f32 = metal.upload(&Tensor::new(vec![total_len, kv_dim], v_data));
+
+        let k_count = total_len * kv_dim;
+        let v_count = total_len * kv_dim;
+        let k_f16 = unsafe {
+            let mb = metal.create_buffer_empty(k_count * 2);
+            DeviceTensor::from_gpu(
+                vec![total_len, kv_dim], TensorDtype::F16, Box::new(mb),
+            )
+        };
+        let v_f16 = unsafe {
+            let mb = metal.create_buffer_empty(v_count * 2);
+            DeviceTensor::from_gpu(
+                vec![total_len, kv_dim], TensorDtype::F16, Box::new(mb),
+            )
+        };
+
+        // Copy F32 → F16 for K
+        unsafe {
+            let enc = metal.ensure_encoder(metal.pso_copy_f32_to_f16);
+            metal.set_buffer(enc, MetalBackend::buf_id(&k_f32), 0);
+            metal.set_buffer(enc, MetalBackend::buf_id(&k_f16), 1);
+            metal.set_u32(enc, k_count as u32, 2);
+            metal.set_u32(enc, 0u32, 3);
+            let threads = 256usize;
+            let groups = (k_count + threads - 1) / threads;
+            ffi::msg_send_dispatch(
+                enc, metal.sels.dispatch_threadgroups,
+                groups, 1, 1, threads, 1, 1,
+            );
+        }
+        // Copy F32 → F16 for V
+        unsafe {
+            let enc = metal.ensure_encoder(metal.pso_copy_f32_to_f16);
+            metal.set_buffer(enc, MetalBackend::buf_id(&v_f32), 0);
+            metal.set_buffer(enc, MetalBackend::buf_id(&v_f16), 1);
+            metal.set_u32(enc, v_count as u32, 2);
+            metal.set_u32(enc, 0u32, 3);
+            let threads = 256usize;
+            let groups = (v_count + threads - 1) / threads;
+            ffi::msg_send_dispatch(
+                enc, metal.sels.dispatch_threadgroups,
+                groups, 1, 1, threads, 1, 1,
+            );
+        }
+
+        // Dispatch grouped_attn_decode_f16
+        let out_bytes = total_dim * std::mem::size_of::<f32>();
+        let result = unsafe {
+            let out_buf = metal.create_buffer_empty(out_bytes);
+            let enc = metal.ensure_encoder(metal.pso_grouped_attn_decode_f16);
+            metal.set_buffer(enc, MetalBackend::buf_id(&q_gpu), 0);
+            metal.set_buffer(enc, MetalBackend::buf_id(&k_f16), 1);
+            metal.set_buffer(enc, MetalBackend::buf_id(&v_f16), 2);
+            metal.set_buffer(enc, out_buf.buffer, 3);
+            metal.set_u32(enc, num_heads as u32, 4);
+            metal.set_u32(enc, num_kv_heads as u32, 5);
+            metal.set_u32(enc, head_dim as u32, 6);
+            metal.set_u32(enc, total_len as u32, 7);
+            metal.set_f32(enc, attn_scale, 8);
+            metal.set_f32(enc, 0.0f32, 9); // no softcap
+            ffi::msg_send_dispatch(
+                enc, metal.sels.dispatch_threadgroups,
+                num_heads, 1, 1, 256, 1, 1,
+            );
+
+            MetalBackend::wrap(out_buf, vec![1, total_dim], TensorDtype::F32)
+        };
+
+        let result_data = metal.download(&result);
+        // Slightly higher tolerance due to F16 quantization
+        assert_vecs_close(
+            result_data.as_f32(), &expected, 0.02,
+            "grouped_attn_decode_f16",
+        );
+    }
+
+    #[test]
+    fn test_grouped_attn_decode_f16_gqa() {
+        // GQA test with F16: 4 Q heads, 2 KV heads
+        let metal = backend();
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let total_len = 4;
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+
+        let total_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let q_data: Vec<f32> = (0..total_dim)
+            .map(|i| ((i % 7) as f32) * 0.15 - 0.5)
+            .collect();
+        let k_data: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 11) as f32) * 0.08 - 0.2)
+            .collect();
+        let v_data: Vec<f32> = (0..total_len * kv_dim)
+            .map(|i| ((i % 5) as f32) * 0.12)
+            .collect();
+
+        // CPU reference
+        let mut expected = vec![0.0f32; total_dim];
+        for h in 0..num_heads {
+            let kv_head = h * num_kv_heads / num_heads;
+            let kv_off = kv_head * head_dim;
+
+            let mut scores: Vec<f32> = Vec::new();
+            for j in 0..total_len {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q_data[h * head_dim + d] * k_data[j * kv_dim + kv_off + d];
+                }
+                scores.push(dot * attn_scale);
+            }
+
+            let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+            let sum_exp: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for j in 0..total_len {
+                    acc += probs[j] * v_data[j * kv_dim + kv_off + d];
+                }
+                expected[h * head_dim + d] = acc;
+            }
+        }
+
+        let q_gpu = metal.upload(&Tensor::new(vec![1, total_dim], q_data));
+
+        // Convert K, V to F16
+        let k_f32 = metal.upload(&Tensor::new(vec![total_len, kv_dim], k_data));
+        let v_f32 = metal.upload(&Tensor::new(vec![total_len, kv_dim], v_data));
+        let k_count = total_len * kv_dim;
+        let v_count = total_len * kv_dim;
+
+        let k_f16 = unsafe {
+            let mb = metal.create_buffer_empty(k_count * 2);
+            DeviceTensor::from_gpu(vec![total_len, kv_dim], TensorDtype::F16, Box::new(mb))
+        };
+        let v_f16 = unsafe {
+            let mb = metal.create_buffer_empty(v_count * 2);
+            DeviceTensor::from_gpu(vec![total_len, kv_dim], TensorDtype::F16, Box::new(mb))
+        };
+
+        // Copy F32 → F16
+        unsafe {
+            let enc = metal.ensure_encoder(metal.pso_copy_f32_to_f16);
+            metal.set_buffer(enc, MetalBackend::buf_id(&k_f32), 0);
+            metal.set_buffer(enc, MetalBackend::buf_id(&k_f16), 1);
+            metal.set_u32(enc, k_count as u32, 2);
+            metal.set_u32(enc, 0u32, 3);
+            ffi::msg_send_dispatch(
+                enc, metal.sels.dispatch_threadgroups,
+                (k_count + 255) / 256, 1, 1, 256, 1, 1,
+            );
+        }
+        unsafe {
+            let enc = metal.ensure_encoder(metal.pso_copy_f32_to_f16);
+            metal.set_buffer(enc, MetalBackend::buf_id(&v_f32), 0);
+            metal.set_buffer(enc, MetalBackend::buf_id(&v_f16), 1);
+            metal.set_u32(enc, v_count as u32, 2);
+            metal.set_u32(enc, 0u32, 3);
+            ffi::msg_send_dispatch(
+                enc, metal.sels.dispatch_threadgroups,
+                (v_count + 255) / 256, 1, 1, 256, 1, 1,
+            );
+        }
+
+        // Dispatch attention
+        let out_bytes = total_dim * std::mem::size_of::<f32>();
+        let result = unsafe {
+            let out_buf = metal.create_buffer_empty(out_bytes);
+            let enc = metal.ensure_encoder(metal.pso_grouped_attn_decode_f16);
+            metal.set_buffer(enc, MetalBackend::buf_id(&q_gpu), 0);
+            metal.set_buffer(enc, MetalBackend::buf_id(&k_f16), 1);
+            metal.set_buffer(enc, MetalBackend::buf_id(&v_f16), 2);
+            metal.set_buffer(enc, out_buf.buffer, 3);
+            metal.set_u32(enc, num_heads as u32, 4);
+            metal.set_u32(enc, num_kv_heads as u32, 5);
+            metal.set_u32(enc, head_dim as u32, 6);
+            metal.set_u32(enc, total_len as u32, 7);
+            metal.set_f32(enc, attn_scale, 8);
+            metal.set_f32(enc, 0.0f32, 9);
+            ffi::msg_send_dispatch(
+                enc, metal.sels.dispatch_threadgroups,
+                num_heads, 1, 1, 256, 1, 1,
+            );
+            MetalBackend::wrap(out_buf, vec![1, total_dim], TensorDtype::F32)
+        };
+
+        let result_data = metal.download(&result);
+        assert_vecs_close(
+            result_data.as_f32(), &expected, 0.02,
+            "grouped_attn_decode_f16_gqa",
+        );
     }
 }
