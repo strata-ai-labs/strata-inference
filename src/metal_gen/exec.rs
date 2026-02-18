@@ -98,6 +98,17 @@ impl MetalResources {
             "gemm_transpose_bias",           // MatmulTransposeBias = 27
             "batched_causal_attention",      // BatchedCausalAttention = 28
             "batched_causal_attention_f16",  // BatchedCausalAttentionF16 = 29
+            // Phase 4: Batched quantized matmul for prefill
+            "batched_matmul_q8_0",           // BatchedMatmulQ8_0 = 30
+            "batched_matmul_bias_q8_0",      // BatchedMatmulBiasQ8_0 = 31
+            "batched_matmul_q4_0",           // BatchedMatmulQ4_0 = 32
+            "batched_matmul_bias_q4_0",      // BatchedMatmulBiasQ4_0 = 33
+            "batched_matmul_q4_k",           // BatchedMatmulQ4K = 34
+            "batched_matmul_bias_q4_k",      // BatchedMatmulBiasQ4K = 35
+            "batched_matmul_q5_k",           // BatchedMatmulQ5K = 36
+            "batched_matmul_bias_q5_k",      // BatchedMatmulBiasQ5K = 37
+            "batched_matmul_q6_k",           // BatchedMatmulQ6K = 38
+            "batched_matmul_bias_q6_k",      // BatchedMatmulBiasQ6K = 39
         ];
 
         let mut psos = Vec::with_capacity(kernel_names.len());

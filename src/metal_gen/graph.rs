@@ -62,6 +62,17 @@ pub(crate) enum PsoRef {
     // Phase 3: Batched causal attention for prefill
     BatchedCausalAttention,
     BatchedCausalAttentionF16,
+    // Phase 4: Batched quantized matmul for prefill
+    BatchedMatmulQ8_0,
+    BatchedMatmulBiasQ8_0,
+    BatchedMatmulQ4_0,
+    BatchedMatmulBiasQ4_0,
+    BatchedMatmulQ4K,
+    BatchedMatmulBiasQ4K,
+    BatchedMatmulQ5K,
+    BatchedMatmulBiasQ5K,
+    BatchedMatmulQ6K,
+    BatchedMatmulBiasQ6K,
 }
 
 /// Parameter value: either fixed at build time or patched per-token.
@@ -1677,8 +1688,9 @@ fn emit_norm_multi(
     }
 }
 
-/// Multi-token linear: quantized matmuls use M row-loop dispatches with offsets,
-/// F32 matmuls use native M>1 via the M parameter.
+/// Multi-token linear: both quantized and F32 matmuls use native M>1 via the M
+/// parameter. Quantized types use batched GEMM kernels with fused dequant;
+/// F32/F16 types use gemm_transpose / gemm_transpose_bias.
 fn emit_linear_multi(
     b: &mut GraphBuilder,
     input: BufferSlot,
@@ -1735,54 +1747,54 @@ fn emit_linear_multi(
             }
         }
         _ => {
-            // Quantized matmul: M=1 kernel, emit M dispatches with row offsets
-            let (pso, pso_bias, threadgroups, threads) = match dtype {
-                TensorDtype::Q8_0 => (PsoRef::QuantizedMatmulQ8_0, PsoRef::QuantizedMatmulBiasQ8_0, ((n + 7) / 8) as u32, 128u32),
-                TensorDtype::Q4_0 => (PsoRef::QuantizedMatmulQ4_0, PsoRef::QuantizedMatmulBiasQ4_0, ((n + 7) / 8) as u32, 64u32),
-                TensorDtype::Q4_K => (PsoRef::QuantizedMatmulQ4K, PsoRef::QuantizedMatmulBiasQ4K, ((n + 3) / 4) as u32, 64u32),
-                TensorDtype::Q5_K => (PsoRef::QuantizedMatmulQ5K, PsoRef::QuantizedMatmulBiasQ5K, ((n + 3) / 4) as u32, 64u32),
-                TensorDtype::Q6_K => (PsoRef::QuantizedMatmulQ6K, PsoRef::QuantizedMatmulBiasQ6K, ((n + 3) / 4) as u32, 64u32),
+            // Batched quantized GEMM: single dispatch for all M rows
+            let (pso, pso_bias) = match dtype {
+                TensorDtype::Q8_0 => (PsoRef::BatchedMatmulQ8_0, PsoRef::BatchedMatmulBiasQ8_0),
+                TensorDtype::Q4_0 => (PsoRef::BatchedMatmulQ4_0, PsoRef::BatchedMatmulBiasQ4_0),
+                TensorDtype::Q4_K => (PsoRef::BatchedMatmulQ4K, PsoRef::BatchedMatmulBiasQ4K),
+                TensorDtype::Q5_K => (PsoRef::BatchedMatmulQ5K, PsoRef::BatchedMatmulBiasQ5K),
+                TensorDtype::Q6_K => (PsoRef::BatchedMatmulQ6K, PsoRef::BatchedMatmulBiasQ6K),
                 _ => panic!("unsupported quantized dtype for prefill: {:?}", dtype),
             };
 
-            for row in 0..m {
-                let in_offset = (row * k * 4) as u32;  // byte offset into input [M, k]
-                let out_offset = (row * n * 4) as u32;  // byte offset into output [M, n]
+            let gx = ((n + 31) / 32) as u32;  // ceil(N/BN)
+            let gy = ((m + 31) / 32) as u32;  // ceil(M/BM)
 
-                if let Some(bias) = bias_ref {
-                    b.ops.push(DecodeOp {
-                        pso: pso_bias,
-                        bindings: vec![
-                            (weight_ref, 0, 0),
-                            (BufferRef::Pool(input), 1, in_offset),
-                            (BufferRef::Pool(out), 2, out_offset),
-                            (bias, 5, 0),
-                        ],
-                        params: vec![
-                            (ParamValue::U32(n as u32), 3),
-                            (ParamValue::U32(k as u32), 4),
-                        ],
-                        dispatch: DispatchDims::Fixed { gx: threadgroups, gy: 1, gz: 1, tx: threads, ty: 1, tz: 1 },
-                        reads: vec![weight_ref, BufferRef::Pool(input), bias],
-                        writes: Some(BufferRef::Pool(out)),
-                    });
-                } else {
-                    b.ops.push(DecodeOp {
-                        pso,
-                        bindings: vec![
-                            (weight_ref, 0, 0),
-                            (BufferRef::Pool(input), 1, in_offset),
-                            (BufferRef::Pool(out), 2, out_offset),
-                        ],
-                        params: vec![
-                            (ParamValue::U32(n as u32), 3),
-                            (ParamValue::U32(k as u32), 4),
-                        ],
-                        dispatch: DispatchDims::Fixed { gx: threadgroups, gy: 1, gz: 1, tx: threads, ty: 1, tz: 1 },
-                        reads: vec![weight_ref, BufferRef::Pool(input)],
-                        writes: Some(BufferRef::Pool(out)),
-                    });
-                }
+            if let Some(bias) = bias_ref {
+                b.ops.push(DecodeOp {
+                    pso: pso_bias,
+                    bindings: vec![
+                        (weight_ref, 0, 0),
+                        (BufferRef::Pool(input), 1, 0),
+                        (BufferRef::Pool(out), 2, 0),
+                        (bias, 6, 0),
+                    ],
+                    params: vec![
+                        (ParamValue::U32(m as u32), 3),
+                        (ParamValue::U32(k as u32), 4),
+                        (ParamValue::U32(n as u32), 5),
+                    ],
+                    dispatch: DispatchDims::Fixed { gx, gy, gz: 1, tx: 128, ty: 1, tz: 1 },
+                    reads: vec![weight_ref, BufferRef::Pool(input), bias],
+                    writes: Some(BufferRef::Pool(out)),
+                });
+            } else {
+                b.ops.push(DecodeOp {
+                    pso,
+                    bindings: vec![
+                        (weight_ref, 0, 0),
+                        (BufferRef::Pool(input), 1, 0),
+                        (BufferRef::Pool(out), 2, 0),
+                    ],
+                    params: vec![
+                        (ParamValue::U32(m as u32), 3),
+                        (ParamValue::U32(k as u32), 4),
+                        (ParamValue::U32(n as u32), 5),
+                    ],
+                    dispatch: DispatchDims::Fixed { gx, gy, gz: 1, tx: 128, ty: 1, tz: 1 },
+                    reads: vec![weight_ref, BufferRef::Pool(input)],
+                    writes: Some(BufferRef::Pool(out)),
+                });
             }
         }
     }
@@ -2068,13 +2080,13 @@ mod tests {
         let count: usize = shape.iter().product();
         match dtype {
             TensorDtype::F32 => DeviceTensor::new(Tensor::new(shape, vec![0.0f32; count])),
-            TensorDtype::Q8_0 => {
+            _ => {
+                // All quantized types
                 let block_size = dtype.block_size();
                 let block_bytes = dtype.block_byte_size();
                 let n_blocks = (count + block_size - 1) / block_size;
                 DeviceTensor::new(Tensor::from_quantized(shape, dtype, vec![0u8; n_blocks * block_bytes]))
             }
-            _ => panic!("test helper only supports F32 and Q8_0"),
         }
     }
 
@@ -2880,21 +2892,14 @@ mod tests {
         let m = 8;
         let graph = PrefillGraph::build(&config, &weights, m, false);
 
-        // GPT-2 1-layer prefill:
+        // GPT-2 1-layer prefill with batched quantized GEMM:
         //   Pre-layer: embedding_lookup(tok) + embedding_lookup(pos) + add = 3 ops
-        //   Per layer:
-        //     norm(1) + Q/K/V matmul(3, each M dispatches for Q8_0) + copy_k(1) + copy_v(1)
-        //     + batched_attention(1) + O_proj(M dispatches) + add_residual(1)
-        //     + norm(1) + up_proj(M dispatches) + gelu(1) + down_proj(M dispatches) + add_residual(1)
+        //   Per layer (each quantized matmul is now 1 op regardless of M):
+        //     norm(1) + Q(1) + K(1) + V(1) + copy_k(1) + copy_v(1) + attn(1)
+        //     + O(1) + add(1) + norm(1) + up(1) + gelu(1) + down(1) + add(1) = 14
         //   Post-layer: norm(1) + copy_last_token(1) + logits_proj(1 dispatch for F32 tied emb)
-        //
-        //   Quantized matmuls emit M ops each. For Q8_0 with M=8:
-        //   Per layer: norm(1) + Q(8) + K(8) + V(8) + copy_k(1) + copy_v(1) + attn(1)
-        //     + O(8) + add(1) + norm(1) + up(8) + gelu(1) + down(8) + add(1)
-        //     = 56 ops per layer
-        //   Pre = 3, Post = 3 (norm + copy + logits)
-        //   Total = 3 + 56 + 3 = 62
-        let expected_per_layer = 1 + 3 * m + 1 + 1 + 1 + m + 1 + 1 + m + 1 + m + 1; // 56
+        //   Total = 3 + 14 + 3 = 20
+        let expected_per_layer = 14;
         let expected_total = 3 + config.num_layers * expected_per_layer + 3;
         assert_eq!(
             graph.ops.len(), expected_total,
@@ -2913,16 +2918,14 @@ mod tests {
         let m = 4;
         let graph = PrefillGraph::build(&config, &weights, m, false);
 
-        // LLaMA 1-layer prefill (pre-norm, RoPE, SwiGLU, no bias, GQA):
+        // LLaMA 1-layer prefill with batched quantized GEMM (pre-norm, RoPE, SwiGLU, no bias, GQA):
         //   Pre-layer: embedding_lookup(tok) = 1 op (no pos embedding)
-        //   Per layer:
-        //     rms_norm(1) + Q(M) + K(M) + V(M) + rope_q(1) + rope_k(1)
-        //     + copy_k(1) + copy_v(1) + batched_attn(1) + O_proj(M) + add(1)
-        //     + rms_norm(1) + gate(M) + up(M) + swiglu(1) + down(M) + add(1)
+        //   Per layer (each quantized matmul is now 1 op regardless of M):
+        //     rms_norm(1) + Q(1) + K(1) + V(1) + rope_q(1) + rope_k(1)
+        //     + copy_k(1) + copy_v(1) + batched_attn(1) + O_proj(1) + add(1)
+        //     + rms_norm(1) + gate(1) + up(1) + swiglu(1) + down(1) + add(1) = 17
         //   Post-layer: rms_norm(1) + copy_last_token(1) + logits_proj(1 for F32)
-        //   Total per layer = 1 + 3*M + 1 + 1 + 1 + 1 + 1 + M + 1 + 1 + 3*M + 1 + M + 1
-        //                   = 10 + 7*M
-        let expected_per_layer = 10 + 7 * m;
+        let expected_per_layer = 17;
         let expected_total = 1 + config.num_layers * expected_per_layer + 3;
         assert_eq!(
             graph.ops.len(), expected_total,
@@ -2949,9 +2952,10 @@ mod tests {
         let decode = DecodeGraph::build(&config, &weights, false);
         let prefill = PrefillGraph::build(&config, &weights, 1, false);
 
-        // With M=1, quantized matmuls emit 1 dispatch each (same as decode).
+        // With M=1, batched quantized matmuls emit 1 dispatch each (same count as decode).
         // The PSO types should match, except:
         //   - decode uses GroupedAttnDecode, prefill uses BatchedCausalAttention
+        //   - decode uses QuantizedMatmul*, prefill uses BatchedMatmul*
         //   - prefill has an extra CopyBuffer op for last-token extraction before logits
         //     (decode doesn't need this since it only has 1 token)
         assert_eq!(
@@ -2961,7 +2965,7 @@ mod tests {
         );
 
         // Compare the layer ops (before the final norm/logits section).
-        // The first N-2 decode ops should match the first N-2 prefill ops (modulo attention PSO).
+        // The first N-2 decode ops should match the first N-2 prefill ops (modulo attention/matmul PSO).
         let layer_end = decode.ops.len() - 2; // skip final norm + logits
         for i in 0..layer_end {
             let d = decode.ops[i].pso;
@@ -2969,6 +2973,17 @@ mod tests {
             match (d, p) {
                 (PsoRef::GroupedAttnDecode, PsoRef::BatchedCausalAttention) => {}
                 (PsoRef::GroupedAttnDecodeF16, PsoRef::BatchedCausalAttentionF16) => {}
+                // Decode uses M=1 quantized matmul, prefill uses batched quantized matmul
+                (PsoRef::QuantizedMatmulQ8_0, PsoRef::BatchedMatmulQ8_0) => {}
+                (PsoRef::QuantizedMatmulBiasQ8_0, PsoRef::BatchedMatmulBiasQ8_0) => {}
+                (PsoRef::QuantizedMatmulQ4_0, PsoRef::BatchedMatmulQ4_0) => {}
+                (PsoRef::QuantizedMatmulBiasQ4_0, PsoRef::BatchedMatmulBiasQ4_0) => {}
+                (PsoRef::QuantizedMatmulQ4K, PsoRef::BatchedMatmulQ4K) => {}
+                (PsoRef::QuantizedMatmulBiasQ4K, PsoRef::BatchedMatmulBiasQ4K) => {}
+                (PsoRef::QuantizedMatmulQ5K, PsoRef::BatchedMatmulQ5K) => {}
+                (PsoRef::QuantizedMatmulBiasQ5K, PsoRef::BatchedMatmulBiasQ5K) => {}
+                (PsoRef::QuantizedMatmulQ6K, PsoRef::BatchedMatmulQ6K) => {}
+                (PsoRef::QuantizedMatmulBiasQ6K, PsoRef::BatchedMatmulBiasQ6K) => {}
                 _ => {
                     assert_eq!(d, p, "Op[{}] PSO mismatch: decode={:?}, prefill={:?}", i, d, p);
                 }
@@ -2977,11 +2992,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Quantized matmul row-loop: verify M dispatches with correct byte offsets
+    // Batched quantized matmul: verify single dispatch per matmul
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_prefill_quantized_matmul_row_offsets() {
+    fn test_prefill_batched_quantized_matmul() {
         let config = gpt2_1layer_config();
         let weights = gpt2_weights(&config);
         let m = 5;
@@ -2989,97 +3004,49 @@ mod tests {
 
         let h = config.hidden_size; // 768
 
-        // GPT-2 has bias, so uses fused QuantizedMatmulBiasQ8_0.
-        // Find consecutive groups of this PSO type.
-        let mut qmatmul_groups: Vec<Vec<usize>> = Vec::new();
-        let mut current_group: Vec<usize> = Vec::new();
+        // GPT-2 has bias, so uses fused BatchedMatmulBiasQ8_0.
+        // With batched kernels, each matmul is a single dispatch.
+        let batched_ops: Vec<(usize, &DecodeOp)> = graph.ops.iter().enumerate()
+            .filter(|(_, op)| op.pso == PsoRef::BatchedMatmulBiasQ8_0)
+            .collect();
 
-        for (i, op) in graph.ops.iter().enumerate() {
-            if op.pso == PsoRef::QuantizedMatmulBiasQ8_0 {
-                current_group.push(i);
-            } else {
-                if !current_group.is_empty() {
-                    qmatmul_groups.push(std::mem::take(&mut current_group));
-                }
-            }
-        }
-        if !current_group.is_empty() {
-            qmatmul_groups.push(current_group);
-        }
-
-        // GPT-2 1-layer pre-norm path: Q, K, V are consecutive (no intervening ops),
-        // forming 1 group of 3M ops. Then O (M), up (M), down (M) = 4 groups total.
+        // GPT-2 1-layer: Q, K, V, O, up, down = 6 batched matmul ops
         assert_eq!(
-            qmatmul_groups.len(), 4,
-            "Expected 4 groups of consecutive Q8_0 fused matmul+bias ops, got {}",
-            qmatmul_groups.len()
+            batched_ops.len(), 6,
+            "Expected 6 BatchedMatmulBiasQ8_0 ops (Q,K,V,O,up,down), got {}",
+            batched_ops.len()
         );
 
-        // First group = Q+K+V = 3*M ops; remaining groups = M ops each
-        assert_eq!(qmatmul_groups[0].len(), 3 * m,
-            "First group (Q+K+V) should have 3*M={} ops, got {}", 3 * m, qmatmul_groups[0].len());
-        for g in 1..4 {
-            assert_eq!(
-                qmatmul_groups[g].len(), m,
-                "Matmul group {} should have {} ops (one per row), got {}",
-                g, m, qmatmul_groups[g].len()
-            );
+        // Each op should have M param at binding index 3
+        for (i, (_, op)) in batched_ops.iter().enumerate() {
+            let m_param = op.params.iter().find(|(_, idx)| *idx == 3).unwrap();
+            if let ParamValue::U32(m_val) = m_param.0 {
+                assert_eq!(m_val, m as u32, "Op {} M param should be {}, got {}", i, m, m_val);
+            } else {
+                panic!("Op {} M param should be U32", i);
+            }
+
+            // All buffer bindings should have offset 0 (no row offsets)
+            for (_, bind_idx, offset) in &op.bindings {
+                assert_eq!(
+                    *offset, 0,
+                    "Op {} binding {} should have offset 0, got {}",
+                    i, bind_idx, offset
+                );
+            }
+
+            // Bias binding should be at index 6 (not 5 as in M=1 kernel)
+            let bias_binding = op.bindings.iter().find(|(_, idx, _)| *idx == 6);
+            assert!(bias_binding.is_some(), "Op {} should have bias at binding index 6", i);
         }
 
-        // Check offsets in the Q projection (first M ops of group 0)
-        // Q projection: input=[M,768], output=[M,768], each row dispatch has incremental offsets.
-        let first_group = &qmatmul_groups[0];
-        for row in 0..m {
-            let op = &graph.ops[first_group[row]];
-
-            // Input binding (index 1) should have byte offset = row * k * 4
-            let input_binding = op.bindings.iter().find(|(_, idx, _)| *idx == 1).unwrap();
-            let expected_in_offset = (row * h * 4) as u32;
-            assert_eq!(
-                input_binding.2, expected_in_offset,
-                "Q row {} input offset: expected {}, got {}",
-                row, expected_in_offset, input_binding.2
-            );
-
-            // Output binding (index 2) should have byte offset = row * n * 4
-            let out_binding = op.bindings.iter().find(|(_, idx, _)| *idx == 2).unwrap();
-            let expected_out_offset = (row * h * 4) as u32; // n = h for Q proj
-            assert_eq!(
-                out_binding.2, expected_out_offset,
-                "Q row {} output offset: expected {}, got {}",
-                row, expected_out_offset, out_binding.2
-            );
-
-            // Bias binding (index 5) should have byte offset = 0 (same bias for all rows)
-            let bias_binding = op.bindings.iter().find(|(_, idx, _)| *idx == 5).unwrap();
-            assert_eq!(
-                bias_binding.2, 0,
-                "Q row {} bias offset should be 0 (shared), got {}",
-                row, bias_binding.2
-            );
-        }
-
-        // Also verify K projection offsets (next M ops in group 0)
-        // K projection: input=[M,768], output=[M,kv_dim]
-        let kv_dim = config.num_kv_heads * config.head_dim;
-        for row in 0..m {
-            let op = &graph.ops[first_group[m + row]];
-
-            let input_binding = op.bindings.iter().find(|(_, idx, _)| *idx == 1).unwrap();
-            let expected_in_offset = (row * h * 4) as u32; // input is normed [M, h]
-            assert_eq!(
-                input_binding.2, expected_in_offset,
-                "K row {} input offset: expected {}, got {}",
-                row, expected_in_offset, input_binding.2
-            );
-
-            let out_binding = op.bindings.iter().find(|(_, idx, _)| *idx == 2).unwrap();
-            let expected_out_offset = (row * kv_dim * 4) as u32; // output is [M, kv_dim]
-            assert_eq!(
-                out_binding.2, expected_out_offset,
-                "K row {} output offset: expected {}, got {}",
-                row, expected_out_offset, out_binding.2
-            );
+        // Verify dispatch grid for Q projection (first op)
+        let q_op = batched_ops[0].1;
+        if let DispatchDims::Fixed { gx, gy, .. } = q_op.dispatch {
+            assert_eq!(gx, ((h + 31) / 32) as u32, "Q proj gx should be ceil(N/32)");
+            assert_eq!(gy, ((m + 31) / 32) as u32, "Q proj gy should be ceil(M/32)");
+        } else {
+            panic!("Expected Fixed dispatch for batched matmul");
         }
     }
 
@@ -3612,6 +3579,272 @@ mod tests {
             let v_idx = (layer * 2 + 1) as u16;
             assert!(kv_indices.contains(&k_idx), "Missing K cache for layer {}", layer);
             assert!(kv_indices.contains(&v_idx), "Missing V cache for layer {}", layer);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Batched matmul no-bias path (LLaMA has no bias)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prefill_batched_matmul_no_bias() {
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let m = 7;
+        let graph = PrefillGraph::build(&config, &weights, m, false);
+
+        // LLaMA uses Q8_0 without bias → BatchedMatmulQ8_0
+        let batched_nobias: Vec<&DecodeOp> = graph.ops.iter()
+            .filter(|op| op.pso == PsoRef::BatchedMatmulQ8_0)
+            .collect();
+
+        // LLaMA 1-layer: Q, K, V, O, gate, up, down = 7 matmuls (no bias)
+        assert_eq!(
+            batched_nobias.len(), 7,
+            "Expected 7 BatchedMatmulQ8_0 ops for LLaMA (no bias), got {}",
+            batched_nobias.len()
+        );
+
+        // No bias ops should exist
+        let batched_bias: usize = graph.ops.iter()
+            .filter(|op| op.pso == PsoRef::BatchedMatmulBiasQ8_0)
+            .count();
+        assert_eq!(batched_bias, 0, "LLaMA should have no bias matmul ops");
+
+        // Each no-bias op should NOT have a binding at index 6 (no bias buffer)
+        for (i, op) in batched_nobias.iter().enumerate() {
+            let has_bias_binding = op.bindings.iter().any(|(_, idx, _)| *idx == 6);
+            assert!(!has_bias_binding, "No-bias op {} should not have binding at index 6", i);
+
+            // Should have 3 bindings: weights(0), input(1), output(2)
+            assert_eq!(op.bindings.len(), 3, "No-bias op {} should have 3 bindings", i);
+
+            // All offsets should be 0
+            for (_, bind_idx, offset) in &op.bindings {
+                assert_eq!(*offset, 0, "Op {} binding {} offset should be 0", i, bind_idx);
+            }
+
+            // Should have 3 params: M(3), K(4), N(5)
+            assert_eq!(op.params.len(), 3, "No-bias op {} should have 3 params", i);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Batched matmul M boundary cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prefill_batched_matmul_m_boundary() {
+        let config = gpt2_1layer_config();
+        let weights = gpt2_weights(&config);
+
+        // M=1: single row, should still use batched kernel (gy = ceil(1/32) = 1)
+        let graph_m1 = PrefillGraph::build(&config, &weights, 1, false);
+        let m1_ops: Vec<&DecodeOp> = graph_m1.ops.iter()
+            .filter(|op| op.pso == PsoRef::BatchedMatmulBiasQ8_0)
+            .collect();
+        assert_eq!(m1_ops.len(), 6, "M=1 should have 6 batched matmul ops");
+        for op in &m1_ops {
+            if let DispatchDims::Fixed { gy, .. } = op.dispatch {
+                assert_eq!(gy, 1, "M=1: gy should be 1 (ceil(1/32))");
+            }
+            let m_param = op.params.iter().find(|(_, idx)| *idx == 3).unwrap();
+            if let ParamValue::U32(m_val) = m_param.0 {
+                assert_eq!(m_val, 1, "M=1: M param should be 1");
+            }
+        }
+
+        // M=32: exactly one tile, gy = 1
+        let graph_m32 = PrefillGraph::build(&config, &weights, 32, false);
+        let m32_ops: Vec<&DecodeOp> = graph_m32.ops.iter()
+            .filter(|op| op.pso == PsoRef::BatchedMatmulBiasQ8_0)
+            .collect();
+        for op in &m32_ops {
+            if let DispatchDims::Fixed { gy, .. } = op.dispatch {
+                assert_eq!(gy, 1, "M=32: gy should be 1 (ceil(32/32))");
+            }
+        }
+
+        // M=33: crosses tile boundary, gy = 2
+        let graph_m33 = PrefillGraph::build(&config, &weights, 33, false);
+        let m33_ops: Vec<&DecodeOp> = graph_m33.ops.iter()
+            .filter(|op| op.pso == PsoRef::BatchedMatmulBiasQ8_0)
+            .collect();
+        for op in &m33_ops {
+            if let DispatchDims::Fixed { gy, .. } = op.dispatch {
+                assert_eq!(gy, 2, "M=33: gy should be 2 (ceil(33/32))");
+            }
+        }
+
+        // Verify total op count is constant regardless of M (no row-loop)
+        assert_eq!(
+            graph_m1.ops.len(), graph_m32.ops.len(),
+            "M=1 and M=32 should have same total op count (no row loop)"
+        );
+        assert_eq!(
+            graph_m32.ops.len(), graph_m33.ops.len(),
+            "M=32 and M=33 should have same total op count (no row loop)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // K-quant batched matmul: Q4_K weights produce BatchedMatmulQ4K ops
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prefill_batched_matmul_kquant() {
+        // Create a LLaMA config with Q4_K weights
+        let config = llama_1layer_config();
+        let h = config.hidden_size;
+        let ffn = config.ffn_hidden;
+        let v = config.vocab_size;
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let total_dim = config.num_heads * config.head_dim;
+        let qtype = TensorDtype::Q4_K;
+
+        let layers: Vec<LayerWeights> = (0..config.num_layers)
+            .map(|_| LayerWeights {
+                attn_norm_w: Some(dt(vec![h], TensorDtype::F32)),
+                attn_norm_b: None,
+                ffn_norm_w: Some(dt(vec![h], TensorDtype::F32)),
+                ffn_norm_b: None,
+                attn_output_norm_w: None,
+                attn_output_norm_b: None,
+                ffn_output_norm_w: None,
+                ffn_output_norm_b: None,
+                attn_q: dt(vec![total_dim, h], qtype),
+                attn_k: dt(vec![kv_dim, h], qtype),
+                attn_v: dt(vec![kv_dim, h], qtype),
+                attn_output: dt(vec![h, total_dim], qtype),
+                attn_q_bias: None,
+                attn_k_bias: None,
+                attn_v_bias: None,
+                attn_output_bias: None,
+                ffn_up: dt(vec![ffn, h], qtype),
+                ffn_down: dt(vec![h, ffn], qtype),
+                ffn_gate: Some(dt(vec![ffn, h], qtype)),
+                ffn_up_bias: None,
+                ffn_down_bias: None,
+                attn_q_norm_w: None,
+                attn_k_norm_w: None,
+                attn_post_norm_w: None,
+                ffn_post_norm_w: None,
+            })
+            .collect();
+
+        let weights = ModelWeights {
+            token_embedding: dt(vec![v, h], TensorDtype::F32),
+            position_embedding: None,
+            token_type_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers,
+            output_norm_w: Some(dt(vec![h], TensorDtype::F32)),
+            output_norm_b: None,
+            output_projection: None,
+        };
+
+        let m = 5;
+        let graph = PrefillGraph::build(&config, &weights, m, false);
+
+        // Should use BatchedMatmulQ4K (not Q8_0)
+        let q4k_ops = count_prefill_pso(&graph, PsoRef::BatchedMatmulQ4K);
+        let q8_ops = count_prefill_pso(&graph, PsoRef::BatchedMatmulQ8_0);
+
+        // Q, K, V, O, gate, up, down = 7 matmuls
+        assert_eq!(q4k_ops, 7, "Q4_K weights should produce 7 BatchedMatmulQ4K ops, got {}", q4k_ops);
+        assert_eq!(q8_ops, 0, "Q4_K weights should produce 0 BatchedMatmulQ8_0 ops");
+
+        // Total op count should be constant (same as Q8_0 LLaMA)
+        let expected_per_layer = 17; // same structure as Q8_0 LLaMA
+        let expected_total = 1 + config.num_layers * expected_per_layer + 3;
+        assert_eq!(
+            graph.ops.len(), expected_total,
+            "Q4_K LLaMA M={} should have {} ops, got {}",
+            m, expected_total, graph.ops.len()
+        );
+
+        // Verify grid dimensions use 128 threads (same as Q8_0 batched)
+        let q4k_op = graph.ops.iter().find(|op| op.pso == PsoRef::BatchedMatmulQ4K).unwrap();
+        if let DispatchDims::Fixed { tx, .. } = q4k_op.dispatch {
+            assert_eq!(tx, 128, "Q4_K batched matmul should use 128 threads");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // M=1 prefill op count with batched kernels matches decode + 1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prefill_m1_op_count_invariant() {
+        // Verify that M=1 prefill has exactly 1 more op than decode
+        // regardless of quant type (Q8_0 or K-quant)
+        for (name, config, weights) in [
+            ("GPT-2 Q8_0", gpt2_1layer_config(), gpt2_weights(&gpt2_1layer_config())),
+            ("LLaMA Q8_0", llama_1layer_config(), llama_weights(&llama_1layer_config())),
+        ] {
+            let decode = DecodeGraph::build(&config, &weights, false);
+            let prefill = PrefillGraph::build(&config, &weights, 1, false);
+
+            assert_eq!(
+                prefill.ops.len(), decode.ops.len() + 1,
+                "{}: M=1 prefill ({}) should have exactly 1 more op than decode ({})",
+                name, prefill.ops.len(), decode.ops.len()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Batched matmul dispatch grid correctness for non-square dimensions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prefill_batched_matmul_grid_dims() {
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let m = 13;
+        let graph = PrefillGraph::build(&config, &weights, m, false);
+
+        let h = config.hidden_size;          // 2048
+        let kv_dim = config.num_kv_heads * config.head_dim; // 4 * 64 = 256
+        let total_dim = config.num_heads * config.head_dim;  // 32 * 64 = 2048
+        let ffn = config.ffn_hidden;          // 5632
+
+        // Collect all batched matmul ops
+        let batched_ops: Vec<&DecodeOp> = graph.ops.iter()
+            .filter(|op| op.pso == PsoRef::BatchedMatmulQ8_0)
+            .collect();
+
+        // LLaMA: Q(total_dim), K(kv_dim), V(kv_dim), O(h), gate(ffn), up(ffn), down(h) = 7
+        assert_eq!(batched_ops.len(), 7);
+
+        // Check that dispatch grids match the output dimensions
+        let expected_n_dims = [total_dim, kv_dim, kv_dim, h, ffn, ffn, h];
+        let expected_gy = ((m + 31) / 32) as u32; // ceil(13/32) = 1
+
+        for (i, (op, &expected_n)) in batched_ops.iter().zip(expected_n_dims.iter()).enumerate() {
+            if let DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } = op.dispatch {
+                let expected_gx = ((expected_n + 31) / 32) as u32;
+                assert_eq!(gx, expected_gx,
+                    "Op {} (N={}): gx should be ceil({}/32)={}, got {}",
+                    i, expected_n, expected_n, expected_gx, gx);
+                assert_eq!(gy, expected_gy,
+                    "Op {} (N={}): gy should be ceil({}/32)={}, got {}",
+                    i, expected_n, m, expected_gy, gy);
+                assert_eq!(gz, 1);
+                assert_eq!(tx, 128);
+                assert_eq!(ty, 1);
+                assert_eq!(tz, 1);
+            } else {
+                panic!("Op {}: expected Fixed dispatch", i);
+            }
+
+            // Verify N param (binding 5) matches expected_n
+            let n_param = op.params.iter().find(|(_, idx)| *idx == 5).unwrap();
+            if let ParamValue::U32(n_val) = n_param.0 {
+                assert_eq!(n_val, expected_n as u32,
+                    "Op {}: N param should be {}, got {}", i, expected_n, n_val);
+            }
         }
     }
 }
