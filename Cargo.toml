@@ -43,3 +43,8 @@ required-features = ["cli"]
 name = "strata-generate"
 path = "src/bin/generate.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "strata-metal-generate"
+path = "src/bin/metal_generate.rs"
+required-features = ["cli", "metal"]

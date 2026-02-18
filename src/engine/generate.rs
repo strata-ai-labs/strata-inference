@@ -286,6 +286,8 @@ impl GenerationEngine {
             ));
         }
 
+        let profiling = std::env::var("STRATA_PROFILE").map_or(false, |v| v == "1");
+
         let prompt_ids = self.tokenizer.encode(prompt, true);
         let prompt_tokens = prompt_ids.len();
 
@@ -319,6 +321,9 @@ impl GenerationEngine {
         }
 
         // Prefill (timed separately from tokenization/setup)
+        if profiling {
+            self.backend.reset_profile();
+        }
         let prefill_start = Instant::now();
         let hidden = model_forward_step(
             &prompt_ids,
@@ -332,10 +337,18 @@ impl GenerationEngine {
         let mut next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
         let prefill_duration = prefill_start.elapsed();
 
+        if profiling {
+            let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
+            eprintln!(
+                "[profile] prefill: {:.1}ms ({} tokens) | {}",
+                prefill_ms, prompt_tokens, self.backend.profile_summary(),
+            );
+        }
+
         // Decode loop — track why we stopped
         let mut stop_reason = StopReason::MaxTokens; // default if loop exhausts
 
-        for _ in 0..gen_config.max_tokens {
+        for step in 0..gen_config.max_tokens {
             if stop_tokens.contains(&next_token) {
                 stop_reason = StopReason::StopToken;
                 break;
@@ -353,6 +366,11 @@ impl GenerationEngine {
                 break;
             }
 
+            if profiling {
+                self.backend.reset_profile();
+            }
+            let tok_start = Instant::now();
+
             let hidden = model_forward_step(
                 &[next_token],
                 &self.weights,
@@ -360,9 +378,24 @@ impl GenerationEngine {
                 self.backend.as_ref(),
                 &mut cache,
             )?;
+            let fwd_ms = tok_start.elapsed().as_secs_f64() * 1000.0;
 
+            let logits_start = Instant::now();
             let logits = self.project_to_logits(&hidden, 0);
+            let logits_ms = logits_start.elapsed().as_secs_f64() * 1000.0;
+
+            let sample_start = Instant::now();
             next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
+            let sample_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
+
+            if profiling {
+                let total_ms = tok_start.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[profile] tok {}: {:.1}ms (fwd={:.1}ms logits={:.1}ms sample={:.1}ms) | {}",
+                    step + 1, total_ms, fwd_ms, logits_ms, sample_ms,
+                    self.backend.profile_summary(),
+                );
+            }
         }
 
         Ok(GenerationOutput {

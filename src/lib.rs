@@ -5,6 +5,8 @@ pub mod tensor;
 pub mod backend;
 pub mod model;
 pub mod engine;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal_gen;
 #[cfg(feature = "cli")]
 pub mod cli;
 

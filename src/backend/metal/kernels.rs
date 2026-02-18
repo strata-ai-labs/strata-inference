@@ -834,10 +834,10 @@ kernel void rope_norm(
     output[idx1] = x0 * sin_theta + x1 * cos_theta;
 
     // Copy non-rotated dimensions (rope_dim .. head_dim) for this head.
-    // Each pair-thread copies one non-rotated element to avoid redundant work.
-    uint non_rot_idx = rope_dim + pair;
-    if (non_rot_idx < head_dim) {
-        uint src = base_idx + non_rot_idx;
+    // Distribute across pair-threads with strided loop.
+    uint half_rope = rope_dim / 2;
+    for (uint nr = pair; nr < head_dim - rope_dim; nr += half_rope) {
+        uint src = base_idx + rope_dim + nr;
         output[src] = input[src];
     }
 }
@@ -896,10 +896,9 @@ kernel void rope_neox(
     output[idx_hi] = x_lo * sin_theta + x_hi * cos_theta;
 
     // Copy non-rotated dimensions (rope_dim .. head_dim) for this head.
-    // Each thread copies one non-rotated element to avoid redundant work.
-    uint non_rot_idx = rope_dim + i;
-    if (non_rot_idx < head_dim) {
-        uint src = base_idx + non_rot_idx;
+    // Distribute across threads with strided loop.
+    for (uint nr = i; nr < head_dim - rope_dim; nr += half_rope) {
+        uint src = base_idx + rope_dim + nr;
         output[src] = input[src];
     }
 }
@@ -1433,6 +1432,742 @@ kernel void copy_buffer(
 {
     if (gid < count) {
         dest[dest_offset + gid] = src[gid];
+    }
+}
+
+// -----------------------------------------------------------------------
+// 16. copy_f32_to_f16 — Convert F32 to F16 and copy into destination.
+//     Used for writing F32 K/V projections into F16 KV cache.
+//     src: f32[count], dest: f16[...], writes at dest[dest_offset..].
+// -----------------------------------------------------------------------
+kernel void copy_f32_to_f16(
+    device const float* src         [[buffer(0)]],
+    device       half*  dest        [[buffer(1)]],
+    constant     uint&  count       [[buffer(2)]],
+    constant     uint&  dest_offset [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < count) {
+        dest[dest_offset + gid] = half(src[gid]);
+    }
+}
+
+// =========================================================================
+// Fused matmul+bias kernels — eliminate separate add_bias dispatch
+// =========================================================================
+
+// -----------------------------------------------------------------------
+// quantized_matmul_bias_q8_0 — Q8_0 matmul with fused bias addition
+//   Same as quantized_matmul_q8_0 but adds bias[row] after reduction.
+// -----------------------------------------------------------------------
+kernel void quantized_matmul_bias_q8_0(
+    device const char*  weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  N       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const float* bias    [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint nb = K / QK8_0;
+    const uint r0 = (tgpig.x * N_SG_Q8 + sgitg) * N_R0_Q8;
+
+    constexpr short NQ = 8;
+
+    device const block_q8_0 * ax[N_R0_Q8];
+    for (short row = 0; row < N_R0_Q8; ++row) {
+        ax[row] = (device const block_q8_0 *)(weights + (r0 + row) * nb * 34);
+    }
+
+    float sumf[N_R0_Q8] = { 0.0f };
+
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+
+    const int ib0 = ix;
+    float yl[NQ];
+    device const float * yb = input + ib0 * QK8_0 + il * NQ;
+
+    for (int ib = ib0; ib < (int)nb; ib += NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+        for (short row = 0; row < N_R0_Q8; ++row) {
+            device const int8_t * qs = ax[row][ib].qs + il * NQ;
+            float sumq = 0.0f;
+            for (short i = 0; i < NQ; ++i) {
+                sumq += float(qs[i]) * yl[i];
+            }
+            sumf[row] += sumq * float(ax[row][ib].d);
+        }
+        yb += NQ * QK8_0;
+    }
+
+    for (short row = 0; row < N_R0_Q8; ++row) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && (r0 + row) < N) {
+            output[r0 + row] = tot + bias[r0 + row];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// quantized_matmul_bias_q4_0 — Q4_0 matmul with fused bias addition
+// -----------------------------------------------------------------------
+kernel void quantized_matmul_bias_q4_0(
+    device const char*  weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  N       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const float* bias    [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint nb = K / QK4_0;
+    const uint r0 = (tgpig.x * N_SG_Q4 + sgitg) * N_R0_Q4;
+
+    device const block_q4_0 * ax[N_R0_Q4];
+    for (short row = 0; row < N_R0_Q4; ++row) {
+        ax[row] = (device const block_q4_0 *)(weights + (r0 + row) * nb * 18);
+    }
+
+    float sumf[N_R0_Q4] = { 0.0f };
+
+    constexpr short NQ = 16;
+    const short ix = tiisg / (NW / NQ);
+    const short il = (tiisg % (NW / NQ)) * 8;
+
+    const int ib0 = ix;
+    device const float * yb = input + ib0 * QK4_0 + il;
+
+    for (int ib = ib0; ib < (int)nb; ib += NQ) {
+        float yl[16];
+        float sumy0 = 0.0f;
+        float sumy1 = 0.0f;
+        for (short i = 0; i < 8; ++i) {
+            yl[i]     = yb[i];
+            yl[i + 8] = yb[i + 16];
+            sumy0 += yl[i];
+            sumy1 += yl[i + 8];
+        }
+        for (short row = 0; row < N_R0_Q4; ++row) {
+            device const uint8_t * qs = ax[row][ib].qs + il / 2;
+            float sumq = 0.0f;
+            for (short i = 0; i < 8; ++i) {
+                uint8_t qbyte = qs[i];
+                float q_lo = float(qbyte & 0x0F);
+                float q_hi = float(qbyte >> 4);
+                sumq += q_lo * yl[i] + q_hi * yl[i + 8];
+            }
+            sumf[row] += float(ax[row][ib].d) * (sumq - 8.0f * (sumy0 + sumy1));
+        }
+        yb += NQ * QK4_0;
+    }
+
+    for (short row = 0; row < N_R0_Q4; ++row) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && (r0 + row) < N) {
+            output[r0 + row] = tot + bias[r0 + row];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// quantized_matmul_bias_q4_k — Q4_K matmul with fused bias addition
+// -----------------------------------------------------------------------
+kernel void quantized_matmul_bias_q4_k(
+    device const char*  weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  N       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const float* bias    [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint nb = K / QK_K;
+    const uint first_row = (tgpig.x * N_SG_KQ + sgitg) * N_R0_KQ;
+
+    constexpr ushort kmask1 = 0x3f3f;
+    constexpr ushort kmask2 = 0x0f0f;
+    constexpr ushort kmask3 = 0xc0c0;
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    float sumf[N_R0_KQ] = {0.f};
+
+    device const float * y4 = input + ix * QK_K + 64 * iq + 8 * ir;
+
+    ushort sc16[4];
+    thread const uchar * sc8 = (thread const uchar *)sc16;
+
+    float yl[16];
+    float yh[16];
+
+    for (int ib = ix; ib < (int)nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short i = 0; i < 8; ++i) {
+            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
+            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
+            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
+            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        }
+
+        for (short row = 0; row < N_R0_KQ; ++row) {
+            uint actual_row = first_row + row;
+            if (actual_row >= N) continue;
+
+            device const uchar*  bp = (device const uchar*)(weights + actual_row * nb * Q4_K_BLOCK_SIZE + ib * Q4_K_BLOCK_SIZE);
+            device const half*   dh = (device const half*)bp;
+            device const ushort* sc = (device const ushort*)(bp + 4) + iq;
+            device const ushort* q1 = (device const ushort*)(bp + 16) + 16 * iq + 4 * ir;
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const ushort * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += float(dh[0]) * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                          (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                          (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                          (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         float(dh[1]) * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+
+        y4 += 4 * QK_K;
+    }
+
+    for (short row = 0; row < N_R0_KQ; ++row) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && (first_row + row) < N) {
+            output[first_row + row] = tot + bias[first_row + row];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// quantized_matmul_bias_q5_k — Q5_K matmul with fused bias addition
+// -----------------------------------------------------------------------
+kernel void quantized_matmul_bias_q5_k(
+    device const char*  weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  N       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const float* bias    [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint nb = K / QK_K;
+    const uint first_row = (tgpig.x * N_SG_KQ + sgitg) * N_R0_KQ;
+
+    const short elem_offset = tiisg * 8;
+    const short sb   = elem_offset / 32;
+    const short pos  = elem_offset % 32;
+    const short pair = sb / 2;
+    const bool  is_high = (sb & 1);
+    const uchar qh_bit  = uchar(1 << sb);
+
+    float sumf[N_R0_KQ] = {0.f};
+
+    for (int ib = 0; ib < (int)nb; ib++) {
+        device const float* y = input + ib * QK_K + elem_offset;
+        float yl[8];
+        for (short i = 0; i < 8; i++) yl[i] = y[i];
+
+        for (short row = 0; row < N_R0_KQ; ++row) {
+            uint actual_row = first_row + row;
+            if (actual_row >= N) continue;
+
+            device const uchar* bp = (device const uchar*)(weights + actual_row * nb * Q5_K_BLOCK_SIZE + ib * Q5_K_BLOCK_SIZE);
+            float d_val    = float(*(device const half*)(bp));
+            float dmin_val = float(*(device const half*)(bp + 2));
+            device const uchar* sa = bp + 4;
+            device const uchar* qh_arr = bp + 16;
+            device const uchar* qs_arr = bp + 48;
+
+            uchar sc_val, m_val;
+            if (sb < 4) {
+                sc_val = sa[sb] & 63;
+                m_val  = sa[sb + 4] & 63;
+            } else {
+                sc_val = (sa[sb + 4] & 0xF) | ((sa[sb - 4] >> 6) << 4);
+                m_val  = (sa[sb + 4] >> 4)  | ((sa[sb]     >> 6) << 4);
+            }
+            float sc_f = d_val * float(sc_val);
+            float m_f  = dmin_val * float(m_val);
+
+            float partial = 0.f;
+            for (short i = 0; i < 8; i++) {
+                short l = pos + i;
+                uchar q_low  = is_high ? (qs_arr[pair * 32 + l] >> 4)
+                                       : (qs_arr[pair * 32 + l] & 0xF);
+                uchar q_high = (qh_arr[l] & qh_bit) ? 16 : 0;
+                partial += (sc_f * float(q_low + q_high) - m_f) * yl[i];
+            }
+            sumf[row] += partial;
+        }
+    }
+
+    for (short row = 0; row < N_R0_KQ; ++row) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && (first_row + row) < N) {
+            output[first_row + row] = tot + bias[first_row + row];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// quantized_matmul_bias_q6_k — Q6_K matmul with fused bias addition
+// -----------------------------------------------------------------------
+kernel void quantized_matmul_bias_q6_k(
+    device const char*  weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  N       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const float* bias    [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint nb = K / QK_K;
+    const uint first_row = (tgpig.x * N_SG_KQ + sgitg) * N_R0_KQ;
+
+    const short elem_offset = tiisg * 8;
+    const short half_idx    = elem_offset / 128;
+    const short within_half = elem_offset % 128;
+    const short group32     = within_half / 32;
+    const short pos         = within_half % 32;
+
+    const uint  ql_off   = half_idx * 64 + ((group32 & 1) ? 32 : 0);
+    const uint  qh_off   = half_idx * 32;
+    const short qh_shift = group32 * 2;
+    const bool  high_nib = (group32 >= 2);
+    const short sc_off   = half_idx * 8 + group32 * 2;
+
+    float sumf[N_R0_KQ] = {0.f};
+
+    for (int ib = 0; ib < (int)nb; ib++) {
+        device const float* y = input + ib * QK_K + elem_offset;
+        float yl[8];
+        for (short i = 0; i < 8; i++) yl[i] = y[i];
+
+        for (short row = 0; row < N_R0_KQ; ++row) {
+            uint actual_row = first_row + row;
+            if (actual_row >= N) continue;
+
+            device const uchar* bp = (device const uchar*)(weights + actual_row * nb * Q6_K_BLOCK_SIZE + ib * Q6_K_BLOCK_SIZE);
+            device const uchar* ql = bp;
+            device const uchar* qh = bp + 128;
+            device const char*  sc = (device const char*)(bp + 192);
+            float d = float(*(device const half*)(bp + 208));
+
+            float partial = 0.f;
+            for (short i = 0; i < 8; i++) {
+                short l = pos + i;
+                uchar ql_byte = ql[ql_off + l];
+                uchar qh_byte = qh[qh_off + l];
+                uchar q_low   = high_nib ? (ql_byte >> 4) : (ql_byte & 0xF);
+                uchar q_high  = (qh_byte >> qh_shift) & 3;
+                int   q_val   = int(q_low | (q_high << 4)) - 32;
+                char  scale   = sc[sc_off + (l / 16)];
+                partial += d * float(scale) * float(q_val) * yl[i];
+            }
+            sumf[row] += partial;
+        }
+    }
+
+    for (short row = 0; row < N_R0_KQ; ++row) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && (first_row + row) < N) {
+            output[first_row + row] = tot + bias[first_row + row];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// gemm_transpose_bias — F32 GEMM with transpose + fused bias addition
+//   C[M,N] = A[M,K] * B^T + bias[N]   where B is stored as (N,K)
+// -----------------------------------------------------------------------
+kernel void gemm_transpose_bias(
+    device const float* A       [[buffer(0)]],
+    device const float* B       [[buffer(1)]],
+    device       float* C       [[buffer(2)]],
+    constant     uint&  M       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    constant     uint&  N       [[buffer(5)]],
+    device const float* bias    [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+    uint tile_row = tgid.y * BM;
+    uint tile_col = tgid.x * BN;
+
+    uint sg_row = (sgid / 2) * 16;
+    uint sg_col = (sgid % 2) * 16;
+
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2; ++i)
+        for (uint j = 0; j < 2; ++j)
+            acc[i][j] = simdgroup_matrix<float, 8, 8>(0);
+
+    threadgroup float tgA[BM * BK];
+    threadgroup float tgB[BK * BN];
+
+    uint num_k_tiles = (K + BK - 1) / BK;
+
+    for (uint kt = 0; kt < num_k_tiles; ++kt) {
+        uint k_base = kt * BK;
+
+        for (uint idx = lid; idx < BM * BK; idx += 128) {
+            uint r = idx / BK;
+            uint c = idx % BK;
+            uint gr = tile_row + r;
+            uint gc = k_base + c;
+            tgA[r * BK + c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+        }
+        for (uint idx = lid; idx < BK * BN; idx += 128) {
+            uint r = idx / BN;
+            uint c = idx % BN;
+            uint gk = k_base + r;
+            uint gn = tile_col + c;
+            tgB[r * BN + c] = (gk < K && gn < N) ? B[gn * K + gk] : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < BK; kk += 8) {
+            simdgroup_matrix<float, 8, 8> a_mat[2];
+            simdgroup_matrix<float, 8, 8> b_mat[2];
+
+            simdgroup_load(a_mat[0], &tgA[(sg_row + 0) * BK + kk], BK);
+            simdgroup_load(a_mat[1], &tgA[(sg_row + 8) * BK + kk], BK);
+
+            simdgroup_load(b_mat[0], &tgB[kk * BN + (sg_col + 0)], BN);
+            simdgroup_load(b_mat[1], &tgB[kk * BN + (sg_col + 8)], BN);
+
+            simdgroup_multiply_accumulate(acc[0][0], a_mat[0], b_mat[0], acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], a_mat[0], b_mat[1], acc[0][1]);
+            simdgroup_multiply_accumulate(acc[1][0], a_mat[1], b_mat[0], acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], a_mat[1], b_mat[1], acc[1][1]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results with bias addition
+    // Use staging to add bias then write
+    threadgroup float staging[BM * BN];
+    uint base = sg_row * BN + sg_col;
+    simdgroup_store(acc[0][0], &staging[base + 0 * BN + 0], BN);
+    simdgroup_store(acc[0][1], &staging[base + 0 * BN + 8], BN);
+    simdgroup_store(acc[1][0], &staging[base + 8 * BN + 0], BN);
+    simdgroup_store(acc[1][1], &staging[base + 8 * BN + 8], BN);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = lid; idx < BM * BN; idx += 128) {
+        uint r = idx / BN;
+        uint c = idx % BN;
+        uint gr = tile_row + r;
+        uint gc = tile_col + c;
+        if (gr < M && gc < N) {
+            C[gr * N + gc] = staging[r * BN + c] + bias[gc];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// grouped_attn_decode_f16 — Online softmax attention reading F16 K/V cache
+//
+//   Single-pass online softmax (Milakov & Gimelshein 2018):
+//   No separate max-finding pass needed. Updates running max, running sum,
+//   and V accumulator in a single scan over positions.
+//
+//   Reads F16 K and V cache (half the bandwidth of F32).
+//   Q is still F32 (comes from matmul output).
+// -----------------------------------------------------------------------
+kernel void grouped_attn_decode_f16(
+    device const float* Q       [[buffer(0)]],
+    device const half*  K       [[buffer(1)]],
+    device const half*  V       [[buffer(2)]],
+    device       float* output  [[buffer(3)]],
+    constant     uint&  num_heads    [[buffer(4)]],
+    constant     uint&  num_kv_heads [[buffer(5)]],
+    constant     uint&  head_dim     [[buffer(6)]],
+    constant     uint&  total_len    [[buffer(7)]],
+    constant     float& attn_scale   [[buffer(8)]],
+    constant     float& softcap      [[buffer(9)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tpg  [[threads_per_threadgroup]])
+{
+    uint h = gid;
+    if (h >= num_heads) return;
+
+    uint kv_dim = num_kv_heads * head_dim;
+    uint kv_head = h * num_kv_heads / num_heads;
+    device const float* q_head = Q + h * head_dim;
+    uint kv_off = kv_head * head_dim;
+
+    threadgroup float shared[256];
+
+    // ---- Single-pass online softmax ----
+    // Each thread processes positions strided by tpg, maintaining its own
+    // running_max, running_sum, and v_acc (for its output dimension lid).
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float v_acc = 0.0f;
+
+    for (uint tile = 0; tile < total_len; tile += tpg) {
+        uint j = tile + lid;
+
+        // Step A: each thread computes score for position j
+        float score = -INFINITY;
+        if (j < total_len) {
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; ++d) {
+                dot += q_head[d] * float(K[j * kv_dim + kv_off + d]);
+            }
+            score = dot * attn_scale;
+            if (softcap > 0.0f) {
+                score = softcap * precise::tanh(score / softcap);
+            }
+        }
+        // Store score in shared memory so all threads can access all scores in this tile
+        shared[lid] = score;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step B: threads parallel over head_dim dimensions
+        // For each position in this tile, update online softmax state
+        uint active = min(tpg, total_len - tile);
+        if (lid < head_dim) {
+            for (uint t = 0; t < active; ++t) {
+                float s = shared[t];
+                if (s > running_max) {
+                    float correction = exp(running_max - s);
+                    running_sum = running_sum * correction + 1.0f;
+                    v_acc = v_acc * correction + float(V[(tile + t) * kv_dim + kv_off + lid]);
+                    running_max = s;
+                } else {
+                    float w = exp(s - running_max);
+                    running_sum += w;
+                    v_acc += w * float(V[(tile + t) * kv_dim + kv_off + lid]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write normalized output
+    if (lid < head_dim) {
+        device float* out_head = output + h * head_dim;
+        out_head[lid] = (running_sum > 0.0f) ? (v_acc / running_sum) : 0.0f;
+    }
+}
+
+// ===========================================================================
+// Phase 3: Batched causal attention for prefill
+// ===========================================================================
+
+// Multi-token causal attention with online softmax. Reads F32 K/V cache.
+// One threadgroup per (head, query_token) pair.
+// Dispatch: (num_heads, n_tokens, 1) threadgroups, 256 threads each.
+kernel void batched_causal_attention(
+    device const float* Q        [[buffer(0)]],   // [n_tokens, num_heads * head_dim]
+    device const float* K        [[buffer(1)]],   // [max_seq_len, num_kv_heads * head_dim]
+    device const float* V        [[buffer(2)]],   // [max_seq_len, num_kv_heads * head_dim]
+    device       float* output   [[buffer(3)]],   // [n_tokens, num_heads * head_dim]
+    constant     uint&  num_heads     [[buffer(4)]],
+    constant     uint&  num_kv_heads  [[buffer(5)]],
+    constant     uint&  head_dim      [[buffer(6)]],
+    constant     uint&  n_tokens      [[buffer(7)]],
+    constant     uint&  total_len     [[buffer(8)]],
+    constant     uint&  pos_offset    [[buffer(9)]],
+    constant     float& attn_scale    [[buffer(10)]],
+    constant     float& softcap       [[buffer(11)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tpg  [[threads_per_threadgroup]])
+{
+    // Flatten 2D (head, query_token) into 1D: gid = q_idx * num_heads + h
+    uint h = gid % num_heads;        // head index
+    uint q_idx = gid / num_heads;    // query token index within this batch
+
+    // GQA: map Q head to KV head (same formula as grouped_attn_decode)
+    uint kv_head = h * num_kv_heads / num_heads;
+    uint kv_dim = num_kv_heads * head_dim;
+    uint total_dim = num_heads * head_dim;
+    uint kv_off = kv_head * head_dim;
+
+    // Causal mask: this query can attend to positions [0, pos_offset + q_idx]
+    uint max_attend = pos_offset + q_idx + 1;
+    if (max_attend > total_len) max_attend = total_len;
+
+    // Load Q for this head and query token
+    device const float* q_head = Q + q_idx * total_dim + h * head_dim;
+
+    // Shared memory for scores (one per thread in the threadgroup)
+    threadgroup float shared[256];
+
+    // Online softmax: accumulate over K/V positions
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float v_acc = 0.0f;
+
+    for (uint tile = 0; tile < max_attend; tile += tpg) {
+        uint j = tile + lid;
+
+        // Step A: each thread computes score for position j
+        float score = -INFINITY;
+        if (j < max_attend) {
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; ++d) {
+                dot += q_head[d] * K[j * kv_dim + kv_off + d];
+            }
+            score = dot * attn_scale;
+            if (softcap > 0.0f) {
+                score = softcap * precise::tanh(score / softcap);
+            }
+        }
+        shared[lid] = score;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step B: threads parallel over head_dim dimensions
+        uint active = min(tpg, max_attend - tile);
+        if (lid < head_dim) {
+            for (uint t = 0; t < active; ++t) {
+                float s = shared[t];
+                if (s > running_max) {
+                    float correction = exp(running_max - s);
+                    running_sum = running_sum * correction + 1.0f;
+                    v_acc = v_acc * correction + V[(tile + t) * kv_dim + kv_off + lid];
+                    running_max = s;
+                } else {
+                    float w = exp(s - running_max);
+                    running_sum += w;
+                    v_acc += w * V[(tile + t) * kv_dim + kv_off + lid];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write normalized output
+    if (lid < head_dim) {
+        device float* out_head = output + q_idx * total_dim + h * head_dim;
+        out_head[lid] = (running_sum > 0.0f) ? (v_acc / running_sum) : 0.0f;
+    }
+}
+
+// ===========================================================================
+// Phase 3b: Batched causal attention reading F16 K/V cache
+// ===========================================================================
+
+// Same as batched_causal_attention but K and V are stored as half (F16).
+// Q and output remain F32.
+kernel void batched_causal_attention_f16(
+    device const float* Q        [[buffer(0)]],   // [n_tokens, num_heads * head_dim]
+    device const half*  K        [[buffer(1)]],   // [max_seq_len, num_kv_heads * head_dim]
+    device const half*  V        [[buffer(2)]],   // [max_seq_len, num_kv_heads * head_dim]
+    device       float* output   [[buffer(3)]],   // [n_tokens, num_heads * head_dim]
+    constant     uint&  num_heads     [[buffer(4)]],
+    constant     uint&  num_kv_heads  [[buffer(5)]],
+    constant     uint&  head_dim      [[buffer(6)]],
+    constant     uint&  n_tokens      [[buffer(7)]],
+    constant     uint&  total_len     [[buffer(8)]],
+    constant     uint&  pos_offset    [[buffer(9)]],
+    constant     float& attn_scale    [[buffer(10)]],
+    constant     float& softcap       [[buffer(11)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tpg  [[threads_per_threadgroup]])
+{
+    uint h = gid % num_heads;
+    uint q_idx = gid / num_heads;
+
+    uint kv_head = h * num_kv_heads / num_heads;
+    uint kv_dim = num_kv_heads * head_dim;
+    uint total_dim = num_heads * head_dim;
+    uint kv_off = kv_head * head_dim;
+
+    uint max_attend = pos_offset + q_idx + 1;
+    if (max_attend > total_len) max_attend = total_len;
+
+    device const float* q_head = Q + q_idx * total_dim + h * head_dim;
+
+    threadgroup float shared[256];
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float v_acc = 0.0f;
+
+    for (uint tile = 0; tile < max_attend; tile += tpg) {
+        uint j = tile + lid;
+
+        float score = -INFINITY;
+        if (j < max_attend) {
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; ++d) {
+                dot += q_head[d] * float(K[j * kv_dim + kv_off + d]);
+            }
+            score = dot * attn_scale;
+            if (softcap > 0.0f) {
+                score = softcap * precise::tanh(score / softcap);
+            }
+        }
+        shared[lid] = score;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint active = min(tpg, max_attend - tile);
+        if (lid < head_dim) {
+            for (uint t = 0; t < active; ++t) {
+                float s = shared[t];
+                if (s > running_max) {
+                    float correction = exp(running_max - s);
+                    running_sum = running_sum * correction + 1.0f;
+                    v_acc = v_acc * correction + float(V[(tile + t) * kv_dim + kv_off + lid]);
+                    running_max = s;
+                } else {
+                    float w = exp(s - running_max);
+                    running_sum += w;
+                    v_acc += w * float(V[(tile + t) * kv_dim + kv_off + lid]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lid < head_dim) {
+        device float* out_head = output + q_idx * total_dim + h * head_dim;
+        out_head[lid] = (running_sum > 0.0f) ? (v_acc / running_sum) : 0.0f;
     }
 }
 "#;
