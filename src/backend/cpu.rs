@@ -873,11 +873,13 @@ impl ComputeBackend for CpuBackend {
 
         trace!(seq_len, total_dim, head_dim, rope_dim, n_heads, pos_offset, freq_base, "CPU rope");
 
-        // Precompute frequencies for the rotated portion
+        // Precompute frequencies for the rotated portion.
+        // Matches llama.cpp: freq = pow(base, -1/rope_dim * 2*i)
         let half_rope_dim = rope_dim / 2;
+        let inv_ndims = -1.0f32 / rope_dim as f32;
         let mut freqs = vec![0.0f32; half_rope_dim];
         for i in 0..half_rope_dim {
-            freqs[i] = 1.0 / freq_base.powf(2.0 * i as f32 / rope_dim as f32);
+            freqs[i] = freq_base.powf(inv_ndims * (2 * i) as f32);
         }
 
         // Clone input data so non-rotated dims pass through unchanged
@@ -1131,10 +1133,12 @@ impl ComputeBackend for CpuBackend {
 
         trace!(seq_len, total_dim, head_dim, rope_dim, n_heads, pos_offset, freq_base, "CPU rope_neox");
 
+        // Matches llama.cpp: freq = pow(base, -1/rope_dim * 2*i)
         let half_rope_dim = rope_dim / 2;
+        let inv_ndims = -1.0f32 / rope_dim as f32;
         let mut freqs = vec![0.0f32; half_rope_dim];
         for i in 0..half_rope_dim {
-            freqs[i] = 1.0 / freq_base.powf(2.0 * i as f32 / rope_dim as f32);
+            freqs[i] = freq_base.powf(inv_ndims * (2 * i) as f32);
         }
 
         let mut q_rot = q_data.to_vec();

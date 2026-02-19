@@ -6,6 +6,10 @@
 pub mod embed;
 pub mod generate;
 pub mod sampler;
+#[allow(dead_code)]
+pub(crate) mod graph;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub(crate) mod exec_metal;
 
 pub use embed::EmbeddingEngine;
 pub use generate::GenerationEngine;
@@ -74,7 +78,7 @@ mod tests {
         // End-to-end: load real GGUF, generate with greedy decoding,
         // verify output is deterministic and coherent.
         //
-        //   let engine = GenerationEngine::from_gguf("model.gguf", backend).unwrap();
+        //   let engine = GenerationEngine::from_gguf("model.gguf").unwrap();
         //   let result = engine.generate("Once upon a time", &gen_config).unwrap();
         //   assert!(!result.is_empty());
         todo!("Requires real causal GGUF model file");

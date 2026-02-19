@@ -1,12 +1,80 @@
-//! Tight Metal encoding loop for single-token decode.
+//! Metal execution and buffer pool for graph-based generation.
 //!
-//! Encodes ALL decode ops into a single command buffer with concurrent dispatch.
+//! Encodes ALL decode/prefill ops into a single command buffer with concurrent dispatch.
 //! No allocation, no mutex, selective barriers.
 
 use crate::backend::metal::ffi::*;
 
-use super::graph::{BufferRef, DecodeGraph, DispatchDims, ParamValue, PrefillGraph};
-use super::pool::BufferPool;
+use super::graph::{BufferRef, BufferSlot, DecodeGraph, DispatchDims, ParamValue, PrefillGraph};
+
+// ---------------------------------------------------------------------------
+// Buffer pool — pre-allocated Metal buffers for zero-allocation decode
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated pool of reusable Metal buffers.
+///
+/// Created once at engine init with sizes determined by the graph builder.
+/// Each slot holds one Metal buffer of a fixed byte size.
+pub(crate) struct MetalBufferPool {
+    /// (raw MTLBuffer pointer, byte_size) per slot.
+    buffers: Vec<(Id, usize)>,
+}
+
+// Metal shared-mode buffers can be accessed from any thread.
+unsafe impl Send for MetalBufferPool {}
+unsafe impl Sync for MetalBufferPool {}
+
+impl MetalBufferPool {
+    /// Allocate one Metal buffer per slot.
+    ///
+    /// # Safety
+    /// `device` must be a valid MTLDevice pointer.
+    pub(crate) unsafe fn new(device: Id, sels: &Selectors, slot_sizes: &[usize]) -> Self {
+        let buffers = slot_sizes
+            .iter()
+            .map(|&size| {
+                let buf = msg_send_new_buffer_length(
+                    device,
+                    sels.new_buffer_with_length,
+                    size,
+                    MTL_RESOURCE_STORAGE_MODE_SHARED,
+                );
+                assert!(!buf.is_null(), "Metal buffer allocation failed for size {}", size);
+                (buf, size)
+            })
+            .collect();
+        Self { buffers }
+    }
+
+    /// Get the raw MTLBuffer pointer for a slot. O(1) array index.
+    #[inline]
+    pub(crate) fn get(&self, slot: BufferSlot) -> Id {
+        self.buffers[slot.0 as usize].0
+    }
+
+    /// Number of slots in the pool.
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.buffers.len()
+    }
+}
+
+impl Drop for MetalBufferPool {
+    fn drop(&mut self) {
+        unsafe {
+            let rel = sel_registerName(b"release\0".as_ptr() as _);
+            for &(buf, _) in &self.buffers {
+                if !buf.is_null() {
+                    msg_send_void(buf, rel);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metal resources and encoding
+// ---------------------------------------------------------------------------
 
 /// `MTLBarrierScopeBuffers` — ensures all buffer writes from prior dispatches
 /// are visible to subsequent dispatches within the same encoder.
@@ -167,7 +235,7 @@ impl Drop for MetalResources {
 /// The graph must have been built for the same model config.
 pub(crate) unsafe fn encode_decode_token(
     graph: &DecodeGraph,
-    pool: &BufferPool,
+    pool: &MetalBufferPool,
     res: &MetalResources,
     weight_bufs: &[Id],
     kv_bufs: &[Id],
@@ -269,44 +337,7 @@ pub(crate) unsafe fn encode_decode_token(
         }
 
         // Dispatch
-        match op.dispatch {
-            DispatchDims::D1 { count, threads } => {
-                let groups = (count + threads - 1) / threads;
-                msg_send_dispatch(
-                    enc, res.sels.dispatch_threadgroups,
-                    groups as usize, 1, 1,
-                    threads as usize, 1, 1,
-                );
-            }
-            DispatchDims::D2 { gx, gy, tx, ty } => {
-                msg_send_dispatch(
-                    enc, res.sels.dispatch_threadgroups,
-                    gx as usize, gy as usize, 1,
-                    tx as usize, ty as usize, 1,
-                );
-            }
-            DispatchDims::D3 { gx, gy, gz, tx, ty, tz } => {
-                msg_send_dispatch(
-                    enc, res.sels.dispatch_threadgroups,
-                    gx as usize, gy as usize, gz as usize,
-                    tx as usize, ty as usize, tz as usize,
-                );
-            }
-            DispatchDims::Rows { num_rows, threads_per_group } => {
-                msg_send_dispatch(
-                    enc, res.sels.dispatch_threadgroups,
-                    num_rows as usize, 1, 1,
-                    threads_per_group as usize, 1, 1,
-                );
-            }
-            DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } => {
-                msg_send_dispatch(
-                    enc, res.sels.dispatch_threadgroups,
-                    gx as usize, gy as usize, gz as usize,
-                    tx as usize, ty as usize, tz as usize,
-                );
-            }
-        }
+        dispatch_op(enc, &res.sels, &op.dispatch);
     }
 
     // 6. End encoding, commit, wait
@@ -334,7 +365,7 @@ pub(crate) struct PrefillParams {
 /// All buffer pointers must be valid Metal buffers.
 pub(crate) unsafe fn encode_prefill(
     graph: &PrefillGraph,
-    pool: &BufferPool,
+    pool: &MetalBufferPool,
     res: &MetalResources,
     weight_bufs: &[Id],
     kv_bufs: &[Id],
@@ -423,44 +454,7 @@ pub(crate) unsafe fn encode_prefill(
         }
 
         // Dispatch
-        match op.dispatch {
-            DispatchDims::D1 { count, threads } => {
-                let groups = (count + threads - 1) / threads;
-                msg_send_dispatch(
-                    enc, res.sels.dispatch_threadgroups,
-                    groups as usize, 1, 1,
-                    threads as usize, 1, 1,
-                );
-            }
-            DispatchDims::D2 { gx, gy, tx, ty } => {
-                msg_send_dispatch(
-                    enc, res.sels.dispatch_threadgroups,
-                    gx as usize, gy as usize, 1,
-                    tx as usize, ty as usize, 1,
-                );
-            }
-            DispatchDims::D3 { gx, gy, gz, tx, ty, tz } => {
-                msg_send_dispatch(
-                    enc, res.sels.dispatch_threadgroups,
-                    gx as usize, gy as usize, gz as usize,
-                    tx as usize, ty as usize, tz as usize,
-                );
-            }
-            DispatchDims::Rows { num_rows, threads_per_group } => {
-                msg_send_dispatch(
-                    enc, res.sels.dispatch_threadgroups,
-                    num_rows as usize, 1, 1,
-                    threads_per_group as usize, 1, 1,
-                );
-            }
-            DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } => {
-                msg_send_dispatch(
-                    enc, res.sels.dispatch_threadgroups,
-                    gx as usize, gy as usize, gz as usize,
-                    tx as usize, ty as usize, tz as usize,
-                );
-            }
-        }
+        dispatch_op(enc, &res.sels, &op.dispatch);
     }
 
     // 6. End encoding, commit, wait
@@ -474,11 +468,54 @@ pub(crate) unsafe fn encode_prefill(
     std::slice::from_raw_parts(ptr, graph.logits_count).to_vec()
 }
 
+/// Dispatch a single op based on its dimensions.
+#[inline]
+unsafe fn dispatch_op(enc: Id, sels: &Selectors, dims: &DispatchDims) {
+    match *dims {
+        DispatchDims::D1 { count, threads } => {
+            let groups = (count + threads - 1) / threads;
+            msg_send_dispatch(
+                enc, sels.dispatch_threadgroups,
+                groups as usize, 1, 1,
+                threads as usize, 1, 1,
+            );
+        }
+        DispatchDims::D2 { gx, gy, tx, ty } => {
+            msg_send_dispatch(
+                enc, sels.dispatch_threadgroups,
+                gx as usize, gy as usize, 1,
+                tx as usize, ty as usize, 1,
+            );
+        }
+        DispatchDims::D3 { gx, gy, gz, tx, ty, tz } => {
+            msg_send_dispatch(
+                enc, sels.dispatch_threadgroups,
+                gx as usize, gy as usize, gz as usize,
+                tx as usize, ty as usize, tz as usize,
+            );
+        }
+        DispatchDims::Rows { num_rows, threads_per_group } => {
+            msg_send_dispatch(
+                enc, sels.dispatch_threadgroups,
+                num_rows as usize, 1, 1,
+                threads_per_group as usize, 1, 1,
+            );
+        }
+        DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } => {
+            msg_send_dispatch(
+                enc, sels.dispatch_threadgroups,
+                gx as usize, gy as usize, gz as usize,
+                tx as usize, ty as usize, tz as usize,
+            );
+        }
+    }
+}
+
 /// Resolve a BufferRef to a raw MTLBuffer Id.
 #[inline]
 unsafe fn resolve_buffer(
     buf_ref: &BufferRef,
-    pool: &BufferPool,
+    pool: &MetalBufferPool,
     weight_bufs: &[Id],
     kv_bufs: &[Id],
 ) -> Id {
