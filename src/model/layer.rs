@@ -1109,14 +1109,14 @@ pub fn model_forward_step(
     }
 
     // 6. Determine LongRoPE frequency factors and mscale (Phi-3.5 etc.)
-    // Use short factors when total sequence length < original_ctx, long otherwise.
+    // llama.cpp selects short vs long factors based on configured n_ctx (max_seq_len),
+    // not the current sequence position.
     // mscale = rope_scaling_attn_factor (applied to cos/sin in RoPE).
-    let total_seq_len = pos_offset + n_tokens;
     let rope_factors_data: Option<Vec<f32>> = if config.rope_scaling_original_ctx > 0 {
-        let factors_tensor = if total_seq_len < config.rope_scaling_original_ctx {
-            weights.rope_factors_short.as_ref()
-        } else {
+        let factors_tensor = if config.max_seq_len >= config.rope_scaling_original_ctx {
             weights.rope_factors_long.as_ref()
+        } else {
+            weights.rope_factors_short.as_ref()
         };
         factors_tensor.map(|t| {
             let host = backend.download(t);
@@ -3120,6 +3120,244 @@ mod tests {
                 "Qwen3 cached vs uncached mismatch at {}: uncached={} cached={}",
                 i, uncached_data[i], cached_data[i]
             );
+        }
+    }
+
+    #[test]
+    fn test_rope_neox_with_factors_correctness() {
+        // Verify rope_neox_with_factors computes:
+        //   freq[i] = freq_base^(-2i/rope_dim) / factors[i]
+        //   theta = pos * freq[i]
+        //   out_lo = (x_lo * cos(theta) - x_hi * sin(theta)) * mscale
+        //   out_hi = (x_lo * sin(theta) + x_hi * cos(theta)) * mscale
+        let b = cpu();
+
+        // 1 token, 1 head, head_dim=4, rope_dim=4 → half_rope=2
+        let head_dim = 4;
+        let rope_dim = 4;
+        let freq_base = 10000.0f32;
+        let pos_offset = 3;
+        let mscale = 1.19f32;
+        let factors = vec![2.0f32, 0.5]; // 2 factors for half_rope=2
+
+        let q_data = vec![1.0f32, 2.0, 3.0, 4.0]; // [lo0, lo1, hi0, hi1]
+        let k_data = vec![5.0f32, 6.0, 7.0, 8.0];
+        let q = dt(Tensor::new(vec![1, 4], q_data.clone()));
+        let k = dt(Tensor::new(vec![1, 4], k_data.clone()));
+
+        let (q_rot, k_rot) = rope_neox_with_factors(
+            &q, &k, pos_offset, freq_base, head_dim, rope_dim,
+            &factors, mscale, &b,
+        );
+
+        // Manual computation
+        let inv_ndims = -1.0f32 / rope_dim as f32;
+        let pos = pos_offset as f32;
+
+        // freq[0] = freq_base^(-0/4) / 2.0 = 1.0 / 2.0 = 0.5
+        let freq0 = freq_base.powf(inv_ndims * 0.0) / factors[0];
+        // freq[1] = freq_base^(-2/4) / 0.5 = freq_base^(-0.5) / 0.5
+        let freq1 = freq_base.powf(inv_ndims * 2.0) / factors[1];
+
+        let theta0 = pos * freq0;
+        let theta1 = pos * freq1;
+
+        let expected_q = [
+            (q_data[0] * theta0.cos() - q_data[2] * theta0.sin()) * mscale,
+            (q_data[1] * theta1.cos() - q_data[3] * theta1.sin()) * mscale,
+            (q_data[0] * theta0.sin() + q_data[2] * theta0.cos()) * mscale,
+            (q_data[1] * theta1.sin() + q_data[3] * theta1.cos()) * mscale,
+        ];
+        let expected_k = [
+            (k_data[0] * theta0.cos() - k_data[2] * theta0.sin()) * mscale,
+            (k_data[1] * theta1.cos() - k_data[3] * theta1.sin()) * mscale,
+            (k_data[0] * theta0.sin() + k_data[2] * theta0.cos()) * mscale,
+            (k_data[1] * theta1.sin() + k_data[3] * theta1.cos()) * mscale,
+        ];
+
+        let q_out = q_rot.as_tensor().as_f32();
+        let k_out = k_rot.as_tensor().as_f32();
+
+        for i in 0..4 {
+            assert!(
+                (q_out[i] - expected_q[i]).abs() < 1e-5,
+                "Q mismatch at {}: got {} expected {}", i, q_out[i], expected_q[i]
+            );
+            assert!(
+                (k_out[i] - expected_k[i]).abs() < 1e-5,
+                "K mismatch at {}: got {} expected {}", i, k_out[i], expected_k[i]
+            );
+        }
+
+        // Verify mscale != 1.0 actually changes the output magnitude
+        let (q_no_scale, _) = rope_neox_with_factors(
+            &q, &k, pos_offset, freq_base, head_dim, rope_dim,
+            &factors, 1.0, &b,
+        );
+        let q_ns = q_no_scale.as_tensor().as_f32();
+        for i in 0..4 {
+            assert!(
+                (q_out[i] - q_ns[i] * mscale).abs() < 1e-5,
+                "mscale should linearly scale output at {}", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_neox_with_factors_divides_not_multiplies() {
+        // Regression test: factors are DIVISORS of the base frequency, not multipliers.
+        // theta = pos * freq_base^(-2i/rope_dim) / factor
+        // So factor=2 at pos=10 should give the same result as factor=1 at pos=5.
+        let b = cpu();
+        let head_dim = 4;
+        let rope_dim = 4;
+        let freq_base = 10000.0f32;
+
+        let q = dt(Tensor::new(vec![1, 4], vec![1.0, 2.0, 3.0, 4.0]));
+        let k = dt(Tensor::new(vec![1, 4], vec![5.0, 6.0, 7.0, 8.0]));
+
+        // factor=2 at pos=10 should equal factor=1 at pos=5
+        // because theta = 10 * freq / 2 = 5 * freq / 1
+        let factors_1 = vec![1.0f32, 1.0];
+        let factors_2 = vec![2.0f32, 2.0];
+
+        let (q_f1_p5, _) = rope_neox_with_factors(
+            &q, &k, 5, freq_base, head_dim, rope_dim, &factors_1, 1.0, &b,
+        );
+        let (q_f2_p10, _) = rope_neox_with_factors(
+            &q, &k, 10, freq_base, head_dim, rope_dim, &factors_2, 1.0, &b,
+        );
+
+        let q1_data = q_f1_p5.as_tensor().as_f32();
+        let q2_data = q_f2_p10.as_tensor().as_f32();
+
+        for i in 0..4 {
+            assert!(
+                (q1_data[i] - q2_data[i]).abs() < 1e-5,
+                "factor=2 at pos=10 should match factor=1 at pos=5 (idx {}): {} vs {}",
+                i, q2_data[i], q1_data[i]
+            );
+        }
+
+        // Sanity: factor=2 at pos=10 should NOT match factor=2 at pos=5
+        let (q_f2_p5, _) = rope_neox_with_factors(
+            &q, &k, 5, freq_base, head_dim, rope_dim, &factors_2, 1.0, &b,
+        );
+        let q3_data = q_f2_p5.as_tensor().as_f32();
+        let mut different = false;
+        for i in 0..4 {
+            if (q2_data[i] - q3_data[i]).abs() > 1e-6 {
+                different = true;
+                break;
+            }
+        }
+        assert!(different, "Different positions should produce different rotations");
+    }
+
+    #[test]
+    fn test_cached_forward_with_longrope_factors() {
+        // Test that model_forward_step correctly uses LongRoPE factors,
+        // and that factored RoPE produces different outputs vs unfactored.
+        let b = cpu();
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let ffn_hidden = 16;
+        let vocab_size = 16;
+
+        // Config with LongRoPE enabled (NeoX-style, original_ctx=64, mscale=1.19)
+        let mut config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+        config.rope_neox = true;
+        config.rope_scaling_original_ctx = 64;
+        config.rope_scaling_attn_factor = 1.19;
+        // max_seq_len < original_ctx → should pick short factors
+        config.max_seq_len = 32;
+
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
+
+        // Short factors: halve the base frequency
+        let short_factors = vec![2.0f32; head_dim / 2];
+        // Long factors: double the base frequency
+        let long_factors = vec![0.5f32; head_dim / 2];
+
+        let weights_with_factors = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data.clone())),
+            position_embedding: None,
+            token_type_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: Some(ones_weight(hidden_size)),
+            output_norm_b: None,
+            output_projection: None,
+            rope_factors_short: Some(dt(Tensor::new(vec![head_dim / 2], short_factors.clone()))),
+            rope_factors_long: Some(dt(Tensor::new(vec![head_dim / 2], long_factors.clone()))),
+        };
+
+        let weights_no_factors = ModelWeights {
+            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
+            position_embedding: None,
+            token_type_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers: vec![gemma_layer_weights(hidden_size, ffn_hidden)],
+            output_norm_w: Some(ones_weight(hidden_size)),
+            output_norm_b: None,
+            output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
+        };
+
+        let config_no_longrope = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
+
+        let input_ids = &[1u32, 3, 5];
+
+        // Run with LongRoPE factors (max_seq_len=32 < original_ctx=64 → uses short factors)
+        let mut cache1 = KvCache::new(&config);
+        let out_factored = model_forward_step(input_ids, &weights_with_factors, &config, &b, &mut cache1).unwrap();
+
+        // Run without LongRoPE factors
+        let mut cache2 = KvCache::new(&config_no_longrope);
+        let out_unfactored = model_forward_step(input_ids, &weights_no_factors, &config_no_longrope, &b, &mut cache2).unwrap();
+
+        // Outputs should differ because factored RoPE changes rotation frequencies
+        let data_f = out_factored.as_tensor().as_f32();
+        let data_u = out_unfactored.as_tensor().as_f32();
+        assert_eq!(data_f.len(), data_u.len());
+
+        let mut any_different = false;
+        for i in 0..data_f.len() {
+            if (data_f[i] - data_u[i]).abs() > 1e-5 {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "LongRoPE factors should change outputs vs unfactored RoPE");
+
+        // Now test long factor selection: max_seq_len >= original_ctx → uses long factors
+        let mut config_long = config.clone();
+        config_long.max_seq_len = 128; // >= original_ctx=64
+
+        let mut cache3 = KvCache::new(&config_long);
+        let out_long = model_forward_step(input_ids, &weights_with_factors, &config_long, &b, &mut cache3).unwrap();
+
+        let data_l = out_long.as_tensor().as_f32();
+
+        // Long vs short factors should produce different outputs
+        let mut long_vs_short_differ = false;
+        for i in 0..data_f.len() {
+            if (data_f[i] - data_l[i]).abs() > 1e-5 {
+                long_vs_short_differ = true;
+                break;
+            }
+        }
+        assert!(long_vs_short_differ, "Long vs short factors should produce different outputs");
+
+        // All outputs should be finite
+        for &v in data_f.iter().chain(data_l.iter()) {
+            assert!(v.is_finite(), "Non-finite value in LongRoPE output");
         }
     }
 }

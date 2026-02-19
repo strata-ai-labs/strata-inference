@@ -38,7 +38,11 @@ use crate::tensor::TensorDtype;
 use super::exec_metal::{
     DynamicParams, MetalBufferPool, MetalResources, PrefillParams,
     encode_decode_token, encode_prefill,
+    encode_decode_token_profiled, encode_prefill_profiled,
+    format_kernel_breakdown,
 };
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use super::graph::PsoRef;
 
 /// Why generation stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -714,13 +718,14 @@ impl GenerationEngine {
             eprintln!("[profile-detail] graph build: {:.1}ms", prefill_start.elapsed().as_secs_f64() * 1000.0);
         }
 
-        // LongRoPE: select long vs short factors based on max position in prefill
+        // LongRoPE: select long vs short factors based on configured context size (n_ctx).
+        // llama.cpp uses the configured n_ctx, not the current sequence position.
         if self.config.rope_scaling_original_ctx > 0 {
             if let Executor::Metal(ref mut m) = self.executor {
                 if let (Some(si), Some(li), Some(sbi)) =
                     (m.rope_short_weight_idx, m.rope_long_buf_id, m.rope_short_buf_id)
                 {
-                    if prompt_ids.len() >= self.config.rope_scaling_original_ctx {
+                    if self.config.max_seq_len >= self.config.rope_scaling_original_ctx {
                         m.weight_buf_ids[si as usize] = li;
                     } else {
                         m.weight_buf_ids[si as usize] = sbi;
@@ -799,22 +804,49 @@ impl GenerationEngine {
             eprintln!("[profile-detail] alloc (pool+tokens+kv): {:.1}ms", prefill_start.elapsed().as_secs_f64() * 1000.0);
         }
 
-        // Encode and execute (single command buffer!)
+        // Encode and execute
         let gpu_start = Instant::now();
-        let logits = unsafe {
-            encode_prefill(
-                &prefill_graph,
-                &prefill_pool,
-                &metal.metal_res,
-                &metal.weight_buf_ids,
-                &kv_buf_ids,
-                &PrefillParams {
-                    n_tokens: prompt_ids.len(),
-                    pos_offset: 0,
-                },
-                token_ids_buf,
-                position_ids_buf,
-            )
+        let prefill_params = PrefillParams {
+            n_tokens: prompt_ids.len(),
+            pos_offset: 0,
+        };
+
+        let logits = if profiling {
+            // Profiled path: per-op command buffers with GPU timestamps
+            let (logits, timings) = unsafe {
+                encode_prefill_profiled(
+                    &prefill_graph,
+                    &prefill_pool,
+                    &metal.metal_res,
+                    &metal.weight_buf_ids,
+                    &kv_buf_ids,
+                    &prefill_params,
+                    token_ids_buf,
+                    position_ids_buf,
+                )
+            };
+            let gpu_ms = gpu_start.elapsed().as_secs_f64() * 1000.0;
+            let (breakdown, _total_gpu) = format_kernel_breakdown(&timings);
+            eprintln!(
+                "[profile] prefill GPU kernel breakdown ({} tok, {} ops, {:.1}ms wall):",
+                prompt_tokens, prefill_graph.ops.len(), gpu_ms,
+            );
+            eprint!("{}", breakdown);
+            logits
+        } else {
+            // Fast path: single command buffer
+            unsafe {
+                encode_prefill(
+                    &prefill_graph,
+                    &prefill_pool,
+                    &metal.metal_res,
+                    &metal.weight_buf_ids,
+                    &kv_buf_ids,
+                    &prefill_params,
+                    token_ids_buf,
+                    position_ids_buf,
+                )
+            }
         };
 
         // Advance cache position to match prefilled tokens
@@ -824,12 +856,10 @@ impl GenerationEngine {
         let prefill_duration = prefill_start.elapsed();
 
         if profiling {
-            let gpu_ms = gpu_start.elapsed().as_secs_f64() * 1000.0;
             let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
-            eprintln!("[profile-detail] gpu exec+readback: {:.1}ms", gpu_ms);
             eprintln!(
-                "[profile] prefill: {:.1}ms ({} tokens, {} ops, 1 cmd buffer)",
-                prefill_ms, prompt_tokens, prefill_graph.ops.len(),
+                "[profile] prefill total: {:.1}ms ({} tokens)",
+                prefill_ms, prompt_tokens,
             );
         }
 
@@ -844,6 +874,9 @@ impl GenerationEngine {
         // ===================================================================
 
         let mut stop_reason = StopReason::MaxTokens;
+        // Accumulate per-token profiling for aggregate decode summary
+        let mut decode_timings_accum: Vec<(PsoRef, f64)> = Vec::new();
+        let mut decode_tokens_profiled: usize = 0;
 
         for step in 0..gen_config.max_tokens {
             if stop_tokens.contains(&next_token) {
@@ -865,20 +898,8 @@ impl GenerationEngine {
 
             let tok_start = if profiling { Some(Instant::now()) } else { None };
 
-            // LongRoPE: swap factors based on current position
-            if self.config.rope_scaling_original_ctx > 0 {
-                if let Executor::Metal(ref mut m) = self.executor {
-                    if let (Some(si), Some(li), Some(sbi)) =
-                        (m.rope_short_weight_idx, m.rope_long_buf_id, m.rope_short_buf_id)
-                    {
-                        if cache.len() >= self.config.rope_scaling_original_ctx {
-                            m.weight_buf_ids[si as usize] = li;
-                        } else {
-                            m.weight_buf_ids[si as usize] = sbi;
-                        }
-                    }
-                }
-            }
+            // LongRoPE factors were selected once before prefill based on max_seq_len
+            // (matching llama.cpp's n_ctx-based selection), so no per-token swap needed.
 
             let metal = match &self.executor {
                 Executor::Metal(m) => m,
@@ -893,17 +914,36 @@ impl GenerationEngine {
 
             let decode_graph = self.decode_graph.as_ref()
                 .expect("Metal executor requires decode_graph");
-            let logits = unsafe {
-                encode_decode_token(
-                    decode_graph,
-                    &metal.buffer_pool,
-                    &metal.metal_res,
-                    &metal.weight_buf_ids,
-                    &kv_buf_ids,
-                    &dynamic,
-                    metal.token_id_buf,
-                    metal.position_id_buf,
-                )
+
+            let logits = if profiling {
+                let (logits, timings) = unsafe {
+                    encode_decode_token_profiled(
+                        decode_graph,
+                        &metal.buffer_pool,
+                        &metal.metal_res,
+                        &metal.weight_buf_ids,
+                        &kv_buf_ids,
+                        &dynamic,
+                        metal.token_id_buf,
+                        metal.position_id_buf,
+                    )
+                };
+                decode_timings_accum.extend_from_slice(&timings);
+                decode_tokens_profiled += 1;
+                logits
+            } else {
+                unsafe {
+                    encode_decode_token(
+                        decode_graph,
+                        &metal.buffer_pool,
+                        &metal.metal_res,
+                        &metal.weight_buf_ids,
+                        &kv_buf_ids,
+                        &dynamic,
+                        metal.token_id_buf,
+                        metal.position_id_buf,
+                    )
+                }
             };
 
             cache.advance(1);
@@ -913,10 +953,20 @@ impl GenerationEngine {
             if let Some(start) = tok_start {
                 let total_ms = start.elapsed().as_secs_f64() * 1000.0;
                 eprintln!(
-                    "[profile] tok {}: {:.1}ms (graph fast path)",
+                    "[profile] tok {}: {:.1}ms",
                     step + 1, total_ms,
                 );
             }
+        }
+
+        // Print aggregate decode kernel breakdown
+        if profiling && decode_tokens_profiled > 0 {
+            let (breakdown, _total_gpu) = format_kernel_breakdown(&decode_timings_accum);
+            eprintln!(
+                "[profile] decode GPU kernel breakdown ({} tok, {} ops total):",
+                decode_tokens_profiled, decode_timings_accum.len(),
+            );
+            eprint!("{}", breakdown);
         }
 
         Ok(GenerationOutput {

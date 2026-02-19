@@ -227,6 +227,13 @@ pub unsafe fn msg_send_ptr(obj: Id, sel: Sel) -> *mut c_void {
     f(obj, sel)
 }
 
+/// `[obj sel]` -> `f64`  (e.g. [commandBuffer GPUStartTime])
+pub unsafe fn msg_send_f64(obj: Id, sel: Sel) -> f64 {
+    let f: unsafe extern "C" fn(Id, Sel) -> f64 =
+        std::mem::transmute(objc_msgSend as *const c_void);
+    f(obj, sel)
+}
+
 /// `[NSString stringWithUTF8String:cstr]` -> `Id`
 pub unsafe fn msg_send_class_cstr(cls: Class, sel: Sel, cstr: *const i8) -> Id {
     let f: unsafe extern "C" fn(Class, Sel, *const i8) -> Id =
@@ -287,6 +294,12 @@ pub struct Selectors {
     pub utf8_string: Sel,
     /// `description` (for error reporting)
     pub description_sel: Sel,
+
+    // MTLCommandBuffer timing
+    /// `GPUStartTime` — absolute GPU timestamp (seconds) when the command buffer started.
+    pub gpu_start_time: Sel,
+    /// `GPUEndTime` — absolute GPU timestamp (seconds) when the command buffer finished.
+    pub gpu_end_time: Sel,
 }
 
 impl Selectors {
@@ -333,6 +346,8 @@ impl Selectors {
             string_with_utf8: sel_registerName(b"stringWithUTF8String:\0".as_ptr() as _),
             utf8_string: sel_registerName(b"UTF8String\0".as_ptr() as _),
             description_sel: sel_registerName(b"description\0".as_ptr() as _),
+            gpu_start_time: sel_registerName(b"GPUStartTime\0".as_ptr() as _),
+            gpu_end_time: sel_registerName(b"GPUEndTime\0".as_ptr() as _),
         }
     }
 }
