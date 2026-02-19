@@ -1041,6 +1041,8 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: head_dim,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -1072,6 +1074,8 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: head_dim,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: false,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -1606,6 +1610,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let input_ids = &[1u32, 3, 5];
@@ -1642,6 +1648,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: Some(zeros_bias(hidden_size)),
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let input_ids = &[0u32, 2, 4, 6];
@@ -1683,6 +1691,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let input_ids = &[0u32];
@@ -1724,6 +1734,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let input_ids = &[1u32, 5];
@@ -1757,6 +1769,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let input_ids = &[3u32];
@@ -1936,6 +1950,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         // Token ID 100 exceeds vocab_size=8 (note: config has vocab_size=16, override)
@@ -1977,6 +1993,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let mut cache = KvCache::new(&config);
@@ -2011,6 +2029,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let mut cache = KvCache::new(&config);
@@ -2052,6 +2072,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let input_ids = &[1u32, 3, 5];
@@ -2102,6 +2124,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let mut cache = KvCache::new(&config);
@@ -2175,6 +2199,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let mut cache = KvCache::new(&config);
@@ -2310,6 +2336,8 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: head_dim,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: false,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -2537,6 +2565,8 @@ mod tests {
             output_norm_w: None,
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let input_ids = &[0u32, 2, 4, 6];
@@ -2576,6 +2606,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let input_ids = &[1u32, 3, 5];
@@ -2602,6 +2634,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
         let output_no_scale = model_forward(input_ids, attention_mask, &weights2, &config_no_scale, &b, 0).unwrap();
         let d1 = output.as_tensor().as_f32();
@@ -2653,6 +2687,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let mask = &[1.0f32, 1.0, 1.0];
@@ -2695,6 +2731,8 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: head_dim,
             rope_neox: true,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -2864,6 +2902,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let mut cache = KvCache::new(&config);
@@ -2909,6 +2949,8 @@ mod tests {
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let input_ids = &[1u32, 3, 5];

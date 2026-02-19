@@ -85,6 +85,15 @@ pub struct ModelConfig {
     /// NeoX-style RoPE (pairs offset by n_rot/2) vs standard (consecutive pairs).
     /// Gemma, Qwen, Falcon, etc. use NeoX; LLaMA uses standard.
     pub rope_neox: bool,
+    /// Original context length for RoPE scaling (LongRoPE / YaRN).
+    /// When > 0, the model was trained with per-dimension frequency factors
+    /// stored as `rope_factors_short.weight` and `rope_factors_long.weight`.
+    /// Use short factors when seq_len < this value, long factors otherwise.
+    pub rope_scaling_original_ctx: usize,
+    /// YaRN attention factor for magnitude scaling.
+    /// Loaded from `{arch}.rope.scaling.attn_factor`, default 1.0.
+    /// When > 1.0, mscale = 0.1 * ln2(factor) + 1.0, applied as mscale^2 to attn_scale.
+    pub rope_scaling_attn_factor: f32,
 
     // Attention
     pub causal: bool,
@@ -177,6 +186,15 @@ impl ModelConfig {
             .get_u32(&format!("{}.rope.dimension_count", arch_name))
             .map(|v| v as usize)
             .unwrap_or(head_dim);
+
+        let rope_scaling_original_ctx = gguf
+            .get_u32(&format!("{}.rope.scaling.original_context_length", arch_name))
+            .map(|v| v as usize)
+            .unwrap_or(0);
+
+        let rope_scaling_attn_factor = gguf
+            .get_f32(&format!("{}.rope.scaling.attn_factor", arch_name))
+            .unwrap_or(1.0);
 
         let max_seq_len = gguf
             .get_u32(&format!("{}.context_length", arch_name))
@@ -308,7 +326,7 @@ impl ModelConfig {
                     Activation::SwiGLU,
                     PositionType::RoPE,
                     true,  // has_ffn_gate
-                    true,  // has_bias (optional, loaded via load_tensor_optional)
+                    false, // has_bias (Phi-3 uses RMSNorm, no biases)
                     1.0,   // embedding_scale
                     true,  // default causal
                     true,  // pre_norm
@@ -360,6 +378,8 @@ impl ModelConfig {
             rope_freq_base,
             rope_dim,
             rope_neox,
+            rope_scaling_original_ctx,
+            rope_scaling_attn_factor,
             causal,
             attn_logit_softcap,
             attn_scale,
@@ -1341,7 +1361,6 @@ mod tests {
             ("phi3.embedding_length", kv_u32(3072)),
             ("phi3.block_count", kv_u32(32)),
             ("phi3.attention.head_count", kv_u32(32)),
-            ("phi3.attention.head_count_kv", kv_u32(8)),
             ("phi3.feed_forward_length", kv_u32(8192)),
         ];
         let (gguf, _tmp) = open_gguf_from_kv(&kv);
@@ -1353,7 +1372,7 @@ mod tests {
         assert_eq!(config.hidden_size, 3072);
         assert_eq!(config.num_layers, 32);
         assert_eq!(config.num_heads, 32);
-        assert_eq!(config.num_kv_heads, 8);
+        assert_eq!(config.num_kv_heads, 32); // MHA (no head_count_kv → defaults to head_count)
         assert_eq!(config.head_dim, 96); // 3072 / 32
         assert_eq!(config.ffn_hidden, 8192);
 
@@ -1362,11 +1381,13 @@ mod tests {
         assert_eq!(config.activation, Activation::SwiGLU);
         assert_eq!(config.position_type, PositionType::RoPE);
         assert!(config.has_ffn_gate);
-        assert!(config.has_bias);
+        assert!(!config.has_bias); // Phi-3 uses RMSNorm, no biases
         assert!(config.causal);
         assert!(config.pre_norm);
         assert!(config.rope_neox);
         assert!((config.embedding_scale - 1.0).abs() < 1e-6);
+        // Default attn_factor when not in GGUF
+        assert!((config.rope_scaling_attn_factor - 1.0).abs() < 1e-6);
     }
 
     #[test]

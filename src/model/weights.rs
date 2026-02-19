@@ -83,6 +83,14 @@ pub struct ModelWeights {
     /// Output projection (lm_head): [vocab_size, hidden_size]
     /// When None, generation falls back to tied embeddings (token_embedding).
     pub output_projection: Option<DeviceTensor>,
+
+    /// LongRoPE short frequency factors: [rope_dim/2], F32.
+    /// Used when sequence length < rope_scaling_original_ctx.
+    pub rope_factors_short: Option<DeviceTensor>,
+
+    /// LongRoPE long frequency factors: [rope_dim/2], F32.
+    /// Used when sequence length >= rope_scaling_original_ctx.
+    pub rope_factors_long: Option<DeviceTensor>,
 }
 
 // ---------------------------------------------------------------------------
@@ -183,42 +191,87 @@ fn load_tensor_optional(
 // Fused QKV splitting helpers
 // ---------------------------------------------------------------------------
 
+/// Compute the byte size of `n_rows` in a quantized weight matrix with `k` columns.
+///
+/// For quantized formats, each row consists of `ceil(k / block_size)` blocks,
+/// each of `block_byte_size` bytes. Rows are independently quantized.
+fn quantized_row_bytes(dtype: TensorDtype, k: usize) -> usize {
+    let block_size = dtype.block_size();
+    let block_byte_size = dtype.block_byte_size();
+    let blocks_per_row = (k + block_size - 1) / block_size;
+    blocks_per_row * block_byte_size
+}
+
 /// Split a fused QKV weight tensor into separate Q, K, V tensors.
 ///
 /// The fused tensor has shape `[n_embd + 2*n_kv, n_embd]` (after GGUF dim
 /// reversal) where `n_kv = num_kv_heads * head_dim`. For standard MHA (GPT-2),
 /// `n_kv == n_embd` so the shape is `[3*n_embd, n_embd]`.
 ///
-/// For quantized tensors (Q8_0, Q4_K, etc.), we dequantize to f32 first, split,
-/// then keep splits as f32. This is a one-time load cost.
+/// For quantized tensors, we split at the raw byte level to keep the data
+/// quantized. This avoids a massive F32 memory blowup for large models.
+/// For F32/F16 tensors, we split the data directly.
 fn split_qkv(
     qkv: &DeviceTensor,
     config: &ModelConfig,
     backend: &dyn ComputeBackend,
 ) -> (DeviceTensor, DeviceTensor, DeviceTensor) {
     let tensor = backend.download(qkv);
-    let f32_tensor = tensor.to_f32();
-    let f32_data = f32_tensor.as_f32();
+    let dtype = tensor.dtype();
 
     let n_embd = config.hidden_size;
     let n_kv = config.num_kv_heads * config.head_dim;
-    let expected = (n_embd + 2 * n_kv) * n_embd;
-    assert_eq!(
-        f32_data.len(),
-        expected,
-        "fused QKV weight has {} elements, expected {} = ({} + 2*{}) * {}",
-        f32_data.len(), expected, n_embd, n_kv, n_embd,
-    );
 
-    let q_data = f32_data[..n_embd * n_embd].to_vec();
-    let k_data = f32_data[n_embd * n_embd..(n_embd + n_kv) * n_embd].to_vec();
-    let v_data = f32_data[(n_embd + n_kv) * n_embd..].to_vec();
+    if dtype.is_quantized() {
+        // Split at the raw byte level, preserving quantization
+        let raw = tensor.quantized_data();
+        let k = n_embd; // input features (columns)
+        let row_bytes = quantized_row_bytes(dtype, k);
 
-    (
-        backend.upload(&Tensor::new(vec![n_embd, n_embd], q_data)),
-        backend.upload(&Tensor::new(vec![n_kv, n_embd], k_data)),
-        backend.upload(&Tensor::new(vec![n_kv, n_embd], v_data)),
-    )
+        let q_rows = n_embd;
+        let k_rows = n_kv;
+        let v_rows = n_kv;
+        let total_rows = q_rows + k_rows + v_rows;
+        assert_eq!(
+            raw.len(), total_rows * row_bytes,
+            "fused QKV quantized data: {} bytes, expected {} = {} rows * {} bytes/row",
+            raw.len(), total_rows * row_bytes, total_rows, row_bytes,
+        );
+
+        let q_end = q_rows * row_bytes;
+        let k_end = (q_rows + k_rows) * row_bytes;
+
+        let q_data = raw[..q_end].to_vec();
+        let k_data = raw[q_end..k_end].to_vec();
+        let v_data = raw[k_end..].to_vec();
+
+        (
+            backend.upload(&Tensor::from_quantized(vec![q_rows, k], dtype, q_data)),
+            backend.upload(&Tensor::from_quantized(vec![k_rows, k], dtype, k_data)),
+            backend.upload(&Tensor::from_quantized(vec![v_rows, k], dtype, v_data)),
+        )
+    } else {
+        // F32/F16 path — dequantize and split as before
+        let f32_tensor = tensor.to_f32();
+        let f32_data = f32_tensor.as_f32();
+
+        let expected = (n_embd + 2 * n_kv) * n_embd;
+        assert_eq!(
+            f32_data.len(), expected,
+            "fused QKV weight has {} elements, expected {} = ({} + 2*{}) * {}",
+            f32_data.len(), expected, n_embd, n_kv, n_embd,
+        );
+
+        let q_data = f32_data[..n_embd * n_embd].to_vec();
+        let k_data = f32_data[n_embd * n_embd..(n_embd + n_kv) * n_embd].to_vec();
+        let v_data = f32_data[(n_embd + n_kv) * n_embd..].to_vec();
+
+        (
+            backend.upload(&Tensor::new(vec![n_embd, n_embd], q_data)),
+            backend.upload(&Tensor::new(vec![n_kv, n_embd], k_data)),
+            backend.upload(&Tensor::new(vec![n_kv, n_embd], v_data)),
+        )
+    }
 }
 
 /// Split a fused QKV bias vector into separate Q, K, V biases.
@@ -260,33 +313,60 @@ fn split_qkv_bias(
 /// with shape `[2*ffn_hidden, hidden_size]`. The first half is the gate
 /// projection, the second half is the up projection.
 ///
-/// For quantized tensors, we dequantize to f32 first, split, then keep as f32.
+/// For quantized tensors, we split at the raw byte level to preserve
+/// quantization and avoid massive F32 memory blowup.
 fn split_gate_up(
     fused: &DeviceTensor,
     config: &ModelConfig,
     backend: &dyn ComputeBackend,
 ) -> (DeviceTensor, DeviceTensor) {
     let tensor = backend.download(fused);
-    let f32_tensor = tensor.to_f32();
-    let f32_data = f32_tensor.as_f32();
+    let dtype = tensor.dtype();
 
     let n_ff = config.ffn_hidden;
     let n_embd = config.hidden_size;
-    let expected = 2 * n_ff * n_embd;
-    assert_eq!(
-        f32_data.len(),
-        expected,
-        "fused gate+up weight has {} elements, expected {} = 2 * {} * {}",
-        f32_data.len(), expected, n_ff, n_embd,
-    );
 
-    let gate_data = f32_data[..n_ff * n_embd].to_vec();
-    let up_data = f32_data[n_ff * n_embd..].to_vec();
+    if dtype.is_quantized() {
+        // Split at the raw byte level, preserving quantization
+        let raw = tensor.quantized_data();
+        let k = n_embd; // input features (columns)
+        let row_bytes = quantized_row_bytes(dtype, k);
 
-    (
-        backend.upload(&Tensor::new(vec![n_ff, n_embd], gate_data)),
-        backend.upload(&Tensor::new(vec![n_ff, n_embd], up_data)),
-    )
+        let total_rows = 2 * n_ff;
+        assert_eq!(
+            raw.len(), total_rows * row_bytes,
+            "fused gate+up quantized data: {} bytes, expected {} = {} rows * {} bytes/row",
+            raw.len(), total_rows * row_bytes, total_rows, row_bytes,
+        );
+
+        let gate_end = n_ff * row_bytes;
+        let gate_data = raw[..gate_end].to_vec();
+        let up_data = raw[gate_end..].to_vec();
+
+        (
+            backend.upload(&Tensor::from_quantized(vec![n_ff, n_embd], dtype, gate_data)),
+            backend.upload(&Tensor::from_quantized(vec![n_ff, n_embd], dtype, up_data)),
+        )
+    } else {
+        // F32/F16 path
+        let f32_tensor = tensor.to_f32();
+        let f32_data = f32_tensor.as_f32();
+
+        let expected = 2 * n_ff * n_embd;
+        assert_eq!(
+            f32_data.len(), expected,
+            "fused gate+up weight has {} elements, expected {} = 2 * {} * {}",
+            f32_data.len(), expected, n_ff, n_embd,
+        );
+
+        let gate_data = f32_data[..n_ff * n_embd].to_vec();
+        let up_data = f32_data[n_ff * n_embd..].to_vec();
+
+        (
+            backend.upload(&Tensor::new(vec![n_ff, n_embd], gate_data)),
+            backend.upload(&Tensor::new(vec![n_ff, n_embd], up_data)),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -627,6 +707,40 @@ impl ModelWeights {
         // -- Output projection (lm_head) --
         let output_projection = load_tensor_optional(gguf, "output.weight", backend)?;
 
+        // -- LongRoPE frequency factors (Phi-3.5, etc.) --
+        let rope_factors_short = load_tensor_optional(gguf, "rope_factors_short.weight", backend)?;
+        let rope_factors_long = load_tensor_optional(gguf, "rope_factors_long.weight", backend)?;
+
+        if rope_factors_short.is_some() || rope_factors_long.is_some() {
+            info!(
+                has_short = rope_factors_short.is_some(),
+                has_long = rope_factors_long.is_some(),
+                "Loaded LongRoPE frequency factors"
+            );
+        }
+
+        // Validate rope_factors shapes
+        if let Some(ref factors) = rope_factors_short {
+            let expected = config.rope_dim / 2;
+            let actual = factors.shape()[0];
+            if actual != expected {
+                return Err(InferenceError::Model(format!(
+                    "rope_factors_short has {} elements, expected {} (rope_dim/2)",
+                    actual, expected
+                )));
+            }
+        }
+        if let Some(ref factors) = rope_factors_long {
+            let expected = config.rope_dim / 2;
+            let actual = factors.shape()[0];
+            if actual != expected {
+                return Err(InferenceError::Model(format!(
+                    "rope_factors_long has {} elements, expected {} (rope_dim/2)",
+                    actual, expected
+                )));
+            }
+        }
+
         info!(
             num_layers = layers.len(),
             has_output_projection = output_projection.is_some(),
@@ -643,6 +757,8 @@ impl ModelWeights {
             output_norm_w,
             output_norm_b,
             output_projection,
+            rope_factors_short,
+            rope_factors_long,
         })
     }
 }
@@ -802,6 +918,8 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: hidden_size / 4,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -833,6 +951,8 @@ mod tests {
             rope_freq_base: 0.0,
             rope_dim: 0,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: false,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -1734,6 +1854,8 @@ mod tests {
             rope_freq_base: 0.0,
             rope_dim: 0,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -2069,10 +2191,10 @@ mod tests {
 
         let layer = &weights.layers[0];
 
-        // After splitting Q8_0 fused QKV, results should be F32 (dequantized)
-        assert_eq!(layer.attn_q.dtype(), TensorDtype::F32);
-        assert_eq!(layer.attn_k.dtype(), TensorDtype::F32);
-        assert_eq!(layer.attn_v.dtype(), TensorDtype::F32);
+        // After splitting Q8_0 fused QKV, results stay Q8_0 (quantized byte-level split)
+        assert_eq!(layer.attn_q.dtype(), TensorDtype::Q8_0);
+        assert_eq!(layer.attn_k.dtype(), TensorDtype::Q8_0);
+        assert_eq!(layer.attn_v.dtype(), TensorDtype::Q8_0);
 
         // Shapes should be correct
         assert_eq!(layer.attn_q.shape(), &[h, h]);
@@ -2201,7 +2323,7 @@ mod tests {
     // Fused gate+up FFN tests (Phi-3 style)
     // -----------------------------------------------------------------------
 
-    /// Build a Phi3-style config: RMSNorm, SwiGLU, RoPE, fused QKV, has_ffn_gate=true, has_bias=true.
+    /// Build a Phi3-style config: RMSNorm, SwiGLU, RoPE, fused QKV, has_ffn_gate=true, has_bias=false.
     fn phi3_config(num_layers: usize, hidden_size: usize) -> ModelConfig {
         ModelConfig {
             arch: ModelArch::Phi3,
@@ -2221,13 +2343,15 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: hidden_size / 4,
             rope_neox: true,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,
             embedding_scale: 1.0,
             pooling_type: PoolingType::Mean,
             has_ffn_gate: true,
-            has_bias: true,
+            has_bias: false,
             pre_norm: true,
         }
     }
@@ -2408,6 +2532,128 @@ mod tests {
         assert!(layer.ffn_gate.is_some());
         assert_eq!(layer.ffn_gate.as_ref().unwrap().shape(), &[ffn, h]);
         assert_eq!(layer.ffn_up.shape(), &[ffn, h]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_fused_gate_up_q8_0_split() {
+        // Verify that fused gate+up splitting works correctly for quantized Q8_0 tensors.
+        // Each block of 32 values should be independently preserved after splitting.
+        let config = phi3_config(1, 32);
+        let h = config.hidden_size; // 32
+        let ffn = config.ffn_hidden; // 64
+
+        // Build Q8_0 data for the fused gate+up tensor [2*ffn, h] = [128, 32]
+        // Gate half: scale=1.0, quants=[0,1,...,31]
+        // Up half: scale=2.0, quants=[0,1,...,31]
+        let gate_rows = ffn; // 64 rows for gate
+        let up_rows = ffn;   // 64 rows for up
+        let gate_data = q8_0_tensor_data(gate_rows * h); // 64*32 = 2048 elements
+        let up_data = {
+            // Custom Q8_0 data with scale=2.0 to distinguish from gate
+            let n_elements = up_rows * h;
+            let n_blocks = n_elements / 32;
+            let mut data = Vec::with_capacity(n_blocks * 34);
+            let scale_bits = f32_to_f16(2.0);
+            for _ in 0..n_blocks {
+                data.extend_from_slice(&scale_bits.to_le_bytes());
+                for i in 0..32u8 {
+                    data.push(i);
+                }
+            }
+            data
+        };
+
+        // Fused tensor data: gate rows followed by up rows
+        let mut fused_data = gate_data.clone();
+        fused_data.extend_from_slice(&up_data);
+
+        let mut tensors: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+
+        // Token embedding
+        tensors.push((
+            "token_embd.weight".to_string(),
+            vec![h as u64, 64],
+            0, // F32
+            f32_tensor_data(&vec![0.1f32; 64 * h]),
+        ));
+
+        // Output norm
+        tensors.push((
+            "output_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+
+        // Layer tensors
+        let prefix = "blk.0";
+        tensors.push((format!("{}.attn_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0; h])));
+        tensors.push((format!("{}.ffn_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0; h])));
+
+        // Fused QKV
+        let n_kv = config.num_kv_heads * config.head_dim;
+        let qkv_cols = h + 2 * n_kv;
+        tensors.push((
+            format!("{}.attn_qkv.weight", prefix),
+            vec![h as u64, qkv_cols as u64],
+            0,
+            f32_tensor_data(&vec![0.01; qkv_cols * h]),
+        ));
+
+        // Attention output
+        tensors.push((format!("{}.attn_output.weight", prefix), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01; h * h])));
+
+        // Fused gate+up as Q8_0: GGUF dtype=8 (Q8_0), dims [h, 2*ffn]
+        tensors.push((
+            format!("{}.ffn_up.weight", prefix),
+            vec![h as u64, (2 * ffn) as u64],
+            8, // Q8_0
+            fused_data,
+        ));
+
+        // FFN down
+        tensors.push((format!("{}.ffn_down.weight", prefix), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01; h * ffn])));
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensors
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("phi3_q8_0_fused", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        let layer = &weights.layers[0];
+
+        // Verify shapes
+        assert!(layer.ffn_gate.is_some(), "ffn_gate should exist after fused split");
+        assert_eq!(layer.ffn_gate.as_ref().unwrap().shape(), &[ffn, h]);
+        assert_eq!(layer.ffn_up.shape(), &[ffn, h]);
+
+        // Verify dtypes are preserved as Q8_0
+        assert_eq!(layer.ffn_gate.as_ref().unwrap().dtype(), TensorDtype::Q8_0);
+        assert_eq!(layer.ffn_up.dtype(), TensorDtype::Q8_0);
+
+        // Verify data is correct by dequantizing
+        let gate_deq = layer.ffn_gate.as_ref().unwrap().as_tensor().to_f32();
+        let gate_f32 = gate_deq.as_f32();
+        let up_deq = layer.ffn_up.as_tensor().to_f32();
+        let up_f32 = up_deq.as_f32();
+
+        // Gate: scale=1.0, values [0,1,...,31] repeated → first 32 values are 0.0, 1.0, ..., 31.0
+        assert!((gate_f32[0] - 0.0).abs() < 1e-3, "gate[0] should be 0.0, got {}", gate_f32[0]);
+        assert!((gate_f32[1] - 1.0).abs() < 1e-3, "gate[1] should be 1.0, got {}", gate_f32[1]);
+        assert!((gate_f32[31] - 31.0).abs() < 1e-3, "gate[31] should be 31.0, got {}", gate_f32[31]);
+
+        // Up: scale=2.0, values [0,1,...,31] repeated → first 32 values are 0.0, 2.0, ..., 62.0
+        assert!((up_f32[0] - 0.0).abs() < 1e-3, "up[0] should be 0.0, got {}", up_f32[0]);
+        assert!((up_f32[1] - 2.0).abs() < 1e-3, "up[1] should be 2.0, got {}", up_f32[1]);
+        assert!((up_f32[31] - 62.0).abs() < 1e-3, "up[31] should be 62.0, got {}", up_f32[31]);
 
         std::fs::remove_file(&path).ok();
     }

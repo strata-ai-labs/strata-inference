@@ -40,6 +40,10 @@ struct Args {
     /// Debug: dump first N logits from graph decode
     #[arg(long, default_value = "0")]
     debug_logits: usize,
+
+    /// Context size (KV cache length). Defaults to min(model context_length, 4096).
+    #[arg(long)]
+    ctx: Option<usize>,
 }
 
 fn main() {
@@ -60,7 +64,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load model via unified GenerationEngine with Metal backend
     let load_start = Instant::now();
-    let mut engine = GenerationEngine::from_gguf_with_backend(&args.model, "metal")?;
+    let mut engine = GenerationEngine::from_gguf_with_options(&args.model, "metal", args.ctx)?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!("[timing] model load: {:.1}ms", load_ms);
 
