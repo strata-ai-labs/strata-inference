@@ -79,6 +79,55 @@ pub(crate) enum PsoRef {
     RopeNeoxFactors,
 }
 
+impl PsoRef {
+    /// Human-readable kernel name for profiling output.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            PsoRef::LayerNorm => "LayerNorm",
+            PsoRef::RmsNorm => "RmsNorm",
+            PsoRef::QuantizedMatmulQ8_0 => "QuantizedMatmulQ8_0",
+            PsoRef::QuantizedMatmulQ4_0 => "QuantizedMatmulQ4_0",
+            PsoRef::QuantizedMatmulQ4K => "QuantizedMatmulQ4K",
+            PsoRef::QuantizedMatmulQ5K => "QuantizedMatmulQ5K",
+            PsoRef::QuantizedMatmulQ6K => "QuantizedMatmulQ6K",
+            PsoRef::MatmulTranspose => "MatmulTranspose",
+            PsoRef::AddTensor => "AddTensor",
+            PsoRef::AddBias => "AddBias",
+            PsoRef::Gelu => "Gelu",
+            PsoRef::Silu => "Silu",
+            PsoRef::SwiGlu => "SwiGlu",
+            PsoRef::GeGlu => "GeGlu",
+            PsoRef::RopeNorm => "RopeNorm",
+            PsoRef::RopeNeox => "RopeNeox",
+            PsoRef::EmbeddingLookup => "EmbeddingLookup",
+            PsoRef::GroupedAttnDecode => "GroupedAttnDecode",
+            PsoRef::CopyBuffer => "CopyBuffer",
+            PsoRef::ScaleKernel => "ScaleKernel",
+            PsoRef::CopyF32ToF16 => "CopyF32ToF16",
+            PsoRef::GroupedAttnDecodeF16 => "GroupedAttnDecodeF16",
+            PsoRef::QuantizedMatmulBiasQ8_0 => "QuantizedMatmulBiasQ8_0",
+            PsoRef::QuantizedMatmulBiasQ4_0 => "QuantizedMatmulBiasQ4_0",
+            PsoRef::QuantizedMatmulBiasQ4K => "QuantizedMatmulBiasQ4K",
+            PsoRef::QuantizedMatmulBiasQ5K => "QuantizedMatmulBiasQ5K",
+            PsoRef::QuantizedMatmulBiasQ6K => "QuantizedMatmulBiasQ6K",
+            PsoRef::MatmulTransposeBias => "MatmulTransposeBias",
+            PsoRef::BatchedCausalAttention => "BatchedCausalAttention",
+            PsoRef::BatchedCausalAttentionF16 => "BatchedCausalAttentionF16",
+            PsoRef::BatchedMatmulQ8_0 => "BatchedMatmulQ8_0",
+            PsoRef::BatchedMatmulBiasQ8_0 => "BatchedMatmulBiasQ8_0",
+            PsoRef::BatchedMatmulQ4_0 => "BatchedMatmulQ4_0",
+            PsoRef::BatchedMatmulBiasQ4_0 => "BatchedMatmulBiasQ4_0",
+            PsoRef::BatchedMatmulQ4K => "BatchedMatmulQ4K",
+            PsoRef::BatchedMatmulBiasQ4K => "BatchedMatmulBiasQ4K",
+            PsoRef::BatchedMatmulQ5K => "BatchedMatmulQ5K",
+            PsoRef::BatchedMatmulBiasQ5K => "BatchedMatmulBiasQ5K",
+            PsoRef::BatchedMatmulQ6K => "BatchedMatmulQ6K",
+            PsoRef::BatchedMatmulBiasQ6K => "BatchedMatmulBiasQ6K",
+            PsoRef::RopeNeoxFactors => "RopeNeoxFactors",
+        }
+    }
+}
+
 /// Parameter value: either fixed at build time or patched per-token.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ParamValue {
@@ -799,18 +848,12 @@ impl DecodeGraph {
         let total_dim = config.num_heads * config.head_dim;
         let ffn_h = config.ffn_hidden;
         let f32_size = std::mem::size_of::<f32>();
-        // Compute YaRN mscale for magnitude scaling
-        let yarn_mscale = {
-            let f = config.rope_scaling_attn_factor;
-            if f > 1.0 { 0.1 * f.log2() + 1.0 } else { 1.0 }
-        };
-        // Apply mscale^2 to attention scale (accounts for both Q and K scaling)
-        let base_attn_scale = config.attn_scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
-        let attn_scale = if config.rope_scaling_original_ctx > 0 && weights.rope_factors_short.is_some() {
-            base_attn_scale * yarn_mscale * yarn_mscale
-        } else {
-            base_attn_scale
-        };
+        // LongRoPE mscale: the raw attn_factor is passed to the RoPE kernel as mscale,
+        // which scales cos/sin for both Q and K.  This naturally produces mscale^2 in
+        // the attention dot product, so we do NOT additionally modify attn_scale here.
+        // (The 0.1*ln(f)+1.0 transform only applies to YaRN with ext_factor!=0.)
+        let yarn_mscale = config.rope_scaling_attn_factor;
+        let attn_scale = config.attn_scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
 
         // ===================================================================
         // Index global weights (same order as weight_walk_order)
@@ -1314,17 +1357,10 @@ impl PrefillGraph {
         let f32_size = std::mem::size_of::<f32>();
         let m = n_tokens;
 
-        // Compute YaRN mscale for magnitude scaling
-        let yarn_mscale = {
-            let f = config.rope_scaling_attn_factor;
-            if f > 1.0 { 0.1 * f.log2() + 1.0 } else { 1.0 }
-        };
-        let base_attn_scale = config.attn_scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
-        let attn_scale = if config.rope_scaling_original_ctx > 0 && weights.rope_factors_short.is_some() {
-            base_attn_scale * yarn_mscale * yarn_mscale
-        } else {
-            base_attn_scale
-        };
+        // LongRoPE mscale: applied inside RoPE kernel to both Q and K, so we do NOT
+        // modify attn_scale here.  See DecodeGraph::build comment for details.
+        let yarn_mscale = config.rope_scaling_attn_factor;
+        let attn_scale = config.attn_scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
 
         // ===================================================================
         // Index global weights (same order as weight_walk_order)

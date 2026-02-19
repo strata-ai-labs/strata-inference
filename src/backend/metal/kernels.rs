@@ -916,7 +916,7 @@ kernel void rope_neox(
 // 8b. rope_neox_factors — Same as rope_neox but with per-dimension frequency
 //     factors (LongRoPE / YaRN). The factors buffer has rope_dim/2 floats
 //     that multiply the base frequency for each pair position.
-//     freq[i] = pow(freq_base, inv_ndims * 2*i) * factors[i]
+//     freq[i] = pow(freq_base, inv_ndims * 2*i) / factors[i]
 // -----------------------------------------------------------------------
 kernel void rope_neox_factors(
     device const float* input      [[buffer(0)]],
@@ -942,7 +942,7 @@ kernel void rope_neox_factors(
     float theta_base = float(pos_offset + seq);
     float inv_ndims = -1.f / float(rope_dim);
     float factor = factors[i];
-    float theta = theta_base * pow(freq_base, inv_ndims * float(2 * i)) * factor;
+    float theta = theta_base * pow(freq_base, inv_ndims * float(2 * i)) / factor;
 
     float cos_theta = cos(theta);
     float sin_theta = sin(theta);

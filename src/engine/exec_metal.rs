@@ -5,7 +5,7 @@
 
 use crate::backend::metal::ffi::*;
 
-use super::graph::{BufferRef, BufferSlot, DecodeGraph, DispatchDims, ParamValue, PrefillGraph};
+use super::graph::{BufferRef, BufferSlot, DecodeGraph, DispatchDims, ParamValue, PrefillGraph, PsoRef};
 
 // ---------------------------------------------------------------------------
 // Buffer pool — pre-allocated Metal buffers for zero-allocation decode
@@ -468,6 +468,265 @@ pub(crate) unsafe fn encode_prefill(
     let logits_buf = pool.get(graph.logits_slot);
     let ptr = msg_send_ptr(logits_buf, res.sels.contents) as *const f32;
     std::slice::from_raw_parts(ptr, graph.logits_count).to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// Profiled execution — per-op command buffers with GPU timestamps
+// ---------------------------------------------------------------------------
+
+/// Encode all prefill ops using per-op command buffers for GPU profiling.
+///
+/// Returns `(logits, timings)` where timings is `Vec<(PsoRef, f64)>` — one
+/// entry per op with GPU-side elapsed seconds.
+///
+/// # Safety
+/// Same requirements as `encode_prefill`.
+pub(crate) unsafe fn encode_prefill_profiled(
+    graph: &PrefillGraph,
+    pool: &MetalBufferPool,
+    res: &MetalResources,
+    weight_bufs: &[Id],
+    kv_bufs: &[Id],
+    params: &PrefillParams,
+    token_ids_buf: Id,
+    position_ids_buf: Id,
+) -> (Vec<f32>, Vec<(PsoRef, f64)>) {
+    let n_tokens = params.n_tokens as u32;
+    let total_len = (params.pos_offset + params.n_tokens) as u32;
+    let pos_offset = params.pos_offset as u32;
+
+    let mut barrier_set = vec![false; graph.ops.len()];
+    for &idx in &graph.barriers {
+        if idx < barrier_set.len() {
+            barrier_set[idx] = true;
+        }
+    }
+
+    let mut timings: Vec<(PsoRef, f64)> = Vec::with_capacity(graph.ops.len());
+
+    for (i, op) in graph.ops.iter().enumerate() {
+        // Each op gets its own command buffer for isolated timing
+        let cmd = msg_send_id(res.command_queue, res.sels.command_buffer);
+        let enc = msg_send_id(cmd, res.sels.compute_command_encoder);
+
+        // Insert barrier if needed (within this single-op encoder, it's a no-op
+        // for correctness since we waitUntilCompleted between ops, but keeps
+        // the dispatch pattern identical)
+        if barrier_set[i] {
+            msg_send_void_nsuint(
+                enc,
+                res.sels.memory_barrier_with_scope,
+                MTL_BARRIER_SCOPE_BUFFERS,
+            );
+        }
+
+        // Set PSO
+        let pso = res.psos[op.pso as usize];
+        msg_send_void_id(enc, res.sels.set_compute_pipeline, pso);
+
+        // Bind buffers
+        for &(ref buf_ref, binding, offset) in &op.bindings {
+            let buf_id = resolve_buffer(buf_ref, pool, weight_bufs, kv_bufs);
+            msg_send_set_buffer(enc, res.sels.set_buffer, buf_id, offset as usize, binding as usize);
+        }
+
+        // Bind params
+        for &(ref param, binding) in &op.params {
+            match param {
+                ParamValue::U32(v) => {
+                    let bytes = v.to_ne_bytes();
+                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                }
+                ParamValue::F32(v) => {
+                    let bytes = v.to_ne_bytes();
+                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                }
+                ParamValue::PrefillTokenIds => {
+                    msg_send_set_buffer(enc, res.sels.set_buffer, token_ids_buf, 0, binding as usize);
+                }
+                ParamValue::PrefillPositionIds => {
+                    msg_send_set_buffer(enc, res.sels.set_buffer, position_ids_buf, 0, binding as usize);
+                }
+                ParamValue::PrefillNTokens => {
+                    let bytes = n_tokens.to_ne_bytes();
+                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                }
+                ParamValue::PrefillTotalLen => {
+                    let bytes = total_len.to_ne_bytes();
+                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                }
+                ParamValue::PrefillPosOffset => {
+                    let bytes = pos_offset.to_ne_bytes();
+                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                }
+                ParamValue::TokenId | ParamValue::PositionId
+                | ParamValue::PositionIdBuffer | ParamValue::TotalLen
+                | ParamValue::CacheRowOffset => {
+                    debug_assert!(false, "decode-only ParamValue in prefill graph");
+                }
+            }
+        }
+
+        // Dispatch
+        dispatch_op(enc, &res.sels, &op.dispatch);
+
+        // End, commit, wait — then read GPU timestamps
+        msg_send_void(enc, res.sels.end_encoding);
+        msg_send_void(cmd, res.sels.commit);
+        msg_send_void(cmd, res.sels.wait_until_completed);
+
+        let gpu_start = msg_send_f64(cmd, res.sels.gpu_start_time);
+        let gpu_end = msg_send_f64(cmd, res.sels.gpu_end_time);
+        timings.push((op.pso, gpu_end - gpu_start));
+    }
+
+    // Read logits from pool
+    let logits_buf = pool.get(graph.logits_slot);
+    let ptr = msg_send_ptr(logits_buf, res.sels.contents) as *const f32;
+    let logits = std::slice::from_raw_parts(ptr, graph.logits_count).to_vec();
+
+    (logits, timings)
+}
+
+/// Encode all decode ops using per-op command buffers for GPU profiling.
+///
+/// Returns `(logits, timings)` where timings is `Vec<(PsoRef, f64)>`.
+///
+/// # Safety
+/// Same requirements as `encode_decode_token`.
+pub(crate) unsafe fn encode_decode_token_profiled(
+    graph: &DecodeGraph,
+    pool: &MetalBufferPool,
+    res: &MetalResources,
+    weight_bufs: &[Id],
+    kv_bufs: &[Id],
+    dynamic: &DynamicParams,
+    token_id_buf: Id,
+    position_id_buf: Id,
+) -> (Vec<f32>, Vec<(PsoRef, f64)>) {
+    let pos = dynamic.pos as u32;
+    let total_len = (dynamic.pos + 1) as u32;
+    let cache_row_offset = dynamic.pos as u32 * dynamic.kv_dim as u32;
+
+    // Write dynamic values
+    let token_ptr = msg_send_ptr(token_id_buf, res.sels.contents) as *mut u32;
+    *token_ptr = dynamic.token_id;
+    let pos_ptr = msg_send_ptr(position_id_buf, res.sels.contents) as *mut u32;
+    *pos_ptr = pos;
+
+    let mut barrier_set = vec![false; graph.ops.len()];
+    for &idx in &graph.barriers {
+        if idx < barrier_set.len() {
+            barrier_set[idx] = true;
+        }
+    }
+
+    let mut timings: Vec<(PsoRef, f64)> = Vec::with_capacity(graph.ops.len());
+
+    for (i, op) in graph.ops.iter().enumerate() {
+        let cmd = msg_send_id(res.command_queue, res.sels.command_buffer);
+        let enc = msg_send_id(cmd, res.sels.compute_command_encoder);
+
+        if barrier_set[i] {
+            msg_send_void_nsuint(
+                enc,
+                res.sels.memory_barrier_with_scope,
+                MTL_BARRIER_SCOPE_BUFFERS,
+            );
+        }
+
+        let pso = res.psos[op.pso as usize];
+        msg_send_void_id(enc, res.sels.set_compute_pipeline, pso);
+
+        for &(ref buf_ref, binding, offset) in &op.bindings {
+            let buf_id = resolve_buffer(buf_ref, pool, weight_bufs, kv_bufs);
+            msg_send_set_buffer(enc, res.sels.set_buffer, buf_id, offset as usize, binding as usize);
+        }
+
+        for &(ref param, binding) in &op.params {
+            match param {
+                ParamValue::U32(v) => {
+                    let bytes = v.to_ne_bytes();
+                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                }
+                ParamValue::F32(v) => {
+                    let bytes = v.to_ne_bytes();
+                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                }
+                ParamValue::TokenId => {
+                    msg_send_set_buffer(enc, res.sels.set_buffer, token_id_buf, 0, binding as usize);
+                }
+                ParamValue::PositionIdBuffer => {
+                    msg_send_set_buffer(enc, res.sels.set_buffer, position_id_buf, 0, binding as usize);
+                }
+                ParamValue::PositionId => {
+                    let bytes = pos.to_ne_bytes();
+                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                }
+                ParamValue::TotalLen => {
+                    let bytes = total_len.to_ne_bytes();
+                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                }
+                ParamValue::CacheRowOffset => {
+                    let bytes = cache_row_offset.to_ne_bytes();
+                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                }
+                ParamValue::PrefillTokenIds | ParamValue::PrefillPositionIds
+                | ParamValue::PrefillNTokens | ParamValue::PrefillTotalLen
+                | ParamValue::PrefillPosOffset => {
+                    debug_assert!(false, "prefill-only ParamValue in decode graph");
+                }
+            }
+        }
+
+        dispatch_op(enc, &res.sels, &op.dispatch);
+
+        msg_send_void(enc, res.sels.end_encoding);
+        msg_send_void(cmd, res.sels.commit);
+        msg_send_void(cmd, res.sels.wait_until_completed);
+
+        let gpu_start = msg_send_f64(cmd, res.sels.gpu_start_time);
+        let gpu_end = msg_send_f64(cmd, res.sels.gpu_end_time);
+        timings.push((op.pso, gpu_end - gpu_start));
+    }
+
+    let logits_buf = pool.get(graph.logits_slot);
+    let ptr = msg_send_ptr(logits_buf, res.sels.contents) as *const f32;
+    let logits = std::slice::from_raw_parts(ptr, graph.logits_count).to_vec();
+
+    (logits, timings)
+}
+
+/// Format a timing breakdown table from per-op timings, aggregated by kernel.
+///
+/// Returns the formatted string and total GPU seconds.
+pub(crate) fn format_kernel_breakdown(timings: &[(PsoRef, f64)]) -> (String, f64) {
+    use std::collections::BTreeMap;
+    use std::fmt::Write;
+
+    // Aggregate by kernel name (BTreeMap for alphabetical ordering)
+    let mut by_kernel: BTreeMap<&'static str, (usize, f64)> = BTreeMap::new();
+    let mut total_gpu = 0.0f64;
+    for &(pso, elapsed) in timings {
+        let entry = by_kernel.entry(pso.name()).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += elapsed;
+        total_gpu += elapsed;
+    }
+
+    // Sort by total time descending
+    let mut sorted: Vec<_> = by_kernel.into_iter().collect();
+    sorted.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+
+    let mut out = String::new();
+    for (name, (count, secs)) in &sorted {
+        let ms = secs * 1000.0;
+        let pct = if total_gpu > 0.0 { secs / total_gpu * 100.0 } else { 0.0 };
+        let _ = writeln!(out, "    {:<36} {:>3} calls  {:>8.2}ms  {:>5.1}%", name, count, ms, pct);
+    }
+    let _ = writeln!(out, "    {:<36}            {:>8.2}ms", "Total GPU", total_gpu * 1000.0);
+
+    (out, total_gpu)
 }
 
 /// Dispatch a single op based on its dimensions.

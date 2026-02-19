@@ -90,9 +90,9 @@ pub struct ModelConfig {
     /// stored as `rope_factors_short.weight` and `rope_factors_long.weight`.
     /// Use short factors when seq_len < this value, long factors otherwise.
     pub rope_scaling_original_ctx: usize,
-    /// YaRN attention factor for magnitude scaling.
+    /// LongRoPE magnitude scaling factor.
     /// Loaded from `{arch}.rope.scaling.attn_factor`, default 1.0.
-    /// When > 1.0, mscale = 0.1 * ln2(factor) + 1.0, applied as mscale^2 to attn_scale.
+    /// Passed directly as mscale to the RoPE kernel (scales cos/sin of both Q and K).
     pub rope_scaling_attn_factor: f32,
 
     // Attention
@@ -1423,5 +1423,28 @@ mod tests {
         assert!(config.pre_norm);
         assert!(config.rope_neox);
         assert!((config.embedding_scale - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_phi35_longrope_config() {
+        // Phi-3.5 includes LongRoPE scaling metadata
+        let kv = vec![
+            ("general.architecture", kv_string("phi3")),
+            ("phi3.embedding_length", kv_u32(3072)),
+            ("phi3.block_count", kv_u32(32)),
+            ("phi3.attention.head_count", kv_u32(32)),
+            ("phi3.feed_forward_length", kv_u32(8192)),
+            ("phi3.context_length", kv_u32(131072)),
+            ("phi3.rope.scaling.original_context_length", kv_u32(4096)),
+            ("phi3.rope.scaling.attn_factor", kv_f32(1.190238)),
+        ];
+        let (gguf, _tmp) = open_gguf_from_kv(&kv);
+        let config = ModelConfig::from_gguf(&gguf).unwrap();
+
+        assert_eq!(config.arch, ModelArch::Phi3);
+        assert_eq!(config.rope_scaling_original_ctx, 4096);
+        assert!((config.rope_scaling_attn_factor - 1.190238).abs() < 1e-5);
+        assert_eq!(config.max_seq_len, 131072);
+        assert!(config.rope_neox);
     }
 }
