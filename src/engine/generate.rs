@@ -710,6 +710,9 @@ impl GenerationEngine {
         let mut prefill_graph = PrefillGraph::build(
             &self.config, &self.weights, prompt_ids.len(), kv_f16,
         );
+        if profiling {
+            eprintln!("[profile-detail] graph build: {:.1}ms", prefill_start.elapsed().as_secs_f64() * 1000.0);
+        }
 
         // LongRoPE: select long vs short factors based on max position in prefill
         if self.config.rope_scaling_original_ctx > 0 {
@@ -742,6 +745,9 @@ impl GenerationEngine {
 
         // Recompute barriers after patching
         prefill_graph.barriers = compute_barriers(&prefill_graph.ops);
+        if profiling {
+            eprintln!("[profile-detail] patch+barrier: {:.1}ms", prefill_start.elapsed().as_secs_f64() * 1000.0);
+        }
 
         // Allocate temporary prefill buffer pool
         let prefill_pool = unsafe {
@@ -789,8 +795,12 @@ impl GenerationEngine {
             KvCache::new_gpu(&self.config, metal.backend.as_ref())
         };
         let kv_buf_ids = Self::extract_kv_buf_ids_metal(&self.config, &cache);
+        if profiling {
+            eprintln!("[profile-detail] alloc (pool+tokens+kv): {:.1}ms", prefill_start.elapsed().as_secs_f64() * 1000.0);
+        }
 
         // Encode and execute (single command buffer!)
+        let gpu_start = Instant::now();
         let logits = unsafe {
             encode_prefill(
                 &prefill_graph,
@@ -814,7 +824,9 @@ impl GenerationEngine {
         let prefill_duration = prefill_start.elapsed();
 
         if profiling {
+            let gpu_ms = gpu_start.elapsed().as_secs_f64() * 1000.0;
             let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
+            eprintln!("[profile-detail] gpu exec+readback: {:.1}ms", gpu_ms);
             eprintln!(
                 "[profile] prefill: {:.1}ms ({} tokens, {} ops, 1 cmd buffer)",
                 prefill_ms, prompt_tokens, prefill_graph.ops.len(),

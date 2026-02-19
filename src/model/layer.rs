@@ -333,13 +333,21 @@ fn pre_norm_layer_forward(
     // 3. Multi-head attention
     let attn_out = multi_head_attention(q, k, v, config, backend, pos_offset, attention_mask);
 
-    // 4. Output projection + residual
+    // 4. Output projection
     let projected = linear_forward(
         &attn_out,
         &layer.attn_output,
         layer.attn_output_bias.as_ref(),
         backend,
     );
+
+    // 4b. Post-attention norm (Gemma3: before residual add)
+    let projected = if let Some(ref norm_w) = layer.attn_post_norm_w {
+        backend.rms_norm(&projected, norm_w, config.norm_eps)
+    } else {
+        projected
+    };
+
     let residual = backend.add(input, &projected);
 
     // 5. Pre-FFN normalization
@@ -353,8 +361,15 @@ fn pre_norm_layer_forward(
         backend,
     );
 
-    // 6. FFN (SwiGLU path)
+    // 6. FFN
     let ffn_out = ffn_forward(&normed2, layer, config, backend);
+
+    // 6b. Post-FFN norm (Gemma3: before residual add)
+    let ffn_out = if let Some(ref norm_w) = layer.ffn_post_norm_w {
+        backend.rms_norm(&ffn_out, norm_w, config.norm_eps)
+    } else {
+        ffn_out
+    };
 
     // 7. Residual connection
     backend.add(&residual, &ffn_out)
@@ -679,6 +694,94 @@ pub fn model_forward(
 
 use super::cache::KvCache;
 
+/// NeoX-style RoPE with per-dimension LongRoPE frequency factors and mscale.
+///
+/// Same as `rope_neox` but divides theta by `factors[i]` and scales cos/sin by `mscale`:
+///   theta[i] = pos * freq_base^(-2i/rope_dim) / factors[i]
+///   cos_theta = cos(theta) * mscale
+///   sin_theta = sin(theta) * mscale
+fn rope_neox_with_factors(
+    q: &DeviceTensor,
+    k: &DeviceTensor,
+    pos_offset: usize,
+    freq_base: f32,
+    head_dim: usize,
+    rope_dim: usize,
+    factors: &[f32],
+    mscale: f32,
+    backend: &dyn ComputeBackend,
+) -> (DeviceTensor, DeviceTensor) {
+    let half_rope_dim = rope_dim / 2;
+    assert_eq!(factors.len(), half_rope_dim,
+        "rope factors length ({}) must equal rope_dim/2 ({})", factors.len(), half_rope_dim);
+
+    let q_host = backend.download(q);
+    let k_host = backend.download(k);
+    let q_data = q_host.as_f32();
+    let k_data = k_host.as_f32();
+    let q_shape = q.shape();
+    let k_shape = k.shape();
+
+    let seq_len = q_shape[0];
+    let total_dim = q_shape[1];
+    let n_heads = total_dim / head_dim;
+    let k_total_dim = k_shape[1];
+    let k_n_heads = k_total_dim / head_dim;
+
+    // Precompute frequencies with factors (factors are divisors, matching llama.cpp: theta/ff)
+    let inv_ndims = -1.0f32 / rope_dim as f32;
+    let mut freqs = vec![0.0f32; half_rope_dim];
+    for i in 0..half_rope_dim {
+        freqs[i] = freq_base.powf(inv_ndims * (2 * i) as f32) / factors[i];
+    }
+
+    let mut q_rot = q_data.to_vec();
+    let mut k_rot = k_data.to_vec();
+
+    for pos in 0..seq_len {
+        let abs_pos = (pos + pos_offset) as f32;
+
+        for head in 0..n_heads {
+            let offset = pos * total_dim + head * head_dim;
+            for i in 0..half_rope_dim {
+                let theta = abs_pos * freqs[i];
+                let cos_theta = theta.cos() * mscale;
+                let sin_theta = theta.sin() * mscale;
+
+                let q0 = q_data[offset + i];
+                let q1 = q_data[offset + i + half_rope_dim];
+                q_rot[offset + i] = q0 * cos_theta - q1 * sin_theta;
+                q_rot[offset + i + half_rope_dim] = q0 * sin_theta + q1 * cos_theta;
+            }
+        }
+
+        for head in 0..k_n_heads {
+            let offset = pos * k_total_dim + head * head_dim;
+            for i in 0..half_rope_dim {
+                let theta = abs_pos * freqs[i];
+                let cos_theta = theta.cos() * mscale;
+                let sin_theta = theta.sin() * mscale;
+
+                let k0 = k_data[offset + i];
+                let k1 = k_data[offset + i + half_rope_dim];
+                k_rot[offset + i] = k0 * cos_theta - k1 * sin_theta;
+                k_rot[offset + i + half_rope_dim] = k0 * sin_theta + k1 * cos_theta;
+            }
+        }
+    }
+
+    (
+        DeviceTensor::new(Tensor::new(q_shape.to_vec(), q_rot)),
+        DeviceTensor::new(Tensor::new(k_shape.to_vec(), k_rot)),
+    )
+}
+
+/// LongRoPE parameters: per-dimension frequency factors and magnitude scale.
+struct LongRopeParams<'a> {
+    factors: &'a [f32],
+    mscale: f32,
+}
+
 /// Multi-head attention with KV cache for autoregressive generation.
 ///
 /// Only new tokens' Q/K/V are computed; previous K/V are read from cache.
@@ -691,6 +794,7 @@ fn multi_head_attention_cached(
     layer_idx: usize,
     config: &ModelConfig,
     backend: &dyn ComputeBackend,
+    longrope: Option<&LongRopeParams>,
 ) -> Result<DeviceTensor, InferenceError> {
     let n_new = q.shape()[0];
     let num_heads = config.num_heads;
@@ -702,7 +806,13 @@ fn multi_head_attention_cached(
 
     // Step a: Apply RoPE to Q and K_new with pos_offset
     let (q_proc, k_proc) = if config.position_type == PositionType::RoPE {
-        if config.rope_neox {
+        if let Some(params) = longrope {
+            // LongRoPE with per-dimension frequency factors and mscale
+            rope_neox_with_factors(
+                &q, &k_new, pos_offset, config.rope_freq_base,
+                head_dim, config.rope_dim, params.factors, params.mscale, backend,
+            )
+        } else if config.rope_neox {
             backend.rope_neox(
                 &q, &k_new, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
             )
@@ -865,6 +975,7 @@ fn transformer_layer_forward_cached(
     config: &ModelConfig,
     backend: &dyn ComputeBackend,
     cache: &mut KvCache,
+    longrope: Option<&LongRopeParams>,
 ) -> Result<DeviceTensor, InferenceError> {
     trace!(layer = layer_idx, "transformer_layer_forward_cached");
 
@@ -886,17 +997,32 @@ fn transformer_layer_forward_cached(
             rms_norm_per_head(k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
         } else { k };
 
-        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend)?;
+        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend, longrope)?;
 
         let projected = linear_forward(
             &attn_out, &layer.attn_output, layer.attn_output_bias.as_ref(), backend,
         );
+
+        // Post-attention norm (Gemma3: applied to projection BEFORE residual add)
+        let projected = if let Some(ref norm_w) = layer.attn_post_norm_w {
+            backend.rms_norm(&projected, norm_w, config.norm_eps)
+        } else {
+            projected
+        };
+
         let residual = backend.add(input, &projected);
 
         let ffn_norm_w = layer.ffn_norm_w.as_ref()
             .expect("pre_norm layer requires ffn_norm_w");
         let normed2 = normalize(&residual, ffn_norm_w, layer.ffn_norm_b.as_ref(), config, backend);
         let ffn_out = ffn_forward(&normed2, layer, config, backend);
+
+        // Post-FFN norm (Gemma3: applied to FFN output BEFORE residual add)
+        let ffn_out = if let Some(ref norm_w) = layer.ffn_post_norm_w {
+            backend.rms_norm(&ffn_out, norm_w, config.norm_eps)
+        } else {
+            ffn_out
+        };
 
         Ok(backend.add(&residual, &ffn_out))
     } else {
@@ -906,7 +1032,7 @@ fn transformer_layer_forward_cached(
         let k = linear_forward(input, &layer.attn_k, layer.attn_k_bias.as_ref(), backend);
         let v = linear_forward(input, &layer.attn_v, layer.attn_v_bias.as_ref(), backend);
 
-        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend)?;
+        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend, longrope)?;
 
         let projected = linear_forward(
             &attn_out, &layer.attn_output, layer.attn_output_bias.as_ref(), backend,
@@ -982,18 +1108,40 @@ pub fn model_forward_step(
         );
     }
 
-    // 6. Run through all transformer layers with cache
+    // 6. Determine LongRoPE frequency factors and mscale (Phi-3.5 etc.)
+    // Use short factors when total sequence length < original_ctx, long otherwise.
+    // mscale = rope_scaling_attn_factor (applied to cos/sin in RoPE).
+    let total_seq_len = pos_offset + n_tokens;
+    let rope_factors_data: Option<Vec<f32>> = if config.rope_scaling_original_ctx > 0 {
+        let factors_tensor = if total_seq_len < config.rope_scaling_original_ctx {
+            weights.rope_factors_short.as_ref()
+        } else {
+            weights.rope_factors_long.as_ref()
+        };
+        factors_tensor.map(|t| {
+            let host = backend.download(t);
+            host.as_f32().to_vec()
+        })
+    } else {
+        None
+    };
+    let longrope_params = rope_factors_data.as_ref().map(|factors| LongRopeParams {
+        factors: factors.as_slice(),
+        mscale: config.rope_scaling_attn_factor,
+    });
+
+    // 7. Run through all transformer layers with cache
     for (i, layer) in weights.layers.iter().enumerate() {
         trace!(layer = i, "Running cached layer");
         hidden = transformer_layer_forward_cached(
-            &hidden, layer, i, config, backend, cache,
+            &hidden, layer, i, config, backend, cache, longrope_params.as_ref(),
         )?;
     }
 
-    // 7. Advance cache position after all layers processed
+    // 8. Advance cache position after all layers processed
     cache.advance(n_tokens);
 
-    // 8. Final output normalization (absent for BERT)
+    // 9. Final output normalization (absent for BERT)
     if let Some(ref norm_w) = weights.output_norm_w {
         hidden = normalize(
             &hidden,

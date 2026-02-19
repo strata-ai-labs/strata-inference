@@ -248,8 +248,15 @@ impl BpeTokenizer {
         }
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-        // Compile the pre-tokenizer regex patterns if a `pre` type is specified.
-        let pre_regexes: Vec<Regex> = pre_type
+        // Compile the pre-tokenizer regex patterns.
+        // For rank-based BPE, default to "default" when no pre-type is specified,
+        // matching llama.cpp's `default:` case in llm_tokenizer_bpe constructor.
+        let effective_pre = match pre_type {
+            Some(p) => Some(p),
+            None if !use_scores => Some("default"),
+            None => None,
+        };
+        let pre_regexes: Vec<Regex> = effective_pre
             .and_then(pretokenizer_regex_for)
             .map(|patterns| {
                 patterns
@@ -738,6 +745,8 @@ impl BpeTokenizer {
             segments.iter().map(|s| Self::byte_encode_word(s)).collect()
         } else {
             // Fallback: hand-written GPT-2 pre-tokenizer, then byte-encode.
+            // This path is rarely reached since rank-based BPE now defaults
+            // to the "default" regex patterns (matching llama.cpp).
             gpt_pre_tokenize(text)
                 .into_iter()
                 .map(|piece| Self::byte_encode_word(&piece))

@@ -235,7 +235,7 @@ impl ModelConfig {
             match arch {
                 ModelArch::Gemma3 | ModelArch::Gemma2 => (
                     NormType::RMSNorm,
-                    Activation::SwiGLU,
+                    Activation::GeGLU,
                     PositionType::RoPE,
                     true,  // has_ffn_gate
                     false, // has_bias
@@ -586,7 +586,7 @@ mod tests {
 
         // Gemma3-specific defaults
         assert_eq!(config.norm_type, NormType::RMSNorm);
-        assert_eq!(config.activation, Activation::SwiGLU);
+        assert_eq!(config.activation, Activation::GeGLU);
         assert_eq!(config.position_type, PositionType::RoPE);
         assert!(config.has_ffn_gate);
         assert!(!config.has_bias);
@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(config.arch_name, "gemma2");
         assert_eq!(config.hidden_size, 512);
         assert_eq!(config.norm_type, NormType::RMSNorm);
-        assert_eq!(config.activation, Activation::SwiGLU);
+        assert_eq!(config.activation, Activation::GeGLU);
         assert_eq!(config.position_type, PositionType::RoPE);
         assert!(config.has_ffn_gate);
         assert!(!config.has_bias);
@@ -1210,7 +1210,7 @@ mod tests {
         assert_eq!(config.pooling_type, PoolingType::Mean);
         assert!(!config.causal);
         assert_eq!(config.norm_type, NormType::RMSNorm);
-        assert_eq!(config.activation, Activation::SwiGLU);
+        assert_eq!(config.activation, Activation::GeGLU);
         assert_eq!(config.position_type, PositionType::RoPE);
         assert!(config.has_ffn_gate);
         assert!(!config.has_bias);
