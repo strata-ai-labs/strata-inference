@@ -630,9 +630,9 @@ impl ModelWeights {
                 None
             };
 
-            // Per-head Q/K normalization (GemmaEmbedding, Qwen3)
+            // Per-head Q/K normalization (Gemma3, GemmaEmbedding, Qwen3)
             let (attn_q_norm_w, attn_k_norm_w) =
-                if config.arch == ModelArch::GemmaEmbedding || config.arch == ModelArch::Qwen3 {
+                if matches!(config.arch, ModelArch::Gemma3 | ModelArch::Gemma2 | ModelArch::GemmaEmbedding | ModelArch::Qwen3) {
                     let qn = load_tensor_optional(
                         gguf,
                         &format!("{}.attn_q_norm.weight", prefix),
@@ -648,9 +648,9 @@ impl ModelWeights {
                     (None, None)
                 };
 
-            // Post-projection norms (GemmaEmbedding only)
+            // Post-projection norms (Gemma3, Gemma2, GemmaEmbedding)
             let (attn_post_norm_w, ffn_post_norm_w) =
-                if config.arch == ModelArch::GemmaEmbedding {
+                if matches!(config.arch, ModelArch::Gemma3 | ModelArch::Gemma2 | ModelArch::GemmaEmbedding) {
                     let apn = load_tensor_optional(
                         gguf,
                         &format!("{}.post_attention_norm.weight", prefix),
