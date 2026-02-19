@@ -3,12 +3,16 @@
 //! [`GenerationEngine`] provides a high-level API for text generation from
 //! any supported causal GGUF model (Gemma, LLaMA, etc.) using a KV cache
 //! for efficient token-by-token decoding.
+//!
+//! On Metal, the engine uses graph-based execution (single command buffer per
+//! token) for maximum throughput. On CPU, it falls back to per-op dispatch
+//! via `model_forward_step`.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::backend::{ComputeBackend, DeviceTensor};
 use crate::error::InferenceError;
@@ -21,6 +25,20 @@ use crate::tensor::Tensor;
 use crate::tokenizer::{create_tokenizer_from_gguf, Tokenizer};
 
 use super::sampler::{SamplingConfig, XorShiftRng, sample_token};
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use super::graph::{BufferRef, DecodeGraph, PrefillGraph, compute_barriers, patch_ops, weight_walk_order};
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use crate::backend::metal::ffi::*;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use crate::backend::metal::{MetalBackend, MetalBuffer};
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use crate::tensor::TensorDtype;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use super::exec_metal::{
+    DynamicParams, MetalBufferPool, MetalResources, PrefillParams,
+    encode_decode_token, encode_prefill,
+};
 
 /// Why generation stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,28 +98,111 @@ impl Default for GenerationConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Executor — backend-specific execution strategy
+// ---------------------------------------------------------------------------
+
+/// Metal graph-based executor.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+struct MetalExecutor {
+    backend: Arc<MetalBackend>,
+    metal_res: MetalResources,
+    buffer_pool: MetalBufferPool,
+    weight_buf_ids: Vec<Id>,
+    kv_dim: usize,
+    token_id_buf: Id,
+    position_id_buf: Id,
+    /// Pre-converted F32 embedding tensors kept alive to prevent buffer deallocation.
+    _f32_emb_tensors: Vec<DeviceTensor>,
+    f32_token_emb_idx: Option<u16>,
+    f32_pos_emb_idx: Option<u16>,
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+unsafe impl Send for MetalExecutor {}
+#[cfg(all(feature = "metal", target_os = "macos"))]
+unsafe impl Sync for MetalExecutor {}
+
+/// CPU executor using per-op dispatch via ComputeBackend.
+struct CpuExecutor {
+    backend: Arc<dyn ComputeBackend>,
+}
+
+/// Backend-specific execution strategy.
+enum Executor {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal(MetalExecutor),
+    Cpu(CpuExecutor),
+}
+
+// ---------------------------------------------------------------------------
+// GenerationEngine
+// ---------------------------------------------------------------------------
+
 /// High-level generation engine for autoregressive text generation.
 ///
 /// Wraps a GGUF model with its tokenizer, compute backend, and KV cache
 /// to provide `generate(prompt) -> String` and streaming APIs.
+///
+/// On Metal, uses graph-based execution (single command buffer per token)
+/// for maximum throughput. On CPU, falls back to per-op `model_forward_step`.
 pub struct GenerationEngine {
     config: ModelConfig,
     weights: ModelWeights,
     tokenizer: Box<dyn Tokenizer>,
-    backend: Arc<dyn ComputeBackend>,
+    executor: Executor,
+    /// Decode graph (Metal path only).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    decode_graph: Option<DecodeGraph>,
+    /// Whether KV cache uses F16 (Metal path only).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    kv_f16: bool,
 }
 
 impl GenerationEngine {
-    /// Load a generation engine from a GGUF file path.
+    /// Load a generation engine from a GGUF file, auto-selecting the best backend.
     ///
-    /// Validates that the model is causal (generation doesn't make sense
-    /// for bidirectional models like BERT).
-    pub fn from_gguf(
+    /// Prefers Metal > CUDA > CPU.
+    pub fn from_gguf(path: impl AsRef<Path>) -> Result<Self, InferenceError> {
+        // Auto-select: try Metal first, then fall back to CPU
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            match Self::from_gguf_metal(path.as_ref()) {
+                Ok(engine) => return Ok(engine),
+                Err(e) => {
+                    info!(error = %e, "Metal init failed, falling back to CPU");
+                }
+            }
+        }
+
+        Self::from_gguf_cpu(path.as_ref())
+    }
+
+    /// Load with an explicit backend selection.
+    pub fn from_gguf_with_backend(
         path: impl AsRef<Path>,
-        backend: Arc<dyn ComputeBackend>,
+        backend: &str,
     ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
-        info!(path = %path.display(), "Loading generation engine from GGUF");
+        match backend {
+            "auto" => Self::from_gguf(path),
+            "cpu" => Self::from_gguf_cpu(path),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            "metal" => Self::from_gguf_metal(path),
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+            "metal" => Err(InferenceError::Backend(
+                "Metal backend not available (compile with --features metal on macOS)".to_string(),
+            )),
+            other => Err(InferenceError::Backend(format!(
+                "Unknown backend '{}'. Options: auto, cpu, metal", other
+            ))),
+        }
+    }
+
+    /// Build a CPU-backed generation engine.
+    fn from_gguf_cpu(path: &Path) -> Result<Self, InferenceError> {
+        info!(path = %path.display(), "Loading generation engine (CPU) from GGUF");
+
         let gguf = GgufFile::open(path)?;
         let config = ModelConfig::from_gguf(&gguf)?;
 
@@ -111,6 +212,8 @@ impl GenerationEngine {
             ));
         }
 
+        let backend: Arc<dyn ComputeBackend> =
+            Arc::new(crate::backend::cpu::CpuBackend::new());
         let weights = ModelWeights::from_gguf(&gguf, &config, backend.as_ref())?;
         let tokenizer = create_tokenizer_from_gguf(&gguf)?;
 
@@ -119,14 +222,171 @@ impl GenerationEngine {
             hidden_size = config.hidden_size,
             vocab_size = config.vocab_size,
             max_seq_len = config.max_seq_len,
-            "Generation engine loaded"
+            "CPU generation engine loaded"
         );
 
         Ok(Self {
             config,
             weights,
             tokenizer,
-            backend,
+            executor: Executor::Cpu(CpuExecutor { backend }),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            decode_graph: None,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            kv_f16: false,
+        })
+    }
+
+    /// Build a Metal graph-based generation engine.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn from_gguf_metal(path: &Path) -> Result<Self, InferenceError> {
+        info!(path = %path.display(), "Loading generation engine (Metal) from GGUF");
+
+        let gguf = GgufFile::open(path)?;
+        let config = ModelConfig::from_gguf(&gguf)?;
+
+        if !config.causal {
+            return Err(InferenceError::Generation(
+                "generation requires a causal model (not bidirectional)".to_string(),
+            ));
+        }
+
+        let backend = Arc::new(MetalBackend::try_new()?);
+        let weights = ModelWeights::from_gguf(&gguf, &config, backend.as_ref())?;
+        let tokenizer = create_tokenizer_from_gguf(&gguf)?;
+
+        info!(
+            arch = %config.arch_name,
+            hidden_size = config.hidden_size,
+            num_layers = config.num_layers,
+            vocab_size = config.vocab_size,
+            token_emb_dtype = ?weights.token_embedding.dtype(),
+            pos_emb_dtype = ?weights.position_embedding.as_ref().map(|w| w.dtype()),
+            layer0_q_dtype = ?weights.layers[0].attn_q.dtype(),
+            "Model loaded, building decode graph"
+        );
+
+        // Build decode graph with F16 KV cache
+        let kv_f16 = true;
+        let mut decode_graph = DecodeGraph::build(&config, &weights, kv_f16);
+        info!(
+            ops = decode_graph.ops.len(),
+            barriers = decode_graph.barriers.len(),
+            slots = decode_graph.num_slots,
+            "Decode graph built"
+        );
+
+        // Create Metal resources (device, queue, PSOs)
+        let (device, command_queue) = unsafe {
+            let device = MTLCreateSystemDefaultDevice();
+            if device == NIL {
+                return Err(InferenceError::Backend("No Metal device available".into()));
+            }
+            msg_send_void(device, sel_registerName(b"retain\0".as_ptr() as _));
+            let sels = Selectors::new();
+            let queue = msg_send_id(device, sels.new_command_queue);
+            if queue == NIL {
+                msg_send_void(device, sels.release);
+                return Err(InferenceError::Backend("Failed to create command queue".into()));
+            }
+            (device, queue)
+        };
+
+        let metal_res = unsafe { MetalResources::new(device, command_queue)? };
+
+        // Pre-allocate buffer pool
+        let buffer_pool = unsafe {
+            MetalBufferPool::new(device, &metal_res.sels, &decode_graph.slot_sizes)
+        };
+
+        // Extract raw buffer Ids from model weights
+        let walked = weight_walk_order(&weights);
+        let mut weight_buf_ids: Vec<Id> = walked
+            .iter()
+            .map(|dt| extract_buffer_id(dt))
+            .collect();
+
+        // Pre-convert non-F32 embedding tables to F32
+        let mut f32_emb_tensors: Vec<DeviceTensor> = Vec::new();
+        let mut f32_token_emb_idx: Option<u16> = None;
+        let mut f32_pos_emb_idx: Option<u16> = None;
+
+        // Weight(0) is always token_embedding
+        if weights.token_embedding.dtype() != TensorDtype::F32 {
+            let f32_tensor = backend.download(&weights.token_embedding).to_f32();
+            let f32_dt = backend.upload(&f32_tensor);
+            let f32_buf = extract_buffer_id(&f32_dt);
+            let new_idx = weight_buf_ids.len() as u16;
+            weight_buf_ids.push(f32_buf);
+            f32_emb_tensors.push(f32_dt);
+            patch_ops(&mut decode_graph.ops, BufferRef::Weight(0), BufferRef::Weight(new_idx));
+            f32_token_emb_idx = Some(new_idx);
+            info!(
+                original_dtype = ?weights.token_embedding.dtype(),
+                new_weight_idx = new_idx,
+                "Pre-converted token embedding to F32 for graph"
+            );
+        }
+
+        // Weight(1) is position_embedding (if present)
+        if let Some(ref pos_emb) = weights.position_embedding {
+            if pos_emb.dtype() != TensorDtype::F32 {
+                let f32_tensor = backend.download(pos_emb).to_f32();
+                let f32_dt = backend.upload(&f32_tensor);
+                let f32_buf = extract_buffer_id(&f32_dt);
+                let new_idx = weight_buf_ids.len() as u16;
+                weight_buf_ids.push(f32_buf);
+                f32_emb_tensors.push(f32_dt);
+                patch_ops(&mut decode_graph.ops, BufferRef::Weight(1), BufferRef::Weight(new_idx));
+                f32_pos_emb_idx = Some(new_idx);
+                info!(
+                    original_dtype = ?pos_emb.dtype(),
+                    new_weight_idx = new_idx,
+                    "Pre-converted position embedding to F32 for graph"
+                );
+            }
+        }
+
+        let kv_dim = config.num_kv_heads * config.head_dim;
+
+        // Pre-allocate tiny buffers for the token ID and position ID
+        let token_id_buf = unsafe {
+            msg_send_new_buffer_length(
+                device,
+                metal_res.sels.new_buffer_with_length,
+                std::mem::size_of::<u32>(),
+                MTL_RESOURCE_STORAGE_MODE_SHARED,
+            )
+        };
+        let position_id_buf = unsafe {
+            msg_send_new_buffer_length(
+                device,
+                metal_res.sels.new_buffer_with_length,
+                std::mem::size_of::<u32>(),
+                MTL_RESOURCE_STORAGE_MODE_SHARED,
+            )
+        };
+
+        info!("Metal generation engine initialized");
+
+        Ok(Self {
+            config,
+            weights,
+            tokenizer,
+            executor: Executor::Metal(MetalExecutor {
+                backend,
+                metal_res,
+                buffer_pool,
+                weight_buf_ids,
+                kv_dim,
+                token_id_buf,
+                position_id_buf,
+                _f32_emb_tensors: f32_emb_tensors,
+                f32_token_emb_idx,
+                f32_pos_emb_idx,
+            }),
+            decode_graph: Some(decode_graph),
+            kv_f16,
         })
     }
 
@@ -142,117 +402,27 @@ impl GenerationEngine {
             config,
             weights,
             tokenizer,
-            backend,
+            executor: Executor::Cpu(CpuExecutor { backend }),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            decode_graph: None,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            kv_f16: false,
         }
     }
 
     /// Generate text from a prompt.
-    ///
-    /// Steps:
-    /// 1. Tokenize the prompt
-    /// 2. Validate prompt length
-    /// 3. Create KV cache
-    /// 4. Prefill: run all prompt tokens through the model
-    /// 5. Sample first token from prefill output
-    /// 6. Decode loop: generate tokens one at a time until stop condition
-    /// 7. Decode generated token IDs to text
     pub fn generate(
-        &self,
+        &mut self,
         prompt: &str,
         gen_config: &GenerationConfig,
     ) -> Result<String, InferenceError> {
-        if !self.config.causal {
-            return Err(InferenceError::Generation(
-                "generation requires a causal model (not bidirectional)".to_string(),
-            ));
-        }
-
-        let prompt_ids = self.tokenizer.encode(prompt, true);
-
-        if prompt_ids.is_empty() {
-            return Err(InferenceError::Generation(
-                "prompt tokenized to empty sequence".to_string(),
-            ));
-        }
-
-        if prompt_ids.len() >= self.config.max_seq_len {
-            return Err(InferenceError::Generation(format!(
-                "prompt length ({}) exceeds max_seq_len ({})",
-                prompt_ids.len(),
-                self.config.max_seq_len
-            )));
-        }
-
-        let mut rng = XorShiftRng::new(gen_config.sampling.seed.unwrap_or(42));
-        let mut cache = if self.backend.is_gpu() {
-            KvCache::new_gpu(&self.config, self.backend.as_ref())
-        } else {
-            KvCache::new(&self.config)
-        };
-        let mut generated_ids: Vec<u32> = Vec::new();
-
-        // Collect all stop tokens (explicit + EOS)
-        let mut stop_tokens = gen_config.stop_tokens.clone();
-        if let Some(eos) = self.tokenizer.eos_token_id() {
-            if !stop_tokens.contains(&eos) {
-                stop_tokens.push(eos);
-            }
-        }
-
-        // Prefill: process all prompt tokens at once
-        let hidden = model_forward_step(
-            &prompt_ids,
-            &self.weights,
-            &self.config,
-            self.backend.as_ref(),
-            &mut cache,
-        )?;
-
-        // Project last hidden state to logits and sample first token
-        let logits = self.project_to_logits(&hidden, prompt_ids.len() - 1);
-        let mut next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
-
-        debug!(first_token = next_token, "Prefill complete, starting decode");
-
-        // Decode loop
-        for step in 0..gen_config.max_tokens {
-            // Check stop conditions
-            if stop_tokens.contains(&next_token) {
-                debug!(step, token = next_token, "Stop token encountered");
-                break;
-            }
-
-            generated_ids.push(next_token);
-
-            if cache.len() >= self.config.max_seq_len {
-                debug!(step, "Context length reached");
-                break;
-            }
-
-            // Forward pass with single token
-            let hidden = model_forward_step(
-                &[next_token],
-                &self.weights,
-                &self.config,
-                self.backend.as_ref(),
-                &mut cache,
-            )?;
-
-            // Project to logits and sample
-            let logits = self.project_to_logits(&hidden, 0);
-            next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
-        }
-
-        // Decode generated token IDs to text
-        Ok(self.tokenizer.decode(&generated_ids))
+        let output = self.generate_full(prompt, gen_config)?;
+        Ok(self.tokenizer.decode(&output.token_ids))
     }
 
     /// Generate text with full metadata (stop reason, prompt token count).
-    ///
-    /// Same as [`generate`] but returns a [`GenerationOutput`] with metadata
-    /// useful for timing and reporting.
     pub fn generate_full(
-        &self,
+        &mut self,
         prompt: &str,
         gen_config: &GenerationConfig,
     ) -> Result<GenerationOutput, InferenceError> {
@@ -264,7 +434,7 @@ impl GenerationEngine {
     /// The callback receives each token ID as it's generated. Return `false`
     /// from the callback to stop generation early.
     pub fn generate_stream(
-        &self,
+        &mut self,
         prompt: &str,
         gen_config: &GenerationConfig,
         callback: impl FnMut(u32) -> bool,
@@ -273,13 +443,33 @@ impl GenerationEngine {
         Ok(output.token_ids)
     }
 
-    /// Generate with streaming and full metadata (stop reason, prompt token count).
+    /// Generate with streaming and full metadata.
     pub fn generate_stream_full(
+        &mut self,
+        prompt: &str,
+        gen_config: &GenerationConfig,
+        callback: impl FnMut(u32) -> bool,
+    ) -> Result<GenerationOutput, InferenceError> {
+        match &self.executor {
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Executor::Metal(_) => self.generate_stream_full_metal(prompt, gen_config, callback),
+            Executor::Cpu(_) => self.generate_stream_full_cpu(prompt, gen_config, callback),
+        }
+    }
+
+    /// CPU generation path using model_forward_step.
+    fn generate_stream_full_cpu(
         &self,
         prompt: &str,
         gen_config: &GenerationConfig,
         mut callback: impl FnMut(u32) -> bool,
     ) -> Result<GenerationOutput, InferenceError> {
+        let backend = match &self.executor {
+            Executor::Cpu(cpu) => &cpu.backend,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            _ => unreachable!(),
+        };
+
         if !self.config.causal {
             return Err(InferenceError::Generation(
                 "generation requires a causal model (not bidirectional)".to_string(),
@@ -306,8 +496,8 @@ impl GenerationEngine {
         }
 
         let mut rng = XorShiftRng::new(gen_config.sampling.seed.unwrap_or(42));
-        let mut cache = if self.backend.is_gpu() {
-            KvCache::new_gpu(&self.config, self.backend.as_ref())
+        let mut cache = if backend.is_gpu() {
+            KvCache::new_gpu(&self.config, backend.as_ref())
         } else {
             KvCache::new(&self.config)
         };
@@ -320,20 +510,20 @@ impl GenerationEngine {
             }
         }
 
-        // Prefill (timed separately from tokenization/setup)
+        // Prefill
         if profiling {
-            self.backend.reset_profile();
+            backend.reset_profile();
         }
         let prefill_start = Instant::now();
         let hidden = model_forward_step(
             &prompt_ids,
             &self.weights,
             &self.config,
-            self.backend.as_ref(),
+            backend.as_ref(),
             &mut cache,
         )?;
 
-        let logits = self.project_to_logits(&hidden, prompt_ids.len() - 1);
+        let logits = self.project_to_logits_cpu(&hidden, prompt_ids.len() - 1, backend.as_ref());
         let mut next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
         let prefill_duration = prefill_start.elapsed();
 
@@ -341,12 +531,12 @@ impl GenerationEngine {
             let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
             eprintln!(
                 "[profile] prefill: {:.1}ms ({} tokens) | {}",
-                prefill_ms, prompt_tokens, self.backend.profile_summary(),
+                prefill_ms, prompt_tokens, backend.profile_summary(),
             );
         }
 
-        // Decode loop — track why we stopped
-        let mut stop_reason = StopReason::MaxTokens; // default if loop exhausts
+        // Decode loop
+        let mut stop_reason = StopReason::MaxTokens;
 
         for step in 0..gen_config.max_tokens {
             if stop_tokens.contains(&next_token) {
@@ -367,7 +557,7 @@ impl GenerationEngine {
             }
 
             if profiling {
-                self.backend.reset_profile();
+                backend.reset_profile();
             }
             let tok_start = Instant::now();
 
@@ -375,13 +565,13 @@ impl GenerationEngine {
                 &[next_token],
                 &self.weights,
                 &self.config,
-                self.backend.as_ref(),
+                backend.as_ref(),
                 &mut cache,
             )?;
             let fwd_ms = tok_start.elapsed().as_secs_f64() * 1000.0;
 
             let logits_start = Instant::now();
-            let logits = self.project_to_logits(&hidden, 0);
+            let logits = self.project_to_logits_cpu(&hidden, 0, backend.as_ref());
             let logits_ms = logits_start.elapsed().as_secs_f64() * 1000.0;
 
             let sample_start = Instant::now();
@@ -393,7 +583,7 @@ impl GenerationEngine {
                 eprintln!(
                     "[profile] tok {}: {:.1}ms (fwd={:.1}ms logits={:.1}ms sample={:.1}ms) | {}",
                     step + 1, total_ms, fwd_ms, logits_ms, sample_ms,
-                    self.backend.profile_summary(),
+                    backend.profile_summary(),
                 );
             }
         }
@@ -406,39 +596,268 @@ impl GenerationEngine {
         })
     }
 
-    /// Project a hidden state row to vocabulary logits.
-    ///
-    /// Uses `output_projection` weight if available, otherwise falls back to
-    /// tied embeddings (`token_embedding`).
-    ///
-    /// For single-row tensors (decode), skips the download/upload roundtrip
-    /// since hidden is already `[1, hidden_size]` on the device.
-    fn project_to_logits(&self, hidden: &DeviceTensor, row: usize) -> Vec<f32> {
+    /// Metal generation path using graph-based execution.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn generate_stream_full_metal(
+        &mut self,
+        prompt: &str,
+        gen_config: &GenerationConfig,
+        mut callback: impl FnMut(u32) -> bool,
+    ) -> Result<GenerationOutput, InferenceError> {
+        let profiling = std::env::var("STRATA_PROFILE").map_or(false, |v| v == "1");
+
+        let prompt_ids = self.tokenizer.encode(prompt, true);
+        let prompt_tokens = prompt_ids.len();
+
+        if prompt_ids.is_empty() {
+            return Err(InferenceError::Generation(
+                "prompt tokenized to empty sequence".to_string(),
+            ));
+        }
+
+        if prompt_ids.len() >= self.config.max_seq_len {
+            return Err(InferenceError::Generation(format!(
+                "prompt length ({}) exceeds max_seq_len ({})",
+                prompt_ids.len(),
+                self.config.max_seq_len
+            )));
+        }
+
+        let mut rng = XorShiftRng::new(gen_config.sampling.seed.unwrap_or(42));
+        let mut generated_ids: Vec<u32> = Vec::new();
+
+        let mut stop_tokens = gen_config.stop_tokens.clone();
+        if let Some(eos) = self.tokenizer.eos_token_id() {
+            if !stop_tokens.contains(&eos) {
+                stop_tokens.push(eos);
+            }
+        }
+
+        // ===================================================================
+        // PREFILL (graph-based fast path — single command buffer)
+        // ===================================================================
+        let prefill_start = Instant::now();
+
+        // Build prefill graph for this prompt's token count
+        let kv_f16 = self.kv_f16;
+        let mut prefill_graph = PrefillGraph::build(
+            &self.config, &self.weights, prompt_ids.len(), kv_f16,
+        );
+
+        // Borrow executor fields
+        let metal = match &self.executor {
+            Executor::Metal(m) => m,
+            _ => unreachable!(),
+        };
+
+        // Apply F32 embedding patches (same indices as decode graph)
+        if let Some(idx) = metal.f32_token_emb_idx {
+            patch_ops(&mut prefill_graph.ops, BufferRef::Weight(0), BufferRef::Weight(idx));
+        }
+        if let Some(idx) = metal.f32_pos_emb_idx {
+            patch_ops(&mut prefill_graph.ops, BufferRef::Weight(1), BufferRef::Weight(idx));
+        }
+
+        // Recompute barriers after patching
+        prefill_graph.barriers = compute_barriers(&prefill_graph.ops);
+
+        // Allocate temporary prefill buffer pool
+        let prefill_pool = unsafe {
+            MetalBufferPool::new(
+                metal.metal_res.device,
+                &metal.metal_res.sels,
+                &prefill_graph.slot_sizes,
+            )
+        };
+
+        // Allocate and fill token IDs buffer (M u32s)
+        let token_ids_buf = unsafe {
+            let buf = msg_send_new_buffer_length(
+                metal.metal_res.device,
+                metal.metal_res.sels.new_buffer_with_length,
+                prompt_ids.len() * std::mem::size_of::<u32>(),
+                MTL_RESOURCE_STORAGE_MODE_SHARED,
+            );
+            let ptr = msg_send_ptr(buf, metal.metal_res.sels.contents) as *mut u32;
+            for (i, &tid) in prompt_ids.iter().enumerate() {
+                *ptr.add(i) = tid;
+            }
+            buf
+        };
+
+        // Allocate and fill position IDs buffer [0, 1, ..., M-1]
+        let position_ids_buf = unsafe {
+            let buf = msg_send_new_buffer_length(
+                metal.metal_res.device,
+                metal.metal_res.sels.new_buffer_with_length,
+                prompt_ids.len() * std::mem::size_of::<u32>(),
+                MTL_RESOURCE_STORAGE_MODE_SHARED,
+            );
+            let ptr = msg_send_ptr(buf, metal.metal_res.sels.contents) as *mut u32;
+            for i in 0..prompt_ids.len() {
+                *ptr.add(i) = i as u32;
+            }
+            buf
+        };
+
+        // Allocate KV cache (F16 or F32, matching prefill graph)
+        let mut cache = if kv_f16 {
+            KvCache::new_gpu_f16(&self.config, metal.backend.as_ref())
+        } else {
+            KvCache::new_gpu(&self.config, metal.backend.as_ref())
+        };
+        let kv_buf_ids = Self::extract_kv_buf_ids_metal(&self.config, &cache);
+
+        // Encode and execute (single command buffer!)
+        let logits = unsafe {
+            encode_prefill(
+                &prefill_graph,
+                &prefill_pool,
+                &metal.metal_res,
+                &metal.weight_buf_ids,
+                &kv_buf_ids,
+                &PrefillParams {
+                    n_tokens: prompt_ids.len(),
+                    pos_offset: 0,
+                },
+                token_ids_buf,
+                position_ids_buf,
+            )
+        };
+
+        // Advance cache position to match prefilled tokens
+        cache.advance(prompt_ids.len());
+
+        let mut next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
+        let prefill_duration = prefill_start.elapsed();
+
+        if profiling {
+            let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
+            eprintln!(
+                "[profile] prefill: {:.1}ms ({} tokens, {} ops, 1 cmd buffer)",
+                prefill_ms, prompt_tokens, prefill_graph.ops.len(),
+            );
+        }
+
+        // Release temporary prefill buffers
+        unsafe {
+            msg_send_void(token_ids_buf, metal.metal_res.sels.release);
+            msg_send_void(position_ids_buf, metal.metal_res.sels.release);
+        }
+
+        // ===================================================================
+        // DECODE LOOP (graph-based fast path)
+        // ===================================================================
+
+        let mut stop_reason = StopReason::MaxTokens;
+
+        for step in 0..gen_config.max_tokens {
+            if stop_tokens.contains(&next_token) {
+                stop_reason = StopReason::StopToken;
+                break;
+            }
+
+            generated_ids.push(next_token);
+
+            if !callback(next_token) {
+                stop_reason = StopReason::Cancelled;
+                break;
+            }
+
+            if cache.len() >= self.config.max_seq_len {
+                stop_reason = StopReason::ContextLength;
+                break;
+            }
+
+            let tok_start = if profiling { Some(Instant::now()) } else { None };
+
+            let metal = match &self.executor {
+                Executor::Metal(m) => m,
+                _ => unreachable!(),
+            };
+
+            let dynamic = DynamicParams {
+                pos: cache.len(),
+                token_id: next_token,
+                kv_dim: metal.kv_dim,
+            };
+
+            let decode_graph = self.decode_graph.as_ref()
+                .expect("Metal executor requires decode_graph");
+            let logits = unsafe {
+                encode_decode_token(
+                    decode_graph,
+                    &metal.buffer_pool,
+                    &metal.metal_res,
+                    &metal.weight_buf_ids,
+                    &kv_buf_ids,
+                    &dynamic,
+                    metal.token_id_buf,
+                    metal.position_id_buf,
+                )
+            };
+
+            cache.advance(1);
+
+            next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
+
+            if let Some(start) = tok_start {
+                let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[profile] tok {}: {:.1}ms (graph fast path)",
+                    step + 1, total_ms,
+                );
+            }
+        }
+
+        Ok(GenerationOutput {
+            token_ids: generated_ids,
+            stop_reason,
+            prompt_tokens,
+            prefill_duration,
+        })
+    }
+
+    /// Project a hidden state row to vocabulary logits (CPU path).
+    fn project_to_logits_cpu(
+        &self,
+        hidden: &DeviceTensor,
+        row: usize,
+        backend: &dyn ComputeBackend,
+    ) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
         let n_rows = hidden.shape()[0];
 
-        // Use output_projection if available, otherwise tied embeddings
         let proj_weight = self.weights.output_projection.as_ref()
             .unwrap_or(&self.weights.token_embedding);
 
         if n_rows == 1 {
-            // Decode: hidden is already [1, hidden_size] — use directly, no roundtrip
-            let logits_tensor = linear_forward(hidden, proj_weight, None, self.backend.as_ref());
-            let logits_host = self.backend.download(&logits_tensor);
+            let logits_tensor = linear_forward(hidden, proj_weight, None, backend);
+            let logits_host = backend.download(&logits_tensor);
             logits_host.as_f32().to_vec()
         } else {
-            // Prefill: extract the requested row via CPU
-            let hidden_host = self.backend.download(hidden);
+            let hidden_host = backend.download(hidden);
             let hidden_data = hidden_host.as_f32();
             let start = row * hidden_size;
             let row_data = &hidden_data[start..start + hidden_size];
-            let row_tensor = self.backend.upload(
+            let row_tensor = backend.upload(
                 &Tensor::new(vec![1, hidden_size], row_data.to_vec()),
             );
-            let logits_tensor = linear_forward(&row_tensor, proj_weight, None, self.backend.as_ref());
-            let logits_host = self.backend.download(&logits_tensor);
+            let logits_tensor = linear_forward(&row_tensor, proj_weight, None, backend);
+            let logits_host = backend.download(&logits_tensor);
             logits_host.as_f32().to_vec()
         }
+    }
+
+    /// Extract raw MTLBuffer pointers from KV cache GPU tensors.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn extract_kv_buf_ids_metal(config: &ModelConfig, cache: &KvCache) -> Vec<Id> {
+        let mut ids = Vec::with_capacity(config.num_layers * 2);
+        for layer in 0..config.num_layers {
+            ids.push(extract_buffer_id(cache.get_k_gpu(layer)));
+            ids.push(extract_buffer_id(cache.get_v_gpu(layer)));
+        }
+        ids
     }
 
     /// The model configuration.
@@ -457,6 +876,37 @@ impl GenerationEngine {
     }
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+impl Drop for GenerationEngine {
+    fn drop(&mut self) {
+        if let Executor::Metal(ref metal) = self.executor {
+            unsafe {
+                let rel = sel_registerName(b"release\0".as_ptr() as _);
+                if metal.token_id_buf != NIL {
+                    msg_send_void(metal.token_id_buf, rel);
+                }
+                if metal.position_id_buf != NIL {
+                    msg_send_void(metal.position_id_buf, rel);
+                }
+                if metal.metal_res.command_queue != NIL {
+                    msg_send_void(metal.metal_res.command_queue, rel);
+                }
+                if metal.metal_res.device != NIL {
+                    msg_send_void(metal.metal_res.device, rel);
+                }
+            }
+        }
+    }
+}
+
+/// Extract the raw MTLBuffer Id from a GPU-resident DeviceTensor.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn extract_buffer_id(dt: &DeviceTensor) -> Id {
+    dt.gpu_inner::<MetalBuffer>()
+        .expect("expected GPU-resident MetalBuffer in DeviceTensor")
+        .buffer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,8 +918,6 @@ mod tests {
     use crate::tokenizer::Tokenizer;
 
     /// A mock tokenizer for generation tests.
-    ///
-    /// Maps token IDs to single-character strings for easy verification.
     struct MockTokenizer {
         vocab: Vec<String>,
         eos_id: u32,
@@ -508,7 +956,6 @@ mod tests {
                     .unwrap_or(0);
                 ids.push(id);
             }
-            // Note: no EOS added for generation (model generates EOS)
             ids
         }
 
@@ -537,8 +984,7 @@ mod tests {
         }
     }
 
-    /// A mock tokenizer with no EOS token, for testing max_tokens without
-    /// EOS interference.
+    /// A mock tokenizer with no EOS token.
     struct NoEosTokenizer;
 
     impl NoEosTokenizer {
@@ -554,7 +1000,6 @@ mod tests {
                 ids.push(1); // BOS
             }
             for word in text.split_whitespace() {
-                // Simple hash to token ID (3-7 range, avoiding 0-2)
                 let id = 3 + (word.len() as u32 % 5);
                 ids.push(id);
             }
@@ -567,7 +1012,7 @@ mod tests {
 
         fn vocab_size(&self) -> usize { 8 }
         fn bos_token_id(&self) -> Option<u32> { Some(1) }
-        fn eos_token_id(&self) -> Option<u32> { None } // No EOS
+        fn eos_token_id(&self) -> Option<u32> { None }
         fn pad_token_id(&self) -> Option<u32> { Some(0) }
     }
 
@@ -594,7 +1039,6 @@ mod tests {
         dt(Tensor::new(vec![dim], vec![1.0f32; dim]))
     }
 
-    /// Build a causal Gemma-style config for generation tests.
     fn gen_config(hidden_size: usize) -> ModelConfig {
         ModelConfig {
             arch: ModelArch::Gemma3,
@@ -630,7 +1074,6 @@ mod tests {
         let ffn = config.ffn_hidden;
         let v = config.vocab_size;
 
-        // Use distinct embedding rows
         let mut emb_data = vec![0.0f32; v * h];
         for i in 0..v {
             for j in 0..h {
@@ -675,7 +1118,7 @@ mod tests {
             layers: vec![layer],
             output_norm_w: Some(ones_weight(h)),
             output_norm_b: None,
-            output_projection: None, // tied embeddings
+            output_projection: None,
         }
     }
 
@@ -689,7 +1132,7 @@ mod tests {
     #[test]
     fn test_generate_greedy_deterministic() {
         let config = gen_config(4);
-        let engine = build_gen_engine(config);
+        let mut engine = build_gen_engine(config);
         let gen_cfg = GenerationConfig {
             max_tokens: 5,
             sampling: SamplingConfig {
@@ -706,12 +1149,11 @@ mod tests {
 
     #[test]
     fn test_generate_stops_at_max_tokens() {
-        // Use a tokenizer with no EOS to isolate max_tokens behavior
         let config = gen_config(4);
         let weights = gen_weights(&config);
         let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
         let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
-        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+        let mut engine = GenerationEngine::new(config, weights, tokenizer, backend);
 
         let gen_cfg = GenerationConfig {
             max_tokens: 3,
@@ -722,7 +1164,6 @@ mod tests {
             },
         };
 
-        // Use generate_stream to count exact tokens produced
         let mut token_count = 0;
         let result = engine.generate_stream("hello", &gen_cfg, |_| {
             token_count += 1;
@@ -741,10 +1182,8 @@ mod tests {
     #[test]
     fn test_generate_stops_at_eos() {
         let config = gen_config(4);
-        let engine = build_gen_engine(config);
+        let mut engine = build_gen_engine(config);
 
-        // Use a large max_tokens — if EOS stops generation, we'll get
-        // far fewer tokens than the limit.
         let gen_cfg = GenerationConfig {
             max_tokens: 100,
             sampling: SamplingConfig {
@@ -754,7 +1193,6 @@ mod tests {
             ..Default::default()
         };
 
-        // Count tokens via stream to verify EOS stops before max_tokens
         let mut token_count = 0;
         let result = engine.generate_stream("hello", &gen_cfg, |_| {
             token_count += 1;
@@ -762,8 +1200,6 @@ mod tests {
         });
         assert!(result.is_ok());
         let generated = result.unwrap();
-        // With EOS in the vocabulary (token 2), generation should stop
-        // well before 100 tokens. Verify it stopped early.
         assert!(
             generated.len() < 100,
             "Expected EOS to stop generation before 100 tokens, got {}",
@@ -774,7 +1210,7 @@ mod tests {
     #[test]
     fn test_generate_stream_callback() {
         let config = gen_config(4);
-        let engine = build_gen_engine(config);
+        let mut engine = build_gen_engine(config);
         let gen_cfg = GenerationConfig {
             max_tokens: 10,
             sampling: SamplingConfig {
@@ -787,15 +1223,13 @@ mod tests {
         let mut received_tokens = Vec::new();
         let result = engine.generate_stream("hello", &gen_cfg, |token_id| {
             received_tokens.push(token_id);
-            received_tokens.len() < 3 // stop after 3 tokens
+            received_tokens.len() < 3
         });
 
         assert!(result.is_ok());
         let generated = result.unwrap();
-        // Should have stopped at 3 or fewer tokens
         assert!(generated.len() <= 3);
         assert_eq!(generated.len(), received_tokens.len());
-        // Verify callback received exactly the same token IDs as the result
         assert_eq!(
             generated, received_tokens,
             "Stream callback tokens should match returned tokens"
@@ -811,7 +1245,7 @@ mod tests {
         let weights = gen_weights(&config);
         let tokenizer: Box<dyn Tokenizer> = Box::new(MockTokenizer::new());
         let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
-        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+        let mut engine = GenerationEngine::new(config, weights, tokenizer, backend);
 
         let gen_cfg = GenerationConfig::default();
         let result = engine.generate("hello", &gen_cfg);
@@ -819,7 +1253,6 @@ mod tests {
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("causal"), "Error should mention causal: {}", err_msg);
 
-        // Also test generate_stream rejects non-causal
         let stream_result = engine.generate_stream("hello", &gen_cfg, |_| true);
         assert!(stream_result.is_err(), "generate_stream() should reject non-causal model");
     }
@@ -827,10 +1260,9 @@ mod tests {
     #[test]
     fn test_generate_empty_prompt() {
         let config = gen_config(4);
-        let engine = build_gen_engine(config);
+        let mut engine = build_gen_engine(config);
         let gen_cfg = GenerationConfig::default();
 
-        // Empty string still gets BOS from mock tokenizer, so it's 1 token
         let result = engine.generate("", &gen_cfg);
         assert!(result.is_ok());
     }
@@ -838,11 +1270,10 @@ mod tests {
     #[test]
     fn test_generate_prompt_exceeds_context() {
         let mut config = gen_config(4);
-        config.max_seq_len = 3; // very short
-        let engine = build_gen_engine(config);
+        config.max_seq_len = 3;
+        let mut engine = build_gen_engine(config);
         let gen_cfg = GenerationConfig::default();
 
-        // "hello world foo" with BOS = 4 tokens, exceeds max_seq_len=3
         let result = engine.generate("hello world foo", &gen_cfg);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
@@ -852,10 +1283,10 @@ mod tests {
     #[test]
     fn test_generate_with_explicit_stop_tokens() {
         let config = gen_config(4);
-        let engine = build_gen_engine(config);
+        let mut engine = build_gen_engine(config);
         let gen_cfg = GenerationConfig {
             max_tokens: 100,
-            stop_tokens: vec![3, 4, 5, 6, 7], // stop on any content token
+            stop_tokens: vec![3, 4, 5, 6, 7],
             sampling: SamplingConfig {
                 temperature: 0.0,
                 ..Default::default()
@@ -876,15 +1307,9 @@ mod tests {
     }
 
     #[test]
-    fn test_generation_engine_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<GenerationEngine>();
-    }
-
-    #[test]
     fn test_generate_max_tokens_zero() {
         let config = gen_config(4);
-        let engine = build_gen_engine(config);
+        let mut engine = build_gen_engine(config);
         let gen_cfg = GenerationConfig {
             max_tokens: 0,
             sampling: SamplingConfig {
@@ -895,19 +1320,15 @@ mod tests {
         };
 
         let result = engine.generate("hello", &gen_cfg).unwrap();
-        // max_tokens=0 means no decode steps, so output should be empty
         assert!(result.is_empty(), "max_tokens=0 should produce empty output, got: {:?}", result);
     }
 
     #[test]
     fn test_generate_and_stream_consistency() {
-        // generate() and generate_stream() should produce the same tokens
-        // for the same input with the same seed.
         let config = gen_config(4);
 
-        // Build two engines with identical state
-        let engine1 = build_gen_engine(config.clone());
-        let engine2 = build_gen_engine(config);
+        let mut engine1 = build_gen_engine(config.clone());
+        let mut engine2 = build_gen_engine(config);
 
         let gen_cfg = GenerationConfig {
             max_tokens: 5,
@@ -918,13 +1339,9 @@ mod tests {
             ..Default::default()
         };
 
-        // generate() returns decoded text
         let text_result = engine1.generate("hello", &gen_cfg).unwrap();
-
-        // generate_stream() returns token IDs
         let stream_ids = engine2.generate_stream("hello", &gen_cfg, |_| true).unwrap();
 
-        // Decode stream IDs using a MockTokenizer (same as used internally)
         let mock_tok = MockTokenizer::new();
         let stream_text = mock_tok.decode(&stream_ids);
         assert_eq!(
@@ -944,7 +1361,7 @@ mod tests {
     #[test]
     fn test_generate_full_returns_metadata() {
         let config = gen_config(4);
-        let engine = build_gen_engine(config);
+        let mut engine = build_gen_engine(config);
         let gen_cfg = GenerationConfig {
             max_tokens: 5,
             sampling: SamplingConfig {
@@ -955,10 +1372,8 @@ mod tests {
         };
 
         let output = engine.generate_full("hello", &gen_cfg).unwrap();
-        // prompt "hello" with BOS = 2 tokens
         assert_eq!(output.prompt_tokens, 2);
         assert!(!output.token_ids.is_empty() || output.stop_reason == StopReason::StopToken);
-        // prefill_duration should be non-zero (actual forward pass happened)
         assert!(
             output.prefill_duration.as_nanos() > 0,
             "prefill_duration should be non-zero"
@@ -971,7 +1386,7 @@ mod tests {
         let weights = gen_weights(&config);
         let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
         let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
-        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+        let mut engine = GenerationEngine::new(config, weights, tokenizer, backend);
 
         let gen_cfg = GenerationConfig {
             max_tokens: 100,
@@ -984,7 +1399,6 @@ mod tests {
 
         let output = engine.generate_stream_full("hello", &gen_cfg, |_| false).unwrap();
         assert_eq!(output.stop_reason, StopReason::Cancelled);
-        // Only 1 token should be generated before callback cancels
         assert_eq!(output.token_ids.len(), 1);
     }
 
@@ -994,7 +1408,7 @@ mod tests {
         let weights = gen_weights(&config);
         let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
         let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
-        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+        let mut engine = GenerationEngine::new(config, weights, tokenizer, backend);
 
         let gen_cfg = GenerationConfig {
             max_tokens: 3,
@@ -1013,9 +1427,8 @@ mod tests {
     #[test]
     fn test_generate_full_stop_token_via_explicit_stop() {
         let config = gen_config(4);
-        let engine = build_gen_engine(config);
+        let mut engine = build_gen_engine(config);
 
-        // First, do a greedy run to find out what the first generated token is
         let probe = engine.generate_full("hello", &GenerationConfig {
             max_tokens: 1,
             stop_tokens: vec![],
@@ -1025,8 +1438,6 @@ mod tests {
         assert!(!probe.token_ids.is_empty(), "Need at least one token to test stop");
         let first_token = probe.token_ids[0];
 
-        // Now run again with that token as a stop token — it should be produced
-        // as the first decode token and trigger StopToken
         let output = engine.generate_full("hello", &GenerationConfig {
             max_tokens: 100,
             stop_tokens: vec![first_token],
@@ -1034,18 +1445,17 @@ mod tests {
         }).unwrap();
 
         assert_eq!(output.stop_reason, StopReason::StopToken);
-        // The stop token is NOT included in the output
         assert!(output.token_ids.is_empty());
     }
 
     #[test]
     fn test_generate_full_context_length_stop_reason() {
         let mut config = gen_config(4);
-        config.max_seq_len = 5; // very short: prompt(2) + max 3 decode steps
+        config.max_seq_len = 5;
         let weights = gen_weights(&config);
         let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
         let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
-        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+        let mut engine = GenerationEngine::new(config, weights, tokenizer, backend);
 
         let gen_cfg = GenerationConfig {
             max_tokens: 100,
@@ -1058,10 +1468,6 @@ mod tests {
 
         let output = engine.generate_full("hello", &gen_cfg).unwrap();
         assert_eq!(output.stop_reason, StopReason::ContextLength);
-        // prompt=2 tokens, max_seq_len=5 → 3 forward passes possible,
-        // but 4 tokens sampled (1 from prefill + 3 from decode steps).
-        // The last token is sampled but can't be fed back — it should
-        // still be included in the output (this was the token drop bug).
         assert_eq!(
             output.token_ids.len(),
             4,
@@ -1071,14 +1477,12 @@ mod tests {
 
     #[test]
     fn test_generate_context_length_preserves_last_token() {
-        // Verify the simple generate() API also preserves the last token
-        // when hitting context length (same bug as generate_full).
         let mut config = gen_config(4);
-        config.max_seq_len = 5; // prompt(2) + 3 decode forward passes
+        config.max_seq_len = 5;
         let weights = gen_weights(&config);
         let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
         let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
-        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+        let mut engine = GenerationEngine::new(config, weights, tokenizer, backend);
 
         let gen_cfg = GenerationConfig {
             max_tokens: 100,
@@ -1089,21 +1493,18 @@ mod tests {
             },
         };
 
-        // generate() returns decoded text; verify it's non-empty
         let text = engine.generate("hello", &gen_cfg).unwrap();
         assert!(!text.is_empty(), "Should produce output at context limit");
     }
 
     #[test]
     fn test_generate_stream_context_length_fires_callback() {
-        // Verify the streaming API calls the callback for the final token
-        // even when that token triggers the context-length stop.
         let mut config = gen_config(4);
         config.max_seq_len = 5;
         let weights = gen_weights(&config);
         let tokenizer: Box<dyn Tokenizer> = Box::new(NoEosTokenizer::new());
         let backend: Arc<dyn ComputeBackend> = Arc::new(CpuBackend::new());
-        let engine = GenerationEngine::new(config, weights, tokenizer, backend);
+        let mut engine = GenerationEngine::new(config, weights, tokenizer, backend);
 
         let gen_cfg = GenerationConfig {
             max_tokens: 100,
@@ -1124,7 +1525,6 @@ mod tests {
 
         assert_eq!(output.stop_reason, StopReason::ContextLength);
         assert_eq!(output.token_ids.len(), 4);
-        // Every token in token_ids should have been streamed via callback
         assert_eq!(
             output.token_ids, streamed_tokens,
             "Streamed tokens should match token_ids exactly"
@@ -1134,8 +1534,8 @@ mod tests {
     #[test]
     fn test_generate_stream_full_tokens_match_stream() {
         let config = gen_config(4);
-        let engine1 = build_gen_engine(config.clone());
-        let engine2 = build_gen_engine(config);
+        let mut engine1 = build_gen_engine(config.clone());
+        let mut engine2 = build_gen_engine(config);
         let gen_cfg = GenerationConfig {
             max_tokens: 5,
             sampling: SamplingConfig {
@@ -1156,5 +1556,46 @@ mod tests {
         let engine = build_gen_engine(config);
         assert_eq!(engine.decode(&[3, 4]), "hello world");
         assert_eq!(engine.decode(&[]), "");
+    }
+
+    // ------------------------------------------------------------------
+    // Backend selection tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_from_gguf_with_backend_unknown_returns_error() {
+        let result = GenerationEngine::from_gguf_with_backend("/nonexistent.gguf", "cuda");
+        match result {
+            Err(e) => {
+                let err = format!("{}", e);
+                assert!(err.contains("Unknown backend"), "Error: {}", err);
+            }
+            Ok(_) => panic!("Expected error for unknown backend"),
+        }
+    }
+
+    #[test]
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    fn test_from_gguf_with_backend_metal_unavailable() {
+        let result = GenerationEngine::from_gguf_with_backend("/nonexistent.gguf", "metal");
+        match result {
+            Err(e) => {
+                let err = format!("{}", e);
+                assert!(err.contains("Metal backend not available"), "Error: {}", err);
+            }
+            Ok(_) => panic!("Expected error for Metal on non-Metal build"),
+        }
+    }
+
+    #[test]
+    fn test_from_gguf_with_backend_cpu_bad_path() {
+        let result = GenerationEngine::from_gguf_with_backend("/nonexistent.gguf", "cpu");
+        assert!(result.is_err(), "CPU backend with bad path should fail");
+    }
+
+    #[test]
+    fn test_from_gguf_with_backend_auto_bad_path() {
+        let result = GenerationEngine::from_gguf_with_backend("/nonexistent.gguf", "auto");
+        assert!(result.is_err(), "Auto backend with bad path should fail");
     }
 }

@@ -983,13 +983,12 @@ impl Tokenizer for BpeTokenizer {
                 }
             }
             // Replace SentencePiece underline with space.
-            let result = result.replace(SPIECE_UNDERLINE, " ");
-            // Strip leading space that comes from the initial underline.
-            if result.starts_with(' ') {
-                result[1..].to_string()
-            } else {
-                result
-            }
+            // Note: we do NOT strip the leading space here. During encoding,
+            // add_space_prefix prepends ▁ which becomes a leading space. For
+            // generation use (decoding output tokens), this space is a real
+            // word boundary and must be preserved. Callers doing round-trip
+            // encode→decode can trim_start() if needed.
+            result.replace(SPIECE_UNDERLINE, " ")
         } else {
             // GPT-2 decoding: reverse the byte-to-unicode mapping.
             let mut bytes = Vec::new();
@@ -1492,7 +1491,10 @@ mod tests {
         let tok = make_spm_tokenizer(false, false);
         let ids = tok.encode("hello world", false);
         let text = tok.decode(&ids);
-        assert_eq!(text, "hello world");
+        // SPM encode prepends ▁ (add_space_prefix), which becomes a leading
+        // space after decode. This matches llama.cpp's per-token decode
+        // behavior and is correct for generation output.
+        assert_eq!(text, " hello world");
     }
 
     #[test]
@@ -1500,8 +1502,9 @@ mod tests {
         let tok = make_spm_tokenizer(true, true);
         let ids = tok.encode("hello", true);
         let text = tok.decode(&ids);
-        // Decode should skip BOS/EOS.
-        assert_eq!(text, "hello");
+        // Decode should skip BOS/EOS. Leading space from add_space_prefix
+        // is preserved (matches llama.cpp per-token decode behavior).
+        assert_eq!(text, " hello");
     }
 
     #[test]

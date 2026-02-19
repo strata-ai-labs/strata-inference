@@ -6,6 +6,10 @@ use std::time::Instant;
 
 use clap::Parser;
 
+use strata_inference::engine::generate::GenerationConfig;
+use strata_inference::engine::sampler::SamplingConfig;
+use strata_inference::GenerationEngine;
+
 #[derive(Parser)]
 #[command(name = "strata-metal-generate", about = "Generate text via Metal graph engine")]
 struct Args {
@@ -54,9 +58,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let total_start = Instant::now();
 
-    // Load model via MetalGenerationEngine
+    // Load model via unified GenerationEngine with Metal backend
     let load_start = Instant::now();
-    let mut engine = strata_inference::metal_gen::MetalGenerationEngine::from_gguf(&args.model)?;
+    let mut engine = GenerationEngine::from_gguf_with_backend(&args.model, "metal")?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!("[timing] model load: {:.1}ms", load_ms);
 
@@ -64,10 +68,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[debug] config: {}", engine.config().arch_name);
     eprintln!("[debug] vocab_size: {}", engine.config().vocab_size);
 
-    let gen_config = strata_inference::engine::generate::GenerationConfig {
+    let gen_config = GenerationConfig {
         max_tokens: args.max_tokens,
         stop_tokens: Vec::new(),
-        sampling: strata_inference::engine::sampler::SamplingConfig {
+        sampling: SamplingConfig {
             temperature: args.temp,
             top_k: 40,
             top_p: 0.95,
@@ -100,8 +104,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Print token IDs
     eprintln!("  token_ids: {:?}", &output.token_ids);
 
-    // Print decoded text using the engine's generate method for a clean comparison
-    let text = engine.generate(&args.prompt, &gen_config)?;
+    // Print decoded text
+    let text = engine.decode(&output.token_ids);
     println!("{}{}", args.prompt, text);
 
     Ok(())

@@ -184,7 +184,12 @@ pub fn create_tokenizer_from_gguf(
             Vec::new()
         };
 
-        let add_bos = gguf.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(false);
+        // Default add_bos/add_eos based on vocab type, matching llama.cpp:
+        // - SPM (model="llama"): add_bos=true, add_eos=false
+        // - BPE (model="gpt2"):  add_bos=false, add_eos=false
+        // The GGUF key overrides these defaults if present.
+        let default_add_bos = model_type != "gpt2"; // SPM/llama defaults to true
+        let add_bos = gguf.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(default_add_bos);
         let add_eos = gguf.get_bool("tokenizer.ggml.add_eos_token").unwrap_or(false);
         // SentencePiece models default to adding space prefix (leading underline).
         // Gemma models set this to false.

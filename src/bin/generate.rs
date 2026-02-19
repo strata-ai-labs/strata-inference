@@ -55,7 +55,7 @@ struct Args {
     #[arg(long, default_value = "text", value_parser = validate_output_format)]
     output_format: String,
 
-    /// Compute backend: auto, cpu, metal, cuda
+    /// Compute backend: auto, cpu, metal
     #[arg(long, default_value = "auto")]
     backend: String,
 
@@ -123,10 +123,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let total_start = Instant::now();
 
-    // Load model
+    // Load model with explicit backend selection
     let load_start = Instant::now();
-    let backend = cli::backend::resolve_backend(Some(&args.backend))?;
-    let engine = GenerationEngine::from_gguf(&args.model, backend)?;
+    let mut engine = GenerationEngine::from_gguf_with_backend(&args.model, &args.backend)?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     // Build generation config

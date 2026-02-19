@@ -814,10 +814,13 @@ kernel void rope_norm(
 
     if (pair >= rope_dim / 2 || head >= n_heads || seq >= seq_len) return;
 
-    // Compute angle: theta = pos / (freq_base ^ (2*pair / rope_dim))
-    float pos = float(pos_offset + seq);
-    float freq_exp = float(2 * pair) / float(rope_dim);
-    float theta = pos / pow(freq_base, freq_exp);
+    // Compute angle matching llama.cpp's formula:
+    //   theta = pos * pow(freq_base, -1.0/rope_dim * i0)
+    // where i0 = 2*pair. Using negative exponent + multiply instead of
+    // positive exponent + divide matches llama.cpp's exact float rounding.
+    float theta_base = float(pos_offset + seq);
+    float inv_ndims = -1.f / float(rope_dim);
+    float theta = theta_base * pow(freq_base, inv_ndims * float(2 * pair));
 
     float cos_theta = cos(theta);
     float sin_theta = sin(theta);
@@ -849,7 +852,7 @@ kernel void rope_norm(
 //   For each pair, apply rotation:
 //     out[i]              = x[i]              * cos(theta) - x[i+rope_dim/2] * sin(theta)
 //     out[i + rope_dim/2] = x[i]              * sin(theta) + x[i+rope_dim/2] * cos(theta)
-//   where theta = (pos_offset + seq_pos) / (freq_base ^ (2i / rope_dim))
+//   where theta = pos * pow(freq_base, -1.0/rope_dim * 2*i)
 //
 //   Input layout: [seq_len, n_heads, head_dim]
 //   Only the first rope_dim elements of each head are rotated.
@@ -876,10 +879,11 @@ kernel void rope_neox(
 
     if (i >= half_rope || head >= n_heads || seq >= seq_len) return;
 
-    // Compute angle: theta = pos / (freq_base ^ (2*i / rope_dim))
-    float pos = float(pos_offset + seq);
-    float freq_exp = float(2 * i) / float(rope_dim);
-    float theta = pos / pow(freq_base, freq_exp);
+    // Compute angle matching llama.cpp's formula:
+    //   theta = pos * pow(freq_base, -1.0/rope_dim * i0)
+    float theta_base = float(pos_offset + seq);
+    float inv_ndims = -1.f / float(rope_dim);
+    float theta = theta_base * pow(freq_base, inv_ndims * float(2 * i));
 
     float cos_theta = cos(theta);
     float sin_theta = sin(theta);
