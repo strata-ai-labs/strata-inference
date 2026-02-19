@@ -1867,10 +1867,10 @@ fn emit_linear_multi(
         _ => {
             // Batched quantized GEMM for M>1 (prefill): single dispatch per linear
             // using tiled matrix multiplication with fused dequantization.
-            // BM=32, BN=32, BK=32 tiles with half-precision threadgroup memory
+            // BBM=64, BBN=32, BBK=32 tiles with half-precision threadgroup memory
             // and block-level dequantization for high throughput.
-            let gx = ((n + 31) / 32) as u32; // ceil(N / BN)
-            let gy = ((m + 31) / 32) as u32; // ceil(M / BM)
+            let gx = ((n + 31) / 32) as u32; // ceil(N / BBN)
+            let gy = ((m + 63) / 64) as u32; // ceil(M / BBM)
 
             if let Some(bias) = bias_ref {
                 let pso = match dtype {
@@ -4189,17 +4189,17 @@ mod tests {
         assert_eq!(batched_ops.len(), 7);
 
         // Check dispatch grid for each linear.
-        // Batched GEMM: gx=ceil(N/32), gy=ceil(M/32), tx=128.
+        // Batched GEMM: gx=ceil(N/32), gy=ceil(M/64), tx=128.
         let expected_n_dims = [total_dim, kv_dim, kv_dim, h, ffn, ffn, h];
-        let expected_gy = ((m + 31) / 32) as u32; // ceil(M/BM)
+        let expected_gy = ((m + 63) / 64) as u32; // ceil(M/BBM)
         for (linear_idx, &expected_n) in expected_n_dims.iter().enumerate() {
             let op = batched_ops[linear_idx];
             if let DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } = op.dispatch {
-                let expected_gx = ((expected_n + 31) / 32) as u32; // ceil(N/BN)
+                let expected_gx = ((expected_n + 31) / 32) as u32; // ceil(N/BBN)
                 assert_eq!(gx, expected_gx,
                     "Linear {} (N={}): gx should be ceil({}/32)={}, got {}",
                     linear_idx, expected_n, expected_n, expected_gx, gx);
-                assert_eq!(gy, expected_gy, "Batched dispatch gy should be ceil(M/32)");
+                assert_eq!(gy, expected_gy, "Batched dispatch gy should be ceil(M/64)");
                 assert_eq!(gz, 1);
                 assert_eq!(tx, 128);
                 assert_eq!(ty, 1);
