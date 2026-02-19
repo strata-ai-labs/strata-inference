@@ -265,6 +265,8 @@ pub struct Selectors {
     // MTLCommandQueue / MTLCommandBuffer / MTLComputeCommandEncoder
     pub command_buffer: Sel,
     pub compute_command_encoder: Sel,
+    /// `computeCommandEncoderWithDispatchType:` (concurrent dispatch)
+    pub compute_command_encoder_with_dispatch_type: Sel,
     /// `setComputePipelineState:`
     pub set_compute_pipeline: Sel,
     /// `setBuffer:offset:atIndex:`
@@ -324,6 +326,9 @@ impl Selectors {
             command_buffer: sel_registerName(b"commandBuffer\0".as_ptr() as _),
             compute_command_encoder: sel_registerName(
                 b"computeCommandEncoder\0".as_ptr() as _,
+            ),
+            compute_command_encoder_with_dispatch_type: sel_registerName(
+                b"computeCommandEncoderWithDispatchType:\0".as_ptr() as _,
             ),
             set_compute_pipeline: sel_registerName(
                 b"setComputePipelineState:\0".as_ptr() as _,

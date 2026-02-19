@@ -80,6 +80,9 @@ impl Drop for MetalBufferPool {
 /// are visible to subsequent dispatches within the same encoder.
 const MTL_BARRIER_SCOPE_BUFFERS: NSUInteger = 1;
 
+/// `MTLDispatchTypeConcurrent` — allows independent dispatches to overlap on GPU.
+const MTL_DISPATCH_TYPE_CONCURRENT: NSUInteger = 1;
+
 /// Dynamic parameters that change per decode token.
 pub(crate) struct DynamicParams {
     pub pos: usize,
@@ -249,11 +252,9 @@ pub(crate) unsafe fn encode_decode_token(
     let cmd = msg_send_id(res.command_queue, res.sels.command_buffer);
     debug_assert!(!cmd.is_null(), "command_buffer returned nil");
 
-    // 2. Create compute command encoder (serial — concurrent dispatch type
-    //    requires MTLComputeCommandEncoder created with dispatchType:Concurrent,
-    //    which needs a different selector. For now, use the standard encoder
-    //    with explicit barriers for correctness, then optimize later.)
-    let enc = msg_send_id(cmd, res.sels.compute_command_encoder);
+    // 2. Create concurrent compute command encoder — allows independent
+    //    dispatches to overlap on GPU. Barriers ensure ordering where needed.
+    let enc = msg_send_id_nsuint(cmd, res.sels.compute_command_encoder_with_dispatch_type, MTL_DISPATCH_TYPE_CONCURRENT);
     debug_assert!(!enc.is_null(), "compute_command_encoder returned nil");
 
     // 3. Pre-compute dynamic values
@@ -379,8 +380,9 @@ pub(crate) unsafe fn encode_prefill(
     let cmd = msg_send_id(res.command_queue, res.sels.command_buffer);
     debug_assert!(!cmd.is_null(), "command_buffer returned nil");
 
-    // 2. Create compute command encoder
-    let enc = msg_send_id(cmd, res.sels.compute_command_encoder);
+    // 2. Create concurrent compute command encoder — allows independent
+    //    dispatches to overlap on GPU. Barriers ensure ordering where needed.
+    let enc = msg_send_id_nsuint(cmd, res.sels.compute_command_encoder_with_dispatch_type, MTL_DISPATCH_TYPE_CONCURRENT);
     debug_assert!(!enc.is_null(), "compute_command_encoder returned nil");
 
     // 3. Pre-compute dynamic values

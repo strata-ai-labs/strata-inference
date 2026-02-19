@@ -2274,12 +2274,24 @@ kernel void batched_matmul_q8_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-            uint r = idx / BBK;
-            uint c = idx % BBK;
-            uint gr = tile_row + r;
-            uint gc = k_base + c;
-            tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2304,6 +2316,7 @@ kernel void batched_matmul_q8_0(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BBK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_mat[4];
             simdgroup_matrix<half, 8, 8> b_mat[2];
@@ -2383,12 +2396,24 @@ kernel void batched_matmul_bias_q8_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-            uint r = idx / BBK;
-            uint c = idx % BBK;
-            uint gr = tile_row + r;
-            uint gc = k_base + c;
-            tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2413,6 +2438,7 @@ kernel void batched_matmul_bias_q8_0(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BBK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_mat[4];
             simdgroup_matrix<half, 8, 8> b_mat[2];
@@ -2483,12 +2509,24 @@ kernel void batched_matmul_q4_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-            uint r = idx / BBK;
-            uint c = idx % BBK;
-            uint gr = tile_row + r;
-            uint gc = k_base + c;
-            tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2519,6 +2557,7 @@ kernel void batched_matmul_q4_0(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BBK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_mat[4];
             simdgroup_matrix<half, 8, 8> b_mat[2];
@@ -2598,12 +2637,24 @@ kernel void batched_matmul_bias_q4_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-            uint r = idx / BBK;
-            uint c = idx % BBK;
-            uint gr = tile_row + r;
-            uint gc = k_base + c;
-            tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2634,6 +2685,7 @@ kernel void batched_matmul_bias_q4_0(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BBK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_mat[4];
             simdgroup_matrix<half, 8, 8> b_mat[2];
@@ -2704,12 +2756,24 @@ kernel void batched_matmul_q4_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-            uint r = idx / BBK;
-            uint c = idx % BBK;
-            uint gr = tile_row + r;
-            uint gc = k_base + c;
-            tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2755,6 +2819,7 @@ kernel void batched_matmul_q4_k(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BBK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_mat[4];
             simdgroup_matrix<half, 8, 8> b_mat[2];
@@ -2834,12 +2899,24 @@ kernel void batched_matmul_bias_q4_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-            uint r = idx / BBK;
-            uint c = idx % BBK;
-            uint gr = tile_row + r;
-            uint gc = k_base + c;
-            tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2885,6 +2962,7 @@ kernel void batched_matmul_bias_q4_k(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BBK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_mat[4];
             simdgroup_matrix<half, 8, 8> b_mat[2];
@@ -2955,12 +3033,24 @@ kernel void batched_matmul_q5_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-            uint r = idx / BBK;
-            uint c = idx % BBK;
-            uint gr = tile_row + r;
-            uint gc = k_base + c;
-            tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -3009,6 +3099,7 @@ kernel void batched_matmul_q5_k(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BBK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_mat[4];
             simdgroup_matrix<half, 8, 8> b_mat[2];
@@ -3088,12 +3179,24 @@ kernel void batched_matmul_bias_q5_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-            uint r = idx / BBK;
-            uint c = idx % BBK;
-            uint gr = tile_row + r;
-            uint gc = k_base + c;
-            tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -3142,6 +3245,7 @@ kernel void batched_matmul_bias_q5_k(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BBK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_mat[4];
             simdgroup_matrix<half, 8, 8> b_mat[2];
@@ -3212,12 +3316,24 @@ kernel void batched_matmul_q6_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-            uint r = idx / BBK;
-            uint c = idx % BBK;
-            uint gr = tile_row + r;
-            uint gc = k_base + c;
-            tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -3263,6 +3379,7 @@ kernel void batched_matmul_q6_k(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BBK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_mat[4];
             simdgroup_matrix<half, 8, 8> b_mat[2];
@@ -3342,12 +3459,24 @@ kernel void batched_matmul_bias_q6_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-            uint r = idx / BBK;
-            uint c = idx % BBK;
-            uint gr = tile_row + r;
-            uint gc = k_base + c;
-            tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -3393,6 +3522,7 @@ kernel void batched_matmul_bias_q6_k(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BBK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_mat[4];
             simdgroup_matrix<half, 8, 8> b_mat[2];
