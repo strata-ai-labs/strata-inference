@@ -116,6 +116,12 @@ struct MetalExecutor {
     _f32_emb_tensors: Vec<DeviceTensor>,
     f32_token_emb_idx: Option<u16>,
     f32_pos_emb_idx: Option<u16>,
+    /// LongRoPE runtime factor swapping: index of rope_factors_short in weight_buf_ids.
+    rope_short_weight_idx: Option<u16>,
+    /// Metal buffer ID for rope_factors_long (to swap in when seq_len >= original_ctx).
+    rope_long_buf_id: Option<Id>,
+    /// Original Metal buffer ID for rope_factors_short (to restore when seq_len < original_ctx).
+    rope_short_buf_id: Option<Id>,
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -183,12 +189,21 @@ impl GenerationEngine {
         path: impl AsRef<Path>,
         backend: &str,
     ) -> Result<Self, InferenceError> {
+        Self::from_gguf_with_options(path, backend, None)
+    }
+
+    /// Load with an explicit backend selection and optional context length override.
+    pub fn from_gguf_with_options(
+        path: impl AsRef<Path>,
+        backend: &str,
+        ctx_size: Option<usize>,
+    ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
         match backend {
             "auto" => Self::from_gguf(path),
             "cpu" => Self::from_gguf_cpu(path),
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            "metal" => Self::from_gguf_metal(path),
+            "metal" => Self::from_gguf_metal_with_ctx(path, ctx_size),
             #[cfg(not(all(feature = "metal", target_os = "macos")))]
             "metal" => Err(InferenceError::Backend(
                 "Metal backend not available (compile with --features metal on macOS)".to_string(),
@@ -240,10 +255,36 @@ impl GenerationEngine {
     /// Build a Metal graph-based generation engine.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     fn from_gguf_metal(path: &Path) -> Result<Self, InferenceError> {
+        Self::from_gguf_metal_with_ctx(path, None)
+    }
+
+    /// Build a Metal graph-based generation engine with an optional context length override.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn from_gguf_metal_with_ctx(path: &Path, ctx_override: Option<usize>) -> Result<Self, InferenceError> {
         info!(path = %path.display(), "Loading generation engine (Metal) from GGUF");
 
         let gguf = GgufFile::open(path)?;
-        let config = ModelConfig::from_gguf(&gguf)?;
+        let mut config = ModelConfig::from_gguf(&gguf)?;
+
+        // Cap max_seq_len to avoid OOM from huge KV caches (e.g., Phi-3.5 has 131072)
+        let default_ctx = 4096;
+        if let Some(ctx) = ctx_override {
+            if ctx < config.max_seq_len {
+                info!(
+                    original = config.max_seq_len,
+                    capped = ctx,
+                    "Capping max_seq_len to user-specified context size"
+                );
+                config.max_seq_len = ctx;
+            }
+        } else if config.max_seq_len > default_ctx {
+            info!(
+                original = config.max_seq_len,
+                capped = default_ctx,
+                "Capping max_seq_len to default (use --ctx to override)"
+            );
+            config.max_seq_len = default_ctx;
+        }
 
         if !config.causal {
             return Err(InferenceError::Generation(
@@ -349,6 +390,29 @@ impl GenerationEngine {
 
         let kv_dim = config.num_kv_heads * config.head_dim;
 
+        // Compute LongRoPE factor indices in weight_buf_ids
+        let (rope_short_weight_idx, rope_long_buf_id, rope_short_buf_id) = {
+            if weights.rope_factors_short.is_some() {
+                // Compute index of rope_factors_short in walk order:
+                // token_embedding(1) + position_embedding? + output_norm_w? + output_norm_b?
+                // + output_projection? = offset for rope_factors_short
+                let mut idx: u16 = 1; // token_embedding always at 0
+                if weights.position_embedding.is_some() { idx += 1; }
+                if weights.output_norm_w.is_some() { idx += 1; }
+                if weights.output_norm_b.is_some() { idx += 1; }
+                if weights.output_projection.is_some() { idx += 1; }
+                let short_buf = weight_buf_ids[idx as usize];
+                let long_buf = if weights.rope_factors_long.is_some() {
+                    Some(weight_buf_ids[(idx + 1) as usize])
+                } else {
+                    None
+                };
+                (Some(idx), long_buf, Some(short_buf))
+            } else {
+                (None, None, None)
+            }
+        };
+
         // Pre-allocate tiny buffers for the token ID and position ID
         let token_id_buf = unsafe {
             msg_send_new_buffer_length(
@@ -384,6 +448,9 @@ impl GenerationEngine {
                 _f32_emb_tensors: f32_emb_tensors,
                 f32_token_emb_idx,
                 f32_pos_emb_idx,
+                rope_short_weight_idx,
+                rope_long_buf_id,
+                rope_short_buf_id,
             }),
             decode_graph: Some(decode_graph),
             kv_f16,
@@ -644,6 +711,21 @@ impl GenerationEngine {
             &self.config, &self.weights, prompt_ids.len(), kv_f16,
         );
 
+        // LongRoPE: select long vs short factors based on max position in prefill
+        if self.config.rope_scaling_original_ctx > 0 {
+            if let Executor::Metal(ref mut m) = self.executor {
+                if let (Some(si), Some(li), Some(sbi)) =
+                    (m.rope_short_weight_idx, m.rope_long_buf_id, m.rope_short_buf_id)
+                {
+                    if prompt_ids.len() >= self.config.rope_scaling_original_ctx {
+                        m.weight_buf_ids[si as usize] = li;
+                    } else {
+                        m.weight_buf_ids[si as usize] = sbi;
+                    }
+                }
+            }
+        }
+
         // Borrow executor fields
         let metal = match &self.executor {
             Executor::Metal(m) => m,
@@ -770,6 +852,21 @@ impl GenerationEngine {
             }
 
             let tok_start = if profiling { Some(Instant::now()) } else { None };
+
+            // LongRoPE: swap factors based on current position
+            if self.config.rope_scaling_original_ctx > 0 {
+                if let Executor::Metal(ref mut m) = self.executor {
+                    if let (Some(si), Some(li), Some(sbi)) =
+                        (m.rope_short_weight_idx, m.rope_long_buf_id, m.rope_short_buf_id)
+                    {
+                        if cache.len() >= self.config.rope_scaling_original_ctx {
+                            m.weight_buf_ids[si as usize] = li;
+                        } else {
+                            m.weight_buf_ids[si as usize] = sbi;
+                        }
+                    }
+                }
+            }
 
             let metal = match &self.executor {
                 Executor::Metal(m) => m,
@@ -1058,6 +1155,8 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: hidden_size,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -1119,6 +1218,8 @@ mod tests {
             output_norm_w: Some(ones_weight(h)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         }
     }
 

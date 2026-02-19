@@ -322,6 +322,8 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: 4,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,

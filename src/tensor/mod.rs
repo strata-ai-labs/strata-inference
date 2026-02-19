@@ -227,6 +227,17 @@ impl Tensor {
         }
     }
 
+    /// Returns a reference to the underlying raw quantized bytes.
+    ///
+    /// # Panics
+    /// Panics if the tensor is not a quantized dtype.
+    pub fn quantized_data(&self) -> &[u8] {
+        match &self.storage {
+            TensorStorage::Quantized(data) => data,
+            _ => panic!("Tensor is {:?}, not quantized", self.dtype),
+        }
+    }
+
     /// Returns a mutable reference to the underlying F32 data.
     ///
     /// # Panics

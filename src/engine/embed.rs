@@ -312,6 +312,8 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: hidden_size,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: false, // bidirectional for embedding
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -375,6 +377,8 @@ mod tests {
             output_norm_w: Some(ones_weight(h)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         }
     }
 

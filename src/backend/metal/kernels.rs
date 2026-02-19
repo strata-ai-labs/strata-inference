@@ -908,6 +908,57 @@ kernel void rope_neox(
 }
 
 // -----------------------------------------------------------------------
+// 8b. rope_neox_factors — Same as rope_neox but with per-dimension frequency
+//     factors (LongRoPE / YaRN). The factors buffer has rope_dim/2 floats
+//     that multiply the base frequency for each pair position.
+//     freq[i] = pow(freq_base, inv_ndims * 2*i) * factors[i]
+// -----------------------------------------------------------------------
+kernel void rope_neox_factors(
+    device const float* input      [[buffer(0)]],
+    device       float* output     [[buffer(1)]],
+    constant     uint&  pos_offset [[buffer(2)]],
+    constant     float& freq_base  [[buffer(3)]],
+    constant     uint&  head_dim   [[buffer(4)]],
+    constant     uint&  rope_dim   [[buffer(5)]],
+    constant     uint&  n_heads    [[buffer(6)]],
+    constant     uint&  seq_len    [[buffer(7)]],
+    device const float* factors    [[buffer(8)]],
+    constant     float& mscale     [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint i    = gid.x;
+    uint head = gid.y;
+    uint seq  = gid.z;
+
+    uint half_rope = rope_dim / 2;
+
+    if (i >= half_rope || head >= n_heads || seq >= seq_len) return;
+
+    float theta_base = float(pos_offset + seq);
+    float inv_ndims = -1.f / float(rope_dim);
+    float factor = factors[i];
+    float theta = theta_base * pow(freq_base, inv_ndims * float(2 * i)) * factor;
+
+    float cos_theta = cos(theta);
+    float sin_theta = sin(theta);
+
+    uint base_idx = seq * n_heads * head_dim + head * head_dim;
+    uint idx_lo = base_idx + i;
+    uint idx_hi = base_idx + i + half_rope;
+
+    float x_lo = input[idx_lo];
+    float x_hi = input[idx_hi];
+
+    output[idx_lo] = (x_lo * cos_theta - x_hi * sin_theta) * mscale;
+    output[idx_hi] = (x_lo * sin_theta + x_hi * cos_theta) * mscale;
+
+    for (uint nr = i; nr < head_dim - rope_dim; nr += half_rope) {
+        uint src = base_idx + rope_dim + nr;
+        output[src] = input[src];
+    }
+}
+
+// -----------------------------------------------------------------------
 // 9. causal_mask — Set attention scores to -INFINITY for future positions
 //   scores[i][j] = -INFINITY where j > i + offset
 //   2D grid: (cols, rows). offset allows shifting for KV-cache decoding.

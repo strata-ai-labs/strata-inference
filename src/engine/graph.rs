@@ -75,6 +75,8 @@ pub(crate) enum PsoRef {
     BatchedMatmulBiasQ5K,
     BatchedMatmulQ6K,
     BatchedMatmulBiasQ6K,
+    // Phase 5: RoPE with per-dimension frequency factors (LongRoPE)
+    RopeNeoxFactors,
 }
 
 /// Parameter value: either fixed at build time or patched per-token.
@@ -185,6 +187,9 @@ pub(crate) fn weight_walk_order(weights: &ModelWeights) -> Vec<&crate::backend::
     if let Some(ref w) = weights.output_norm_w { out.push(w); }
     if let Some(ref w) = weights.output_norm_b { out.push(w); }
     if let Some(ref w) = weights.output_projection { out.push(w); }
+    // LongRoPE frequency factors (Phi-3.5, etc.)
+    if let Some(ref w) = weights.rope_factors_short { out.push(w); }
+    if let Some(ref w) = weights.rope_factors_long { out.push(w); }
 
     // Per-layer weights
     for layer in &weights.layers {
@@ -624,6 +629,9 @@ impl GraphBuilder {
     }
 
     /// Emit RoPE (norm or neox) for Q or K (single token, [1, n_heads * head_dim]).
+    /// When `rope_factors` is Some, uses the `rope_neox_factors` kernel which multiplies
+    /// per-dimension frequency factors into the RoPE computation (LongRoPE).
+    /// `mscale` is the YaRN magnitude scaling factor (1.0 = no scaling).
     fn emit_rope(
         &mut self,
         neox: bool,
@@ -633,29 +641,50 @@ impl GraphBuilder {
         head_dim: usize,
         rope_dim: usize,
         freq_base: f32,
+        rope_factors: Option<BufferRef>,
+        mscale: f32,
     ) {
-        let pso = if neox { PsoRef::RopeNeox } else { PsoRef::RopeNorm };
+        let pso = match (neox, rope_factors.is_some()) {
+            (true, true) => PsoRef::RopeNeoxFactors,
+            (true, false) => PsoRef::RopeNeox,
+            (false, _) => PsoRef::RopeNorm, // factors not yet supported for norm variant
+        };
         let half_rope = rope_dim / 2;
         let gx = ((half_rope + 15) / 16) as u32;
         let gy = ((n_heads + 15) / 16) as u32;
         let gz = 1u32; // seq_len = 1
 
+        let mut bindings = vec![
+            (BufferRef::Pool(input), 0, 0),
+            (BufferRef::Pool(out), 1, 0),
+        ];
+        if let Some(factors_ref) = rope_factors {
+            bindings.push((factors_ref, 8, 0));
+        }
+
+        let mut params = vec![
+            (ParamValue::PositionId, 2), // pos_offset (patched at encode)
+            (ParamValue::F32(freq_base), 3),
+            (ParamValue::U32(head_dim as u32), 4),
+            (ParamValue::U32(rope_dim as u32), 5),
+            (ParamValue::U32(n_heads as u32), 6),
+            (ParamValue::U32(1), 7), // seq_len = 1
+        ];
+        if rope_factors.is_some() {
+            params.push((ParamValue::F32(mscale), 9));
+        }
+
+        let mut reads = vec![BufferRef::Pool(input)];
+        if let Some(factors_ref) = rope_factors {
+            reads.push(factors_ref);
+        }
+
         self.ops.push(DecodeOp {
             pso,
-            bindings: vec![
-                (BufferRef::Pool(input), 0, 0),
-                (BufferRef::Pool(out), 1, 0),
-            ],
-            params: vec![
-                (ParamValue::PositionId, 2), // pos_offset (patched at encode)
-                (ParamValue::F32(freq_base), 3),
-                (ParamValue::U32(head_dim as u32), 4),
-                (ParamValue::U32(rope_dim as u32), 5),
-                (ParamValue::U32(n_heads as u32), 6),
-                (ParamValue::U32(1), 7), // seq_len = 1
-            ],
+            bindings,
+            params,
             dispatch: DispatchDims::Fixed { gx, gy, gz, tx: 16, ty: 16, tz: 1 },
-            reads: vec![BufferRef::Pool(input)],
+            reads,
             writes: Some(BufferRef::Pool(out)),
         });
     }
@@ -770,7 +799,18 @@ impl DecodeGraph {
         let total_dim = config.num_heads * config.head_dim;
         let ffn_h = config.ffn_hidden;
         let f32_size = std::mem::size_of::<f32>();
-        let attn_scale = config.attn_scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
+        // Compute YaRN mscale for magnitude scaling
+        let yarn_mscale = {
+            let f = config.rope_scaling_attn_factor;
+            if f > 1.0 { 0.1 * f.log2() + 1.0 } else { 1.0 }
+        };
+        // Apply mscale^2 to attention scale (accounts for both Q and K scaling)
+        let base_attn_scale = config.attn_scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
+        let attn_scale = if config.rope_scaling_original_ctx > 0 && weights.rope_factors_short.is_some() {
+            base_attn_scale * yarn_mscale * yarn_mscale
+        } else {
+            base_attn_scale
+        };
 
         // ===================================================================
         // Index global weights (same order as weight_walk_order)
@@ -784,6 +824,11 @@ impl DecodeGraph {
         let output_norm_w = b.next_weight_opt(weights.output_norm_w.is_some());
         let output_norm_b = b.next_weight_opt(weights.output_norm_b.is_some());
         let output_proj = b.next_weight_opt(weights.output_projection.is_some());
+        // LongRoPE frequency factors — short factors used at graph level.
+        // At runtime, MetalExecutor swaps in long factors when seq_len >= original_ctx.
+        let rope_factors = b.next_weight_opt(weights.rope_factors_short.is_some());
+        let rope_factors_long = b.next_weight_opt(weights.rope_factors_long.is_some());
+        let _ = rope_factors_long; // consumed by next_weight_opt to maintain walk order
 
         // ===================================================================
         // Pre-layer: embedding lookup + position embedding + scaling
@@ -899,11 +944,13 @@ impl DecodeGraph {
                     b.emit_rope(
                         config.rope_neox, q_out, q_rope,
                         config.num_heads, config.head_dim, config.rope_dim, config.rope_freq_base,
+                        rope_factors, yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(kv_dim * f32_size);
                     b.emit_rope(
                         config.rope_neox, k_out, k_rope,
                         config.num_kv_heads, config.head_dim, config.rope_dim, config.rope_freq_base,
+                        rope_factors, yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
@@ -972,11 +1019,13 @@ impl DecodeGraph {
                     b.emit_rope(
                         config.rope_neox, q_out, q_rope,
                         config.num_heads, config.head_dim, config.rope_dim, config.rope_freq_base,
+                        rope_factors, yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(kv_dim * f32_size);
                     b.emit_rope(
                         config.rope_neox, k_out, k_rope,
                         config.num_kv_heads, config.head_dim, config.rope_dim, config.rope_freq_base,
+                        rope_factors, yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
@@ -1264,7 +1313,18 @@ impl PrefillGraph {
         let ffn_h = config.ffn_hidden;
         let f32_size = std::mem::size_of::<f32>();
         let m = n_tokens;
-        let attn_scale = config.attn_scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
+
+        // Compute YaRN mscale for magnitude scaling
+        let yarn_mscale = {
+            let f = config.rope_scaling_attn_factor;
+            if f > 1.0 { 0.1 * f.log2() + 1.0 } else { 1.0 }
+        };
+        let base_attn_scale = config.attn_scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
+        let attn_scale = if config.rope_scaling_original_ctx > 0 && weights.rope_factors_short.is_some() {
+            base_attn_scale * yarn_mscale * yarn_mscale
+        } else {
+            base_attn_scale
+        };
 
         // ===================================================================
         // Index global weights (same order as weight_walk_order)
@@ -1278,6 +1338,9 @@ impl PrefillGraph {
         let output_norm_w = b.next_weight_opt(weights.output_norm_w.is_some());
         let output_norm_b = b.next_weight_opt(weights.output_norm_b.is_some());
         let output_proj = b.next_weight_opt(weights.output_projection.is_some());
+        let rope_factors = b.next_weight_opt(weights.rope_factors_short.is_some());
+        let rope_factors_long = b.next_weight_opt(weights.rope_factors_long.is_some());
+        let _ = rope_factors_long; // consumed by next_weight_opt to maintain walk order
 
         // ===================================================================
         // Pre-layer: embedding lookup + position embedding + scaling
@@ -1385,13 +1448,13 @@ impl PrefillGraph {
                     emit_rope_multi(
                         &mut b, config.rope_neox, q_raw, q_rope,
                         config.num_heads, config.head_dim, config.rope_dim,
-                        config.rope_freq_base, m,
+                        config.rope_freq_base, m, rope_factors, yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(m * kv_dim * f32_size);
                     emit_rope_multi(
                         &mut b, config.rope_neox, k_raw, k_rope,
                         config.num_kv_heads, config.head_dim, config.rope_dim,
-                        config.rope_freq_base, m,
+                        config.rope_freq_base, m, rope_factors, yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
@@ -1456,13 +1519,13 @@ impl PrefillGraph {
                     emit_rope_multi(
                         &mut b, config.rope_neox, q_raw, q_rope,
                         config.num_heads, config.head_dim, config.rope_dim,
-                        config.rope_freq_base, m,
+                        config.rope_freq_base, m, rope_factors, yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(m * kv_dim * f32_size);
                     emit_rope_multi(
                         &mut b, config.rope_neox, k_raw, k_rope,
                         config.num_kv_heads, config.head_dim, config.rope_dim,
-                        config.rope_freq_base, m,
+                        config.rope_freq_base, m, rope_factors, yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
@@ -1868,6 +1931,8 @@ fn emit_scale_multi(
 }
 
 /// Multi-token RoPE: dispatch gz = n_tokens, use PrefillPosOffset.
+/// When `rope_factors` is Some, uses the `rope_neox_factors` kernel (LongRoPE).
+/// `mscale` is the YaRN magnitude scaling factor (1.0 = no scaling).
 fn emit_rope_multi(
     b: &mut GraphBuilder,
     neox: bool,
@@ -1878,29 +1943,50 @@ fn emit_rope_multi(
     rope_dim: usize,
     freq_base: f32,
     n_tokens: usize,
+    rope_factors: Option<BufferRef>,
+    mscale: f32,
 ) {
-    let pso = if neox { PsoRef::RopeNeox } else { PsoRef::RopeNorm };
+    let pso = match (neox, rope_factors.is_some()) {
+        (true, true) => PsoRef::RopeNeoxFactors,
+        (true, false) => PsoRef::RopeNeox,
+        (false, _) => PsoRef::RopeNorm,
+    };
     let half_rope = rope_dim / 2;
     let gx = ((half_rope + 15) / 16) as u32;
     let gy = ((n_heads + 15) / 16) as u32;
     let gz = ((n_tokens + 0) / 1) as u32; // 1 group per token in z
 
+    let mut bindings = vec![
+        (BufferRef::Pool(input), 0, 0),
+        (BufferRef::Pool(out), 1, 0),
+    ];
+    if let Some(factors_ref) = rope_factors {
+        bindings.push((factors_ref, 8, 0));
+    }
+
+    let mut reads = vec![BufferRef::Pool(input)];
+    if let Some(factors_ref) = rope_factors {
+        reads.push(factors_ref);
+    }
+
+    let mut params = vec![
+        (ParamValue::PrefillPosOffset, 2), // pos_offset (patched at encode)
+        (ParamValue::F32(freq_base), 3),
+        (ParamValue::U32(head_dim as u32), 4),
+        (ParamValue::U32(rope_dim as u32), 5),
+        (ParamValue::U32(n_heads as u32), 6),
+        (ParamValue::U32(n_tokens as u32), 7), // seq_len = M
+    ];
+    if rope_factors.is_some() {
+        params.push((ParamValue::F32(mscale), 9));
+    }
+
     b.ops.push(DecodeOp {
         pso,
-        bindings: vec![
-            (BufferRef::Pool(input), 0, 0),
-            (BufferRef::Pool(out), 1, 0),
-        ],
-        params: vec![
-            (ParamValue::PrefillPosOffset, 2), // pos_offset (patched at encode)
-            (ParamValue::F32(freq_base), 3),
-            (ParamValue::U32(head_dim as u32), 4),
-            (ParamValue::U32(rope_dim as u32), 5),
-            (ParamValue::U32(n_heads as u32), 6),
-            (ParamValue::U32(n_tokens as u32), 7), // seq_len = M
-        ],
+        bindings,
+        params,
         dispatch: DispatchDims::Fixed { gx, gy, gz, tx: 16, ty: 16, tz: 1 },
-        reads: vec![BufferRef::Pool(input)],
+        reads,
         writes: Some(BufferRef::Pool(out)),
     });
 }
@@ -2131,6 +2217,8 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: 64,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -2161,6 +2249,8 @@ mod tests {
             rope_freq_base: 10000.0,
             rope_dim: 64,
             rope_neox: false,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
             causal: true,
             attn_logit_softcap: 0.0,
             attn_scale: None,
@@ -2236,6 +2326,8 @@ mod tests {
             output_norm_w: Some(dt(vec![h], TensorDtype::F32)),
             output_norm_b: Some(dt(vec![h], TensorDtype::F32)),
             output_projection: None, // tied embeddings
+            rope_factors_short: None,
+            rope_factors_long: None,
         }
     }
 
@@ -2287,6 +2379,8 @@ mod tests {
             output_norm_w: Some(dt(vec![h], TensorDtype::F32)),
             output_norm_b: None,
             output_projection: None, // tied embeddings
+            rope_factors_short: None,
+            rope_factors_long: None,
         }
     }
 
@@ -2534,6 +2628,255 @@ mod tests {
         // Post-layer: final norm + logits
         assert_op_pso(&graph, 18, PsoRef::RmsNorm);
         assert_op_pso(&graph, 19, PsoRef::MatmulTranspose);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phi-3 tests
+    // -----------------------------------------------------------------------
+
+    fn phi3_config() -> ModelConfig {
+        ModelConfig {
+            arch: ModelArch::Phi3,
+            arch_name: "phi3".to_string(),
+            hidden_size: 3072,
+            num_layers: 32,
+            num_heads: 32,
+            num_kv_heads: 32, // MHA
+            head_dim: 96,
+            ffn_hidden: 8192,
+            vocab_size: 32064,
+            max_seq_len: 4096,
+            norm_type: NormType::RMSNorm,
+            norm_eps: 1e-5,
+            activation: Activation::SwiGLU,
+            position_type: PositionType::RoPE,
+            rope_freq_base: 10000.0,
+            rope_dim: 96,
+            rope_neox: true,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
+            causal: true,
+            attn_logit_softcap: 0.0,
+            attn_scale: None,
+            embedding_scale: 1.0,
+            pooling_type: PoolingType::None,
+            has_ffn_gate: true,
+            has_bias: false,
+            pre_norm: true,
+        }
+    }
+
+    fn phi3_1layer_config() -> ModelConfig {
+        ModelConfig {
+            num_layers: 1,
+            ..phi3_config()
+        }
+    }
+
+    fn phi3_weights(config: &ModelConfig) -> ModelWeights {
+        let h = config.hidden_size;
+        let ffn = config.ffn_hidden;
+        let v = config.vocab_size;
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let total_dim = config.num_heads * config.head_dim;
+        let qtype = TensorDtype::Q8_0;
+
+        let layers: Vec<LayerWeights> = (0..config.num_layers)
+            .map(|_| LayerWeights {
+                attn_norm_w: Some(dt(vec![h], TensorDtype::F32)),
+                attn_norm_b: None,
+                ffn_norm_w: Some(dt(vec![h], TensorDtype::F32)),
+                ffn_norm_b: None,
+                attn_output_norm_w: None,
+                attn_output_norm_b: None,
+                ffn_output_norm_w: None,
+                ffn_output_norm_b: None,
+                attn_q: dt(vec![total_dim, h], qtype),
+                attn_k: dt(vec![kv_dim, h], qtype),
+                attn_v: dt(vec![kv_dim, h], qtype),
+                attn_output: dt(vec![h, total_dim], qtype),
+                attn_q_bias: None,
+                attn_k_bias: None,
+                attn_v_bias: None,
+                attn_output_bias: None,
+                ffn_up: dt(vec![ffn, h], qtype),
+                ffn_down: dt(vec![h, ffn], qtype),
+                ffn_gate: Some(dt(vec![ffn, h], qtype)),
+                ffn_up_bias: None,
+                ffn_down_bias: None,
+                attn_q_norm_w: None,
+                attn_k_norm_w: None,
+                attn_post_norm_w: None,
+                ffn_post_norm_w: None,
+            })
+            .collect();
+
+        ModelWeights {
+            token_embedding: dt(vec![v, h], TensorDtype::F32),
+            position_embedding: None,
+            token_type_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers,
+            output_norm_w: Some(dt(vec![h], TensorDtype::F32)),
+            output_norm_b: None,
+            output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
+        }
+    }
+
+    fn phi3_longrope_weights(config: &ModelConfig) -> ModelWeights {
+        let half_rope = config.rope_dim / 2;
+        ModelWeights {
+            rope_factors_short: Some(dt(vec![half_rope], TensorDtype::F32)),
+            rope_factors_long: Some(dt(vec![half_rope], TensorDtype::F32)),
+            ..phi3_weights(config)
+        }
+    }
+
+    #[test]
+    fn test_phi3_graph_structure() {
+        let config = phi3_config();
+        let weights = phi3_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, false);
+
+        // Phi-3 32 layers:
+        //   Pre-layer: embedding_lookup = 1 op
+        //   Per layer (17 ops): rms_norm + qmatmul(Q) + qmatmul(K) + qmatmul(V) +
+        //     rope_neox(Q) + rope_neox(K) + copy_k + copy_v + grouped_attn +
+        //     qmatmul(O) + add(residual) + rms_norm(FFN) +
+        //     qmatmul(gate) + qmatmul(up) + swiglu + qmatmul(down) + add(residual) = 17
+        //   Post-layer: rms_norm(final) + matmul(logits) = 2 ops
+        //   Total = 1 + 32*17 + 2 = 547
+        assert_eq!(
+            graph.ops.len(), 547,
+            "Phi-3 32-layer should have exactly 547 ops, got {}",
+            graph.ops.len()
+        );
+
+        // PSO distribution
+        assert_eq!(count_pso(&graph, PsoRef::RopeNeox), 2 * 32); // Q+K per layer
+        assert_eq!(count_pso(&graph, PsoRef::SwiGlu), 32);
+        assert_eq!(count_pso(&graph, PsoRef::RmsNorm), 2 * 32 + 1); // attn+FFN per layer + final
+        assert_eq!(count_pso(&graph, PsoRef::LayerNorm), 0);
+        assert_eq!(count_pso(&graph, PsoRef::Gelu), 0);
+        assert_eq!(count_pso(&graph, PsoRef::AddBias), 0);
+        assert_eq!(count_pso(&graph, PsoRef::EmbeddingLookup), 1);
+    }
+
+    #[test]
+    fn test_phi3_1layer_op_sequence() {
+        let config = phi3_1layer_config();
+        let weights = phi3_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, false);
+
+        // 1 + 1*17 + 2 = 20 ops
+        assert_eq!(graph.ops.len(), 20, "Phi-3 1-layer: expected 20 ops, got {}", graph.ops.len());
+
+        // Embedding lookup
+        assert_op_pso(&graph, 0, PsoRef::EmbeddingLookup);
+
+        // Layer: pre-norm
+        assert_op_pso(&graph, 1, PsoRef::RmsNorm);
+
+        // QKV without biases
+        assert_op_pso(&graph, 2, PsoRef::QuantizedMatmulQ8_0); // Q
+        assert_op_pso(&graph, 3, PsoRef::QuantizedMatmulQ8_0); // K
+        assert_op_pso(&graph, 4, PsoRef::QuantizedMatmulQ8_0); // V
+
+        // RoPE NeoX on Q and K
+        assert_op_pso(&graph, 5, PsoRef::RopeNeox); // Q
+        assert_op_pso(&graph, 6, PsoRef::RopeNeox); // K
+
+        // Copy to KV cache
+        assert_op_pso(&graph, 7, PsoRef::CopyBuffer);
+        assert_op_pso(&graph, 8, PsoRef::CopyBuffer);
+
+        // Attention
+        assert_op_pso(&graph, 9, PsoRef::GroupedAttnDecode);
+
+        // Output projection + residual
+        assert_op_pso(&graph, 10, PsoRef::QuantizedMatmulQ8_0);
+        assert_op_pso(&graph, 11, PsoRef::AddTensor);
+
+        // FFN pre-norm
+        assert_op_pso(&graph, 12, PsoRef::RmsNorm);
+
+        // FFN: SwiGLU path
+        assert_op_pso(&graph, 13, PsoRef::QuantizedMatmulQ8_0); // gate
+        assert_op_pso(&graph, 14, PsoRef::QuantizedMatmulQ8_0); // up
+        assert_op_pso(&graph, 15, PsoRef::SwiGlu);
+        assert_op_pso(&graph, 16, PsoRef::QuantizedMatmulQ8_0); // down
+        assert_op_pso(&graph, 17, PsoRef::AddTensor);
+
+        // Post-layer
+        assert_op_pso(&graph, 18, PsoRef::RmsNorm);
+        assert_op_pso(&graph, 19, PsoRef::MatmulTranspose);
+    }
+
+    #[test]
+    fn test_phi3_rope_uses_neox() {
+        let config = phi3_1layer_config();
+        let weights = phi3_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, false);
+
+        // Should use RopeNeox (not RopeNorm)
+        assert_eq!(count_pso(&graph, PsoRef::RopeNeox), 2);
+        assert_eq!(count_pso(&graph, PsoRef::RopeNorm), 0);
+    }
+
+    #[test]
+    fn test_phi3_no_bias_ops() {
+        let config = phi3_1layer_config();
+        let weights = phi3_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, false);
+
+        // No fused matmul+bias PSOs should appear (Phi-3 has no biases)
+        assert_eq!(count_pso(&graph, PsoRef::QuantizedMatmulBiasQ8_0), 0);
+        assert_eq!(count_pso(&graph, PsoRef::QuantizedMatmulBiasQ4_0), 0);
+        assert_eq!(count_pso(&graph, PsoRef::MatmulTransposeBias), 0);
+        assert_eq!(count_pso(&graph, PsoRef::AddBias), 0);
+    }
+
+    #[test]
+    fn test_phi3_longrope_factors() {
+        let config = phi3_1layer_config();
+        let weights = phi3_longrope_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, false);
+
+        // With rope factors, should use RopeNeoxFactors instead of RopeNeox
+        assert_eq!(count_pso(&graph, PsoRef::RopeNeoxFactors), 2);
+        assert_eq!(count_pso(&graph, PsoRef::RopeNeox), 0);
+        assert_eq!(count_pso(&graph, PsoRef::RopeNorm), 0);
+    }
+
+    #[test]
+    fn test_phi3_weight_walk_order_consistency() {
+        let config = phi3_config();
+        let weights = phi3_weights(&config);
+
+        let graph = DecodeGraph::build(&config, &weights, false);
+        let walked = weight_walk_order(&weights);
+
+        let max_weight_idx = graph.ops.iter()
+            .flat_map(|op| {
+                op.bindings.iter().map(|(br, _, _)| br)
+                    .chain(op.reads.iter())
+            })
+            .filter_map(|br| match br {
+                BufferRef::Weight(i) => Some(*i as usize),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+
+        assert!(
+            max_weight_idx < walked.len(),
+            "Weight index {} out of bounds (walked {} weights)",
+            max_weight_idx,
+            walked.len()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3424,6 +3767,8 @@ mod tests {
             output_norm_w: Some(dt(vec![h], TensorDtype::F32)),
             output_norm_b: Some(dt(vec![h], TensorDtype::F32)),
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let m = 10;
@@ -3725,6 +4070,8 @@ mod tests {
             output_norm_w: Some(dt(vec![h], TensorDtype::F32)),
             output_norm_b: None,
             output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
         };
 
         let m = 5;
