@@ -322,6 +322,9 @@ mod tests {
             has_ffn_gate: true,
             has_bias: false,
             pre_norm: true,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 

@@ -664,7 +664,7 @@ kernel void quantized_matmul_q4_0(
         }
 
         for (short row = 0; row < N_R0_Q4; ++row) {
-            device const uint8_t * qs = ax[row][ib].qs + il / 2;
+            device const uint8_t * qs = ax[row][ib].qs + il;
 
             float sumq = 0.0f;
             for (short i = 0; i < 8; ++i) {
@@ -745,8 +745,13 @@ kernel void quantized_matmul_q5_0(
         }
 
         for (short row = 0; row < N_R0_Q5; ++row) {
-            device const uint8_t * qs = ax[row][ib].qs + il / 2;
-            uint32_t qh = *(device const uint32_t*)(ax[row][ib].qh);
+            device const uint8_t * qs = ax[row][ib].qs + il;
+            // Read qh byte-by-byte (avoids unaligned uint32_t read at offset 2)
+            device const uint8_t * qh_ptr = ax[row][ib].qh;
+            uint32_t qh = uint32_t(qh_ptr[0])
+                        | (uint32_t(qh_ptr[1]) << 8)
+                        | (uint32_t(qh_ptr[2]) << 16)
+                        | (uint32_t(qh_ptr[3]) << 24);
             float d = float(ax[row][ib].d);
 
             float sumq = 0.0f;
@@ -756,9 +761,9 @@ kernel void quantized_matmul_q5_0(
                 uint j_hi = il + i + 16;  // element index for high nibble
 
                 // Low nibble: 4 bits from qs + 5th bit from qh
-                float q_lo = float(int((qbyte & 0x0F) | (((qh >> j_lo) & 1u) << 4)) - 16);
+                float q_lo = float(int((qbyte & 0x0Fu) | (((qh >> j_lo) & 1u) << 4)) - 16);
                 // High nibble: 4 bits from qs + 5th bit from qh
-                float q_hi = float(int((qbyte >> 4) | (((qh >> j_hi) & 1u) << 4)) - 16);
+                float q_hi = float(int(((qbyte >> 4) & 0x0Fu) | (((qh >> j_hi) & 1u) << 4)) - 16);
 
                 sumq += q_lo * yl[i] + q_hi * yl[i + 8];
             }
@@ -1213,6 +1218,7 @@ kernel void grouped_attn_decode(
     constant     uint&  total_len    [[buffer(7)]],
     constant     float& attn_scale   [[buffer(8)]],
     constant     float& softcap      [[buffer(9)]],
+    constant     uint&  swa_window   [[buffer(10)]],
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint tpg  [[threads_per_threadgroup]])
@@ -1224,6 +1230,7 @@ kernel void grouped_attn_decode(
     uint kv_head = h * num_kv_heads / num_heads;
     device const float* q_head = Q + h * head_dim;
     uint kv_off = kv_head * head_dim;
+    uint query_pos = total_len - 1;
 
     threadgroup float shared[256];
 
@@ -1231,6 +1238,8 @@ kernel void grouped_attn_decode(
     // Threads parallel over positions
     float local_max = -INFINITY;
     for (uint j = lid; j < total_len; j += tpg) {
+        // SWA: skip positions outside sliding window
+        if (swa_window > 0 && query_pos >= j + swa_window) continue;
         float dot = 0.0f;
         for (uint d = 0; d < head_dim; ++d) {
             dot += q_head[d] * K[j * kv_dim + kv_off + d];
@@ -1269,7 +1278,8 @@ kernel void grouped_attn_decode(
 
         // Step A: each thread computes exp(score - max) for one position
         float w = 0.0f;
-        if (j < total_len) {
+        bool in_window = j < total_len && (swa_window == 0 || query_pos < j + swa_window);
+        if (in_window) {
             float dot = 0.0f;
             for (uint d = 0; d < head_dim; ++d) {
                 dot += q_head[d] * K[j * kv_dim + kv_off + d];
@@ -1714,7 +1724,7 @@ kernel void quantized_matmul_bias_q4_0(
             sumy1 += yl[i + 8];
         }
         for (short row = 0; row < N_R0_Q4; ++row) {
-            device const uint8_t * qs = ax[row][ib].qs + il / 2;
+            device const uint8_t * qs = ax[row][ib].qs + il;
             float sumq = 0.0f;
             for (short i = 0; i < 8; ++i) {
                 uint8_t qbyte = qs[i];
@@ -1773,16 +1783,21 @@ kernel void quantized_matmul_bias_q5_0(
             yl[i + 8] = yb[i + 16];
         }
         for (short row = 0; row < N_R0_Q5; ++row) {
-            device const uint8_t * qs = ax[row][ib].qs + il / 2;
-            uint32_t qh = *(device const uint32_t*)(ax[row][ib].qh);
+            device const uint8_t * qs = ax[row][ib].qs + il;
+            // Read qh byte-by-byte (avoids unaligned uint32_t read at offset 2)
+            device const uint8_t * qh_ptr = ax[row][ib].qh;
+            uint32_t qh = uint32_t(qh_ptr[0])
+                        | (uint32_t(qh_ptr[1]) << 8)
+                        | (uint32_t(qh_ptr[2]) << 16)
+                        | (uint32_t(qh_ptr[3]) << 24);
             float d = float(ax[row][ib].d);
             float sumq = 0.0f;
             for (short i = 0; i < 8; ++i) {
                 uint8_t qbyte = qs[i];
                 uint j_lo = il + i;
                 uint j_hi = il + i + 16;
-                float q_lo = float(int((qbyte & 0x0F) | (((qh >> j_lo) & 1u) << 4)) - 16);
-                float q_hi = float(int((qbyte >> 4) | (((qh >> j_hi) & 1u) << 4)) - 16);
+                float q_lo = float(int((qbyte & 0x0Fu) | (((qh >> j_lo) & 1u) << 4)) - 16);
+                float q_hi = float(int(((qbyte >> 4) & 0x0Fu) | (((qh >> j_hi) & 1u) << 4)) - 16);
                 sumq += q_lo * yl[i] + q_hi * yl[i + 8];
             }
             sumf[row] += d * sumq;
@@ -2155,6 +2170,7 @@ kernel void grouped_attn_decode_f16(
     constant     uint&  total_len    [[buffer(7)]],
     constant     float& attn_scale   [[buffer(8)]],
     constant     float& softcap      [[buffer(9)]],
+    constant     uint&  swa_window   [[buffer(10)]],
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint tpg  [[threads_per_threadgroup]])
@@ -2184,12 +2200,14 @@ kernel void grouped_attn_decode_f16(
     float sg_sum = 0.0f;
     float sg_v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
+    uint query_pos = total_len - 1;
     for (uint tile = 0; tile < total_len; tile += tpg) {
         uint j = tile + lid;
 
         // Step A: each thread computes score for position j (float4 vectorized)
         float score = -INFINITY;
-        if (j < total_len) {
+        bool in_window = j < total_len && (swa_window == 0 || query_pos < j + swa_window);
+        if (in_window) {
             float dot = 0.0f;
             device const half* k_row = K + j * kv_dim + kv_off;
             for (uint d = 0; d < head_dim; d += 4) {
@@ -2324,6 +2342,7 @@ kernel void attn_decode_vec_f16(
     constant     uint&  total_len    [[buffer(7)]],
     constant     float& attn_scale   [[buffer(8)]],
     constant     float& softcap      [[buffer(9)]],
+    constant     uint&  swa_window   [[buffer(10)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint  tiisg [[thread_index_in_simdgroup]])
 {
@@ -2341,7 +2360,11 @@ kernel void attn_decode_vec_f16(
     float M = -INFINITY, S = 0.0f;
     float v_acc[8] = {0,0,0,0,0,0,0,0};
 
+    uint query_pos = total_len - 1;
     for (uint pos = iwg; pos < total_len; pos += NWG) {
+        // SWA: skip positions outside the sliding window
+        if (swa_window > 0 && query_pos >= pos + swa_window) continue;
+
         // Q·K^T via simd_sum
         device const half* k_row = K + pos * kv_dim + kv_off;
         float partial = 0.0f;
@@ -2437,6 +2460,7 @@ kernel void batched_causal_attention(
     constant     uint&  pos_offset    [[buffer(9)]],
     constant     float& attn_scale    [[buffer(10)]],
     constant     float& softcap       [[buffer(11)]],
+    constant     uint&  swa_window    [[buffer(12)]],
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint tpg  [[threads_per_threadgroup]])
@@ -2452,8 +2476,15 @@ kernel void batched_causal_attention(
     uint kv_off = kv_head * head_dim;
 
     // Causal mask: this query can attend to positions [0, pos_offset + q_idx]
-    uint max_attend = pos_offset + q_idx + 1;
+    uint query_pos = pos_offset + q_idx;
+    uint max_attend = query_pos + 1;
     if (max_attend > total_len) max_attend = total_len;
+
+    // SWA: compute the minimum position this query can attend to
+    uint min_attend = 0;
+    if (swa_window > 0 && query_pos >= swa_window) {
+        min_attend = query_pos - swa_window + 1;
+    }
 
     // Load Q for this head and query token
     device const float* q_head = Q + q_idx * total_dim + h * head_dim;
@@ -2466,12 +2497,12 @@ kernel void batched_causal_attention(
     float running_sum = 0.0f;
     float v_acc = 0.0f;
 
-    for (uint tile = 0; tile < max_attend; tile += tpg) {
+    for (uint tile = min_attend; tile < max_attend; tile += tpg) {
         uint j = tile + lid;
 
         // Step A: each thread computes score for position j
         float score = -INFINITY;
-        if (j < max_attend) {
+        if (j < max_attend && j >= min_attend) {
             float dot = 0.0f;
             for (uint d = 0; d < head_dim; ++d) {
                 dot += q_head[d] * K[j * kv_dim + kv_off + d];
@@ -2530,6 +2561,7 @@ kernel void batched_causal_attention_f16(
     constant     uint&  pos_offset    [[buffer(9)]],
     constant     float& attn_scale    [[buffer(10)]],
     constant     float& softcap       [[buffer(11)]],
+    constant     uint&  swa_window    [[buffer(12)]],
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint tpg  [[threads_per_threadgroup]])
@@ -2542,8 +2574,15 @@ kernel void batched_causal_attention_f16(
     uint total_dim = num_heads * head_dim;
     uint kv_off = kv_head * head_dim;
 
-    uint max_attend = pos_offset + q_idx + 1;
+    uint query_pos = pos_offset + q_idx;
+    uint max_attend = query_pos + 1;
     if (max_attend > total_len) max_attend = total_len;
+
+    // SWA: compute the minimum position this query can attend to
+    uint min_attend = 0;
+    if (swa_window > 0 && query_pos >= swa_window) {
+        min_attend = query_pos - swa_window + 1;
+    }
 
     device const float* q_head = Q + q_idx * total_dim + h * head_dim;
 
@@ -2553,11 +2592,11 @@ kernel void batched_causal_attention_f16(
     float running_sum = 0.0f;
     float v_acc = 0.0f;
 
-    for (uint tile = 0; tile < max_attend; tile += tpg) {
+    for (uint tile = min_attend; tile < max_attend; tile += tpg) {
         uint j = tile + lid;
 
         float score = -INFINITY;
-        if (j < max_attend) {
+        if (j < max_attend && j >= min_attend) {
             float dot = 0.0f;
             for (uint d = 0; d < head_dim; ++d) {
                 dot += q_head[d] * float(K[j * kv_dim + kv_off + d]);
@@ -3150,16 +3189,20 @@ kernel void batched_matmul_q5_0(
             if (gn < N) {
                 device const uchar* bp = (device const uchar*)(weights + gn * row_bytes + block_idx * 22);
                 float d = float(*(device const half*)bp);
-                uint32_t qh = *(device const uint32_t*)(bp + 2);
+                // Read qh byte-by-byte (avoids potential unaligned uint32_t read)
+                uint32_t qh = uint32_t(bp[2])
+                            | (uint32_t(bp[3]) << 8)
+                            | (uint32_t(bp[4]) << 16)
+                            | (uint32_t(bp[5]) << 24);
                 device const uchar* qs = bp + 6;
                 for (uint i = 0; i < 8; i++) {
                     uint r = k_off + i;  // element index within the block (0..31)
                     if (k_base + r < K) {
                         float q_val;
                         if (r < 16) {
-                            q_val = float(int((qs[r] & 0x0F) | (((qh >> r) & 1u) << 4)) - 16);
+                            q_val = float(int((qs[r] & 0x0Fu) | (((qh >> r) & 1u) << 4)) - 16);
                         } else {
-                            q_val = float(int((qs[r - 16] >> 4) | (((qh >> r) & 1u) << 4)) - 16);
+                            q_val = float(int(((qs[r - 16] >> 4) & 0x0Fu) | (((qh >> r) & 1u) << 4)) - 16);
                         }
                         tgB[r * BBN + col] = half(d * q_val);
                     } else {
@@ -3283,7 +3326,11 @@ kernel void batched_matmul_bias_q5_0(
             if (gn < N && block_idx < nb_per_row) {
                 device const uchar* bp = (device const uchar*)(weights + gn * row_bytes + block_idx * 22);
                 float d = float(*(device const half*)bp);
-                uint32_t qh = *(device const uint32_t*)(bp + 2);
+                // Read qh byte-by-byte (avoids potential unaligned uint32_t read)
+                uint32_t qh = uint32_t(bp[2])
+                            | (uint32_t(bp[3]) << 8)
+                            | (uint32_t(bp[4]) << 16)
+                            | (uint32_t(bp[5]) << 24);
                 device const uchar* qs = bp + 6;
                 for (uint i = 0; i < 8; i++) {
                     uint r = k_off + i;
@@ -3292,10 +3339,10 @@ kernel void batched_matmul_bias_q5_0(
                         float q_val;
                         if (elem < 16) {
                             uint8_t qbyte = qs[elem];
-                            q_val = float(int((qbyte & 0x0F) | (((qh >> elem) & 1u) << 4)) - 16);
+                            q_val = float(int((qbyte & 0x0Fu) | (((qh >> elem) & 1u) << 4)) - 16);
                         } else {
                             uint8_t qbyte = qs[elem - 16];
-                            q_val = float(int((qbyte >> 4) | (((qh >> elem) & 1u) << 4)) - 16);
+                            q_val = float(int(((qbyte >> 4) & 0x0Fu) | (((qh >> elem) & 1u) << 4)) - 16);
                         }
                         tgB[r * BBN + col] = half(d * q_val);
                     } else {

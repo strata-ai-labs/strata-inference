@@ -403,6 +403,7 @@ impl GenerationEngine {
         // Weight(0) is always token_embedding
         if weights.token_embedding.dtype() != TensorDtype::F32 {
             let f32_tensor = backend.download(&weights.token_embedding).to_f32();
+
             let f32_dt = backend.upload(&f32_tensor);
             let f32_buf = extract_buffer_id(&f32_dt);
             let new_idx = weight_buf_ids.len() as u16;
@@ -613,6 +614,7 @@ impl GenerationEngine {
         )?;
 
         let logits = self.project_to_logits_cpu(&hidden, prompt_ids.len() - 1, backend.as_ref());
+
         let mut next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
         let prefill_duration = prefill_start.elapsed();
 
@@ -1229,6 +1231,9 @@ mod tests {
             has_ffn_gate: true,
             has_bias: false,
             pre_norm: true,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 
