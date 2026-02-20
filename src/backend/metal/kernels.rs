@@ -1012,8 +1012,9 @@ kernel void rope_neox(
 // -----------------------------------------------------------------------
 // 8b. rope_neox_factors — Same as rope_neox but with per-dimension frequency
 //     factors (LongRoPE / YaRN). The factors buffer has rope_dim/2 floats
-//     that multiply the base frequency for each pair position.
-//     freq[i] = pow(freq_base, inv_ndims * 2*i) / factors[i]
+//     containing PRECOMPUTED frequencies:
+//     factors[i] = pow(freq_base, -2*i / rope_dim) / original_factor[i]
+//     This avoids per-thread pow() which introduces Metal vs CPU divergence.
 // -----------------------------------------------------------------------
 kernel void rope_neox_factors(
     device const float* input      [[buffer(0)]],
@@ -1037,12 +1038,13 @@ kernel void rope_neox_factors(
     if (i >= half_rope || head >= n_heads || seq >= seq_len) return;
 
     float theta_base = float(pos_offset + seq);
-    float inv_ndims = -1.f / float(rope_dim);
-    float factor = factors[i];
-    float theta = theta_base * pow(freq_base, inv_ndims * float(2 * i)) / factor;
+    // factors[i] is precomputed on CPU: pow(freq_base, -2*i/rope_dim) / factor[i]
+    float theta = theta_base * factors[i];
 
-    float cos_theta = cos(theta);
-    float sin_theta = sin(theta);
+    // Apply mscale to cos/sin BEFORE rotation (matching CPU order of operations).
+    // This matters because (a*b - c*d)*e != a*(b*e) - c*(d*e) in IEEE 754.
+    float cos_theta = cos(theta) * mscale;
+    float sin_theta = sin(theta) * mscale;
 
     uint base_idx = seq * n_heads * head_dim + head * head_dim;
     uint idx_lo = base_idx + i;
@@ -1051,8 +1053,8 @@ kernel void rope_neox_factors(
     float x_lo = input[idx_lo];
     float x_hi = input[idx_hi];
 
-    output[idx_lo] = (x_lo * cos_theta - x_hi * sin_theta) * mscale;
-    output[idx_hi] = (x_lo * sin_theta + x_hi * cos_theta) * mscale;
+    output[idx_lo] = x_lo * cos_theta - x_hi * sin_theta;
+    output[idx_hi] = x_lo * sin_theta + x_hi * cos_theta;
 
     for (uint nr = i; nr < head_dim - rope_dim; nr += half_rope) {
         uint src = base_idx + rope_dim + nr;
