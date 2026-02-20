@@ -13,9 +13,9 @@ use strata_inference::EmbeddingEngine;
 #[derive(Parser)]
 #[command(name = "strata-embed", about = "Generate embeddings from a GGUF model")]
 struct Args {
-    /// Path to GGUF model file
+    /// Model name or path to GGUF file (e.g., "miniLM" or "./model.gguf")
     #[arg(short = 'm', long)]
-    model: PathBuf,
+    model: String,
 
     /// Text to embed
     #[arg(short = 'p', long, conflicts_with = "file")]
@@ -94,6 +94,7 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let model_path = cli::model::resolve_model(&args.model)?;
     let input = cli::read_input(args.prompt.as_deref(), args.file.as_deref(), false)?;
 
     let total_start = Instant::now();
@@ -101,7 +102,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Load model
     let load_start = Instant::now();
     let backend = cli::backend::resolve_backend(Some(&args.backend))?;
-    let engine = EmbeddingEngine::from_gguf(&args.model, backend)?;
+    let engine = EmbeddingEngine::from_gguf(&model_path, backend)?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     // Split input by separator
@@ -126,7 +127,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     match args.embd_output_format.as_str() {
         "json" => {
             let output = JsonOutput {
-                model: args.model.display().to_string(),
+                model: args.model.clone(),
                 num_embeddings: embeddings.len(),
                 embedding_dim,
                 embeddings,

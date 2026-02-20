@@ -1,11 +1,11 @@
 //! strata-metal-generate: Generate text using the graph-based Metal fast path.
 
-use std::path::PathBuf;
 use std::process;
 use std::time::Instant;
 
 use clap::Parser;
 
+use strata_inference::cli;
 use strata_inference::engine::generate::GenerationConfig;
 use strata_inference::engine::sampler::SamplingConfig;
 use strata_inference::GenerationEngine;
@@ -13,9 +13,9 @@ use strata_inference::GenerationEngine;
 #[derive(Parser)]
 #[command(name = "strata-metal-generate", about = "Generate text via Metal graph engine")]
 struct Args {
-    /// Path to GGUF model file
+    /// Model name or path to GGUF file (e.g., "tinyllama" or "./model.gguf")
     #[arg(short = 'm', long)]
-    model: PathBuf,
+    model: String,
 
     /// Prompt text
     #[arg(short = 'p', long)]
@@ -60,11 +60,12 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         unsafe { std::env::set_var("STRATA_PROFILE", "1"); }
     }
 
+    let model_path = cli::model::resolve_model(&args.model)?;
     let total_start = Instant::now();
 
     // Load model via unified GenerationEngine with Metal backend
     let load_start = Instant::now();
-    let mut engine = GenerationEngine::from_gguf_with_options(&args.model, "metal", args.ctx)?;
+    let mut engine = GenerationEngine::from_gguf_with_options(&model_path, "metal", args.ctx)?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!("[timing] model load: {:.1}ms", load_ms);
 

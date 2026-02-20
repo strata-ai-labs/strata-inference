@@ -257,7 +257,7 @@ impl Default for ModelRegistry {
 }
 
 /// Format bytes as a human-readable string (e.g., "4.7 GB").
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     const GB: u64 = 1_000_000_000;
     const MB: u64 = 1_000_000;
 

@@ -15,9 +15,9 @@ use strata_inference::GenerationEngine;
 #[derive(Parser)]
 #[command(name = "strata-generate", about = "Generate text from a GGUF model")]
 struct Args {
-    /// Path to GGUF model file
+    /// Model name or path to GGUF file (e.g., "qwen3:8b" or "./model.gguf")
     #[arg(short = 'm', long)]
-    model: PathBuf,
+    model: String,
 
     /// Prompt text
     #[arg(short = 'p', long, conflicts_with = "file")]
@@ -123,13 +123,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.profile {
         unsafe { std::env::set_var("STRATA_PROFILE", "1"); }
     }
+    let model_path = cli::model::resolve_model(&args.model)?;
     let input = cli::read_input(args.prompt.as_deref(), args.file.as_deref(), false)?;
 
     let total_start = Instant::now();
 
     // Load model with explicit backend selection
     let load_start = Instant::now();
-    let mut engine = GenerationEngine::from_gguf_with_options(&args.model, &args.backend, args.ctx)?;
+    let mut engine = GenerationEngine::from_gguf_with_options(&model_path, &args.backend, args.ctx)?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     // Build generation config
@@ -191,7 +192,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     match args.output_format.as_str() {
         "json" => {
             let json = JsonOutput {
-                model: args.model.display().to_string(),
+                model: args.model.clone(),
                 prompt: input.clone(),
                 output: generated_text,
                 generated_tokens,
