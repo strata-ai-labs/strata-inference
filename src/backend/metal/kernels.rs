@@ -22,13 +22,13 @@ using namespace metal;
 // Constants
 // =========================================================================
 
-// Simdgroup-matrix GEMM tiling constants (32x32 tiles, 4 simdgroups of 32)
+// Simdgroup-matrix GEMM tiling constants (64x32 tiles, 4 simdgroups of 32)
 constant constexpr uint BM = 32;
 constant constexpr uint BN = 32;
 constant constexpr uint BK = 32;
 
 // Batched GEMM tiling constants (64x32 tiles for higher arithmetic intensity)
-constant constexpr uint BBM = 64;  // Batched M-tile (doubled for prefill throughput)
+constant constexpr uint BBM = 64;  // Batched M-tile
 constant constexpr uint BBN = 32;  // Batched N-tile
 constant constexpr uint BBK = 32;  // Batched K-tile
 
@@ -2274,24 +2274,16 @@ kernel void batched_matmul_q8_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
-        if (tile_row + BBM <= M && k_base + BBK <= K) {
-            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-                uint base = idx * 4;
-                uint r = base / BBK;
-                uint c = base % BBK;
-                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
-                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
-            }
-        } else {
-            // Boundary tile: scalar with bounds checking
-            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-                uint r = idx / BBK;
-                uint c = idx % BBK;
-                uint gr = tile_row + r;
-                uint gc = k_base + c;
-                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
-            }
+        // Vectorized A-loading with row clamping — always takes the fast float4 path.
+        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
+        // K is always a multiple of BBK for all supported quant types, so no K boundary.
+        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+            uint base = idx * 4;
+            uint r = base / BBK;
+            uint c = base % BBK;
+            uint gr = min(tile_row + r, M - 1);
+            float4 v = *(device const float4*)(input + gr * K + k_base + c);
+            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
         }
 
         {
@@ -2396,24 +2388,16 @@ kernel void batched_matmul_bias_q8_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
-        if (tile_row + BBM <= M && k_base + BBK <= K) {
-            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-                uint base = idx * 4;
-                uint r = base / BBK;
-                uint c = base % BBK;
-                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
-                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
-            }
-        } else {
-            // Boundary tile: scalar with bounds checking
-            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-                uint r = idx / BBK;
-                uint c = idx % BBK;
-                uint gr = tile_row + r;
-                uint gc = k_base + c;
-                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
-            }
+        // Vectorized A-loading with row clamping — always takes the fast float4 path.
+        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
+        // K is always a multiple of BBK for all supported quant types, so no K boundary.
+        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+            uint base = idx * 4;
+            uint r = base / BBK;
+            uint c = base % BBK;
+            uint gr = min(tile_row + r, M - 1);
+            float4 v = *(device const float4*)(input + gr * K + k_base + c);
+            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
         }
 
         {
@@ -2509,24 +2493,16 @@ kernel void batched_matmul_q4_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
-        if (tile_row + BBM <= M && k_base + BBK <= K) {
-            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-                uint base = idx * 4;
-                uint r = base / BBK;
-                uint c = base % BBK;
-                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
-                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
-            }
-        } else {
-            // Boundary tile: scalar with bounds checking
-            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-                uint r = idx / BBK;
-                uint c = idx % BBK;
-                uint gr = tile_row + r;
-                uint gc = k_base + c;
-                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
-            }
+        // Vectorized A-loading with row clamping — always takes the fast float4 path.
+        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
+        // K is always a multiple of BBK for all supported quant types, so no K boundary.
+        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+            uint base = idx * 4;
+            uint r = base / BBK;
+            uint c = base % BBK;
+            uint gr = min(tile_row + r, M - 1);
+            float4 v = *(device const float4*)(input + gr * K + k_base + c);
+            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
         }
 
         {
@@ -2637,24 +2613,16 @@ kernel void batched_matmul_bias_q4_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
-        if (tile_row + BBM <= M && k_base + BBK <= K) {
-            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-                uint base = idx * 4;
-                uint r = base / BBK;
-                uint c = base % BBK;
-                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
-                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
-            }
-        } else {
-            // Boundary tile: scalar with bounds checking
-            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-                uint r = idx / BBK;
-                uint c = idx % BBK;
-                uint gr = tile_row + r;
-                uint gc = k_base + c;
-                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
-            }
+        // Vectorized A-loading with row clamping — always takes the fast float4 path.
+        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
+        // K is always a multiple of BBK for all supported quant types, so no K boundary.
+        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+            uint base = idx * 4;
+            uint r = base / BBK;
+            uint c = base % BBK;
+            uint gr = min(tile_row + r, M - 1);
+            float4 v = *(device const float4*)(input + gr * K + k_base + c);
+            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
         }
 
         {
@@ -2756,24 +2724,16 @@ kernel void batched_matmul_q4_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
-        if (tile_row + BBM <= M && k_base + BBK <= K) {
-            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-                uint base = idx * 4;
-                uint r = base / BBK;
-                uint c = base % BBK;
-                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
-                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
-            }
-        } else {
-            // Boundary tile: scalar with bounds checking
-            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-                uint r = idx / BBK;
-                uint c = idx % BBK;
-                uint gr = tile_row + r;
-                uint gc = k_base + c;
-                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
-            }
+        // Vectorized A-loading with row clamping — always takes the fast float4 path.
+        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
+        // K is always a multiple of BBK for all supported quant types, so no K boundary.
+        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+            uint base = idx * 4;
+            uint r = base / BBK;
+            uint c = base % BBK;
+            uint gr = min(tile_row + r, M - 1);
+            float4 v = *(device const float4*)(input + gr * K + k_base + c);
+            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
         }
 
         {
@@ -2899,24 +2859,16 @@ kernel void batched_matmul_bias_q4_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
-        if (tile_row + BBM <= M && k_base + BBK <= K) {
-            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-                uint base = idx * 4;
-                uint r = base / BBK;
-                uint c = base % BBK;
-                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
-                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
-            }
-        } else {
-            // Boundary tile: scalar with bounds checking
-            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-                uint r = idx / BBK;
-                uint c = idx % BBK;
-                uint gr = tile_row + r;
-                uint gc = k_base + c;
-                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
-            }
+        // Vectorized A-loading with row clamping — always takes the fast float4 path.
+        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
+        // K is always a multiple of BBK for all supported quant types, so no K boundary.
+        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+            uint base = idx * 4;
+            uint r = base / BBK;
+            uint c = base % BBK;
+            uint gr = min(tile_row + r, M - 1);
+            float4 v = *(device const float4*)(input + gr * K + k_base + c);
+            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
         }
 
         {
@@ -3033,24 +2985,16 @@ kernel void batched_matmul_q5_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
-        if (tile_row + BBM <= M && k_base + BBK <= K) {
-            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-                uint base = idx * 4;
-                uint r = base / BBK;
-                uint c = base % BBK;
-                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
-                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
-            }
-        } else {
-            // Boundary tile: scalar with bounds checking
-            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-                uint r = idx / BBK;
-                uint c = idx % BBK;
-                uint gr = tile_row + r;
-                uint gc = k_base + c;
-                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
-            }
+        // Vectorized A-loading with row clamping — always takes the fast float4 path.
+        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
+        // K is always a multiple of BBK for all supported quant types, so no K boundary.
+        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+            uint base = idx * 4;
+            uint r = base / BBK;
+            uint c = base % BBK;
+            uint gr = min(tile_row + r, M - 1);
+            float4 v = *(device const float4*)(input + gr * K + k_base + c);
+            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
         }
 
         {
@@ -3179,24 +3123,16 @@ kernel void batched_matmul_bias_q5_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
-        if (tile_row + BBM <= M && k_base + BBK <= K) {
-            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-                uint base = idx * 4;
-                uint r = base / BBK;
-                uint c = base % BBK;
-                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
-                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
-            }
-        } else {
-            // Boundary tile: scalar with bounds checking
-            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-                uint r = idx / BBK;
-                uint c = idx % BBK;
-                uint gr = tile_row + r;
-                uint gc = k_base + c;
-                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
-            }
+        // Vectorized A-loading with row clamping — always takes the fast float4 path.
+        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
+        // K is always a multiple of BBK for all supported quant types, so no K boundary.
+        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+            uint base = idx * 4;
+            uint r = base / BBK;
+            uint c = base % BBK;
+            uint gr = min(tile_row + r, M - 1);
+            float4 v = *(device const float4*)(input + gr * K + k_base + c);
+            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
         }
 
         {
@@ -3316,24 +3252,16 @@ kernel void batched_matmul_q6_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
-        if (tile_row + BBM <= M && k_base + BBK <= K) {
-            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-                uint base = idx * 4;
-                uint r = base / BBK;
-                uint c = base % BBK;
-                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
-                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
-            }
-        } else {
-            // Boundary tile: scalar with bounds checking
-            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-                uint r = idx / BBK;
-                uint c = idx % BBK;
-                uint gr = tile_row + r;
-                uint gc = k_base + c;
-                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
-            }
+        // Vectorized A-loading with row clamping — always takes the fast float4 path.
+        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
+        // K is always a multiple of BBK for all supported quant types, so no K boundary.
+        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+            uint base = idx * 4;
+            uint r = base / BBK;
+            uint c = base % BBK;
+            uint gr = min(tile_row + r, M - 1);
+            float4 v = *(device const float4*)(input + gr * K + k_base + c);
+            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
         }
 
         {
@@ -3459,24 +3387,16 @@ kernel void batched_matmul_bias_q6_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
-        if (tile_row + BBM <= M && k_base + BBK <= K) {
-            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-                uint base = idx * 4;
-                uint r = base / BBK;
-                uint c = base % BBK;
-                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
-                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
-            }
-        } else {
-            // Boundary tile: scalar with bounds checking
-            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
-                uint r = idx / BBK;
-                uint c = idx % BBK;
-                uint gr = tile_row + r;
-                uint gc = k_base + c;
-                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
-            }
+        // Vectorized A-loading with row clamping — always takes the fast float4 path.
+        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
+        // K is always a multiple of BBK for all supported quant types, so no K boundary.
+        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+            uint base = idx * 4;
+            uint r = base / BBK;
+            uint c = base % BBK;
+            uint gr = min(tile_row + r, M - 1);
+            float4 v = *(device const float4*)(input + gr * K + k_base + c);
+            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
         }
 
         {
