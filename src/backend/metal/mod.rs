@@ -118,6 +118,11 @@ pub struct MetalBackend {
     pso_batched_causal_attention: Id,
     pso_copy_f32_to_f16: Id,
     pso_grouped_attn_decode_f16: Id,
+    pso_batched_matmul_q8_0: Id,
+    pso_batched_matmul_q4_0: Id,
+    pso_batched_matmul_q4_k: Id,
+    pso_batched_matmul_q5_k: Id,
+    pso_batched_matmul_q6_k: Id,
     /// Active command buffer and compute encoder for deferred dispatch.
     /// `None` means no open command buffer; dispatches create one lazily.
     active_cmd: Mutex<Option<(Id, Id)>>,
@@ -169,6 +174,11 @@ impl Drop for MetalBackend {
                 self.pso_batched_causal_attention,
                 self.pso_copy_f32_to_f16,
                 self.pso_grouped_attn_decode_f16,
+                self.pso_batched_matmul_q8_0,
+                self.pso_batched_matmul_q4_0,
+                self.pso_batched_matmul_q4_k,
+                self.pso_batched_matmul_q5_k,
+                self.pso_batched_matmul_q6_k,
             ] {
                 if pso != NIL {
                     msg_send_void(pso, rel);
@@ -265,9 +275,14 @@ impl MetalBackend {
                 "batched_causal_attention",
                 "copy_f32_to_f16",
                 "grouped_attn_decode_f16",
+                "batched_matmul_q8_0",
+                "batched_matmul_q4_0",
+                "batched_matmul_q4_k",
+                "batched_matmul_q5_k",
+                "batched_matmul_q6_k",
             ];
 
-            let mut psos = [NIL; 30];
+            let mut psos = [NIL; 35];
             for (i, name) in kernel_names.iter().enumerate() {
                 let ns_name = ns_string(name);
                 let func =
@@ -317,7 +332,7 @@ impl MetalBackend {
 
             msg_send_void(library, sels.release);
 
-            debug!("MetalBackend initialized with 30 PSOs");
+            debug!("MetalBackend initialized with 35 PSOs");
 
             Ok(Self {
                 device,
@@ -353,6 +368,11 @@ impl MetalBackend {
                 pso_batched_causal_attention: psos[27],
                 pso_copy_f32_to_f16: psos[28],
                 pso_grouped_attn_decode_f16: psos[29],
+                pso_batched_matmul_q8_0: psos[30],
+                pso_batched_matmul_q4_0: psos[31],
+                pso_batched_matmul_q4_k: psos[32],
+                pso_batched_matmul_q5_k: psos[33],
+                pso_batched_matmul_q6_k: psos[34],
                 active_cmd: Mutex::new(None),
                 profile: Mutex::new(ProfileCounters::default()),
             })
@@ -883,8 +903,8 @@ impl ComputeBackend for MetalBackend {
             let weight_buf_id = Self::buf_id(weights);
 
             // Fast path: M=1 with GPU-resident input — bind the buffer directly,
-            // no flush or copy needed. The quantized kernels expect a flat f32
-            // input vector, which is exactly what a [1, K] GPU tensor is.
+            // no flush or copy needed. Uses the per-row kernels which operate in
+            // f32 throughout (no f16 threadgroup memory), giving tighter precision.
             if m == 1 && input.gpu_inner::<MetalBuffer>().is_some() {
                 let input_buf_id = Self::buf_id(input);
                 match dtype {
@@ -914,34 +934,14 @@ impl ComputeBackend for MetalBackend {
                             threadgroups, 1, 1, 64, 1, 1,
                         );
                     }
-                    TensorDtype::Q4_K => {
-                        let enc = self.ensure_encoder(self.pso_quantized_matmul_q4_k);
-                        self.set_buffer(enc, weight_buf_id, 0);
-                        self.set_buffer(enc, input_buf_id, 1);
-                        self.set_buffer(enc, out_buf.buffer, 2);
-                        self.set_u32(enc, n as u32, 3);
-                        self.set_u32(enc, k as u32, 4);
-                        let threadgroups = (n + 3) / 4;
-                        msg_send_dispatch(
-                            enc, self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1, 64, 1, 1,
-                        );
-                    }
-                    TensorDtype::Q5_K => {
-                        let enc = self.ensure_encoder(self.pso_quantized_matmul_q5_k);
-                        self.set_buffer(enc, weight_buf_id, 0);
-                        self.set_buffer(enc, input_buf_id, 1);
-                        self.set_buffer(enc, out_buf.buffer, 2);
-                        self.set_u32(enc, n as u32, 3);
-                        self.set_u32(enc, k as u32, 4);
-                        let threadgroups = (n + 3) / 4;
-                        msg_send_dispatch(
-                            enc, self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1, 64, 1, 1,
-                        );
-                    }
-                    TensorDtype::Q6_K => {
-                        let enc = self.ensure_encoder(self.pso_quantized_matmul_q6_k);
+                    TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => {
+                        let pso = match dtype {
+                            TensorDtype::Q4_K => self.pso_quantized_matmul_q4_k,
+                            TensorDtype::Q5_K => self.pso_quantized_matmul_q5_k,
+                            TensorDtype::Q6_K => self.pso_quantized_matmul_q6_k,
+                            _ => unreachable!(),
+                        };
+                        let enc = self.ensure_encoder(pso);
                         self.set_buffer(enc, weight_buf_id, 0);
                         self.set_buffer(enc, input_buf_id, 1);
                         self.set_buffer(enc, out_buf.buffer, 2);
@@ -958,7 +958,37 @@ impl ComputeBackend for MetalBackend {
                 return Self::wrap(out_buf, vec![1, n], TensorDtype::F32);
             }
 
-            // General path: per-row dispatch
+            // M>1 with GPU-resident input — single batched kernel dispatch.
+            // Uses tiled GEMM (BBM=64, BBN=32) with fused dequantization and
+            // f16 threadgroup memory for high throughput.
+            if m > 1 && input.gpu_inner::<MetalBuffer>().is_some() {
+                let input_buf_id = Self::buf_id(input);
+                let pso = match dtype {
+                    TensorDtype::Q8_0 => self.pso_batched_matmul_q8_0,
+                    TensorDtype::Q4_0 => self.pso_batched_matmul_q4_0,
+                    TensorDtype::Q4_K => self.pso_batched_matmul_q4_k,
+                    TensorDtype::Q5_K => self.pso_batched_matmul_q5_k,
+                    TensorDtype::Q6_K => self.pso_batched_matmul_q6_k,
+                    _ => unreachable!("handled by fallback above"),
+                };
+                let enc = self.ensure_encoder(pso);
+                self.set_buffer(enc, weight_buf_id, 0);
+                self.set_buffer(enc, input_buf_id, 1);
+                self.set_buffer(enc, out_buf.buffer, 2);
+                self.set_u32(enc, m as u32, 3);
+                self.set_u32(enc, k as u32, 4);
+                self.set_u32(enc, n as u32, 5);
+                let gx = (n + 31) / 32;  // ceil(N / BBN)
+                let gy = (m + 63) / 64;  // ceil(M / BBM)
+                msg_send_dispatch(
+                    enc, self.sels.dispatch_threadgroups,
+                    gx, gy, 1,
+                    128, 1, 1,
+                );
+                return Self::wrap(out_buf, vec![m, n], TensorDtype::F32);
+            }
+
+            // CPU-resident input fallback: per-row dispatch using M=1 kernels
             for row in 0..m {
                 let input_row_data = if let Some(tensor) = input.try_as_tensor() {
                     let f32_data = tensor.as_f32();
@@ -976,48 +1006,34 @@ impl ComputeBackend for MetalBackend {
                 match dtype {
                     TensorDtype::Q8_0 => {
                         let enc = self.ensure_encoder(self.pso_quantized_matmul_q8_0);
-
                         self.set_buffer(enc, weight_buf_id, 0);
                         self.set_buffer(enc, input_row_buf.buffer, 1);
                         msg_send_set_buffer(
-                            enc,
-                            self.sels.set_buffer,
-                            out_buf.buffer,
-                            row_out_offset * std::mem::size_of::<f32>(),
-                            2,
+                            enc, self.sels.set_buffer, out_buf.buffer,
+                            row_out_offset * std::mem::size_of::<f32>(), 2,
                         );
                         self.set_u32(enc, n as u32, 3);
                         self.set_u32(enc, k as u32, 4);
-
                         let threadgroups = (n + 7) / 8;
                         msg_send_dispatch(
-                            enc,
-                            self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1,
-                            128, 1, 1,
+                            enc, self.sels.dispatch_threadgroups,
+                            threadgroups, 1, 1, 128, 1, 1,
                         );
                     }
                     TensorDtype::Q4_0 => {
                         let enc = self.ensure_encoder(self.pso_quantized_matmul_q4_0);
-
                         self.set_buffer(enc, weight_buf_id, 0);
                         self.set_buffer(enc, input_row_buf.buffer, 1);
                         msg_send_set_buffer(
-                            enc,
-                            self.sels.set_buffer,
-                            out_buf.buffer,
-                            row_out_offset * std::mem::size_of::<f32>(),
-                            2,
+                            enc, self.sels.set_buffer, out_buf.buffer,
+                            row_out_offset * std::mem::size_of::<f32>(), 2,
                         );
                         self.set_u32(enc, n as u32, 3);
                         self.set_u32(enc, k as u32, 4);
-
                         let threadgroups = (n + 7) / 8;
                         msg_send_dispatch(
-                            enc,
-                            self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1,
-                            64, 1, 1,
+                            enc, self.sels.dispatch_threadgroups,
+                            threadgroups, 1, 1, 64, 1, 1,
                         );
                     }
                     TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => {
@@ -1028,25 +1044,18 @@ impl ComputeBackend for MetalBackend {
                             _ => unreachable!(),
                         };
                         let enc = self.ensure_encoder(pso);
-
                         self.set_buffer(enc, weight_buf_id, 0);
                         self.set_buffer(enc, input_row_buf.buffer, 1);
                         msg_send_set_buffer(
-                            enc,
-                            self.sels.set_buffer,
-                            out_buf.buffer,
-                            row_out_offset * std::mem::size_of::<f32>(),
-                            2,
+                            enc, self.sels.set_buffer, out_buf.buffer,
+                            row_out_offset * std::mem::size_of::<f32>(), 2,
                         );
                         self.set_u32(enc, n as u32, 3);
                         self.set_u32(enc, k as u32, 4);
-
                         let threadgroups = (n + 3) / 4;
                         msg_send_dispatch(
-                            enc,
-                            self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1,
-                            64, 1, 1,
+                            enc, self.sels.dispatch_threadgroups,
+                            threadgroups, 1, 1, 64, 1, 1,
                         );
                     }
                     _ => unreachable!("handled by fallback above"),

@@ -4204,6 +4204,95 @@ mod tests {
     // Batched matmul dispatch grid correctness for non-square dimensions
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Phi-3 prefill graph
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prefill_phi3_1layer_structure() {
+        let config = phi3_1layer_config();
+        let weights = phi3_weights(&config);
+        let m = 8;
+        let graph = PrefillGraph::build(&config, &weights, m, false);
+
+        // Phi-3 1-layer prefill with batched quantized GEMM:
+        //   Pre-layer: embedding_lookup(tok) = 1 op
+        //   Per layer:
+        //     rms_norm(1) + Q(1) + K(1) + V(1) + rope_q(1) + rope_k(1)
+        //     + copy_k(1) + copy_v(1) + batched_attn(1) + O_proj(1) + add(1)
+        //     + rms_norm(1) + gate(1) + up(1) + swiglu(1) + down(1) + add(1) = 10 + 7 = 17
+        //   Post-layer: rms_norm(1) + copy_last_token(1) + logits_proj(1) = 3
+        let expected_per_layer = 17;
+        let expected_total = 1 + config.num_layers * expected_per_layer + 3;
+        assert_eq!(
+            graph.ops.len(), expected_total,
+            "Phi-3 1-layer M={} should have {} ops, got {}",
+            m, expected_total, graph.ops.len()
+        );
+
+        // Should use NeoX-style RoPE (not RopeNorm)
+        assert_eq!(count_prefill_pso(&graph, PsoRef::RopeNeox), 2);
+        assert_eq!(count_prefill_pso(&graph, PsoRef::RopeNorm), 0);
+
+        // Should use SwiGLU, not GELU
+        assert!(count_prefill_pso(&graph, PsoRef::SwiGlu) > 0);
+        assert_eq!(count_prefill_pso(&graph, PsoRef::Gelu), 0);
+
+        // No bias ops (Phi-3 has no biases)
+        assert_eq!(count_prefill_pso(&graph, PsoRef::BatchedMatmulBiasQ8_0), 0);
+        assert_eq!(count_prefill_pso(&graph, PsoRef::AddBias), 0);
+
+        // M>1 should use batched matmul kernels (not per-row)
+        // 7 linears per layer: Q, K, V, O, gate, up, down
+        assert_eq!(count_prefill_pso(&graph, PsoRef::BatchedMatmulQ8_0), 7);
+    }
+
+    #[test]
+    fn test_prefill_phi3_longrope_uses_factors_kernel() {
+        let config = phi3_1layer_config();
+        let weights = phi3_longrope_weights(&config);
+        let m = 4;
+        let graph = PrefillGraph::build(&config, &weights, m, false);
+
+        // With LongRoPE factors, should use RopeNeoxFactors instead of RopeNeox
+        assert_eq!(count_prefill_pso(&graph, PsoRef::RopeNeoxFactors), 2);
+        assert_eq!(count_prefill_pso(&graph, PsoRef::RopeNeox), 0);
+    }
+
+    #[test]
+    fn test_prefill_phi3_weight_walk_order_matches_decode() {
+        let config = phi3_1layer_config();
+        let weights = phi3_weights(&config);
+
+        let decode = DecodeGraph::build(&config, &weights, false);
+        let prefill = PrefillGraph::build(&config, &weights, 8, false);
+
+        // Both should reference the same weights in the same walk order
+        let walked = weight_walk_order(&weights);
+
+        let decode_max = decode.ops.iter()
+            .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br).chain(op.reads.iter()))
+            .filter_map(|br| match br { BufferRef::Weight(i) => Some(*i as usize), _ => None })
+            .max()
+            .unwrap_or(0);
+
+        let prefill_max = prefill.ops.iter()
+            .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br).chain(op.reads.iter()))
+            .filter_map(|br| match br { BufferRef::Weight(i) => Some(*i as usize), _ => None })
+            .max()
+            .unwrap_or(0);
+
+        assert_eq!(
+            decode_max, prefill_max,
+            "Decode and prefill should reference the same max weight index"
+        );
+        assert!(
+            prefill_max < walked.len(),
+            "Weight index {} out of bounds (walked {} weights)",
+            prefill_max, walked.len()
+        );
+    }
+
     #[test]
     fn test_prefill_batched_matmul_grid_dims() {
         let config = llama_1layer_config();

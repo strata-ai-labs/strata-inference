@@ -2657,4 +2657,155 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
+
+    #[test]
+    fn test_fused_qkv_split_with_gqa() {
+        // GQA: num_kv_heads < num_heads. Q is [n_embd, n_embd], K/V are [n_kv, n_embd].
+        // This is the Phi-3.5-mini case (32 Q heads, 8 KV heads).
+        let mut config = phi3_config(1, 32);
+        config.num_heads = 8;
+        config.num_kv_heads = 2; // GQA: 4 Q heads per KV group
+        config.head_dim = 4; // hidden_size / num_heads = 32 / 8 = 4
+        config.rope_dim = 4;
+
+        let h = config.hidden_size; // 32
+        let n_kv = config.num_kv_heads * config.head_dim; // 2 * 4 = 8
+        let ffn = config.ffn_hidden;
+        let v = config.vocab_size;
+
+        let mut tensors = Vec::new();
+
+        // Token embedding
+        tensors.push(("token_embd.weight".to_string(), vec![h as u64, v as u64], 0, f32_tensor_data(&vec![0.1f32; v * h])));
+        // Output norm
+        tensors.push(("output_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        // Layer norms
+        tensors.push(("blk.0.attn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensors.push(("blk.0.ffn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+
+        // Fused QKV: [h, h + 2*n_kv] in GGUF dims → [h + 2*n_kv, h] rows
+        // Fill Q region with 0.1, K with 0.2, V with 0.3
+        let qkv_cols = h + 2 * n_kv; // 32 + 2*8 = 48
+        let mut qkv_data = Vec::with_capacity(qkv_cols * h);
+        qkv_data.extend(std::iter::repeat(0.1f32).take(h * h));      // Q: h rows
+        qkv_data.extend(std::iter::repeat(0.2f32).take(n_kv * h));   // K: n_kv rows
+        qkv_data.extend(std::iter::repeat(0.3f32).take(n_kv * h));   // V: n_kv rows
+        tensors.push((
+            "blk.0.attn_qkv.weight".to_string(),
+            vec![h as u64, qkv_cols as u64],
+            0,
+            f32_tensor_data(&qkv_data),
+        ));
+
+        // Attention output
+        tensors.push(("blk.0.attn_output.weight".to_string(), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
+        // Fused gate+up
+        tensors.push(("blk.0.ffn_up.weight".to_string(), vec![h as u64, (2 * ffn) as u64], 0, f32_tensor_data(&vec![0.01f32; 2 * ffn * h])));
+        // FFN down
+        tensors.push(("blk.0.ffn_down.weight".to_string(), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensors
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("phi3_gqa_fused_qkv", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        let layer = &weights.layers[0];
+
+        // Q should be [h, h] = [32, 32], K and V should be [n_kv, h] = [8, 32]
+        assert_eq!(layer.attn_q.shape(), &[h, h], "Q shape with GQA");
+        assert_eq!(layer.attn_k.shape(), &[n_kv, h], "K shape with GQA");
+        assert_eq!(layer.attn_v.shape(), &[n_kv, h], "V shape with GQA");
+
+        // Verify data correctness
+        let q_data = backend.download(&layer.attn_q);
+        let k_data = backend.download(&layer.attn_k);
+        let v_data = backend.download(&layer.attn_v);
+
+        for (i, &val) in q_data.as_f32().iter().enumerate() {
+            assert!((val - 0.1).abs() < 1e-6, "Q[{}] = {}, expected 0.1", i, val);
+        }
+        for (i, &val) in k_data.as_f32().iter().enumerate() {
+            assert!((val - 0.2).abs() < 1e-6, "K[{}] = {}, expected 0.2", i, val);
+        }
+        for (i, &val) in v_data.as_f32().iter().enumerate() {
+            assert!((val - 0.3).abs() < 1e-6, "V[{}] = {}, expected 0.3", i, val);
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_fused_qkv_q8_0_split_with_gqa() {
+        // GQA with quantized (Q8_0) fused QKV — verify byte-level split preserves
+        // quantization format and produces correct asymmetric shapes.
+        let mut config = phi3_config(1, 32);
+        config.num_heads = 8;
+        config.num_kv_heads = 2;
+        config.head_dim = 4;
+        config.rope_dim = 4;
+
+        let h = config.hidden_size; // 32
+        let n_kv = config.num_kv_heads * config.head_dim; // 8
+        let ffn = config.ffn_hidden;
+        let v = config.vocab_size;
+        let qkv_cols = h + 2 * n_kv; // 48
+
+        let mut tensors = Vec::new();
+
+        // Token embedding, norms (F32)
+        tensors.push(("token_embd.weight".to_string(), vec![h as u64, v as u64], 0, f32_tensor_data(&vec![0.1f32; v * h])));
+        tensors.push(("output_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensors.push(("blk.0.attn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensors.push(("blk.0.ffn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+
+        // Fused QKV as Q8_0: rows = qkv_cols = 48, cols = h = 32
+        // Q8_0: block_size=32, so h=32 means 1 block per row, 34 bytes per row
+        let q8_qkv = q8_0_tensor_data(qkv_cols * h);
+        tensors.push((
+            "blk.0.attn_qkv.weight".to_string(),
+            vec![h as u64, qkv_cols as u64],
+            8, // Q8_0
+            q8_qkv,
+        ));
+
+        // Attention output (F32)
+        tensors.push(("blk.0.attn_output.weight".to_string(), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
+        // Fused gate+up (F32)
+        tensors.push(("blk.0.ffn_up.weight".to_string(), vec![h as u64, (2 * ffn) as u64], 0, f32_tensor_data(&vec![0.01f32; 2 * ffn * h])));
+        // FFN down (F32)
+        tensors.push(("blk.0.ffn_down.weight".to_string(), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
+
+        let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensors
+            .iter()
+            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .collect();
+
+        let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
+        let path = write_temp_gguf("phi3_gqa_q8_qkv", &gguf_bytes);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let backend = CpuBackend::new();
+        let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
+
+        let layer = &weights.layers[0];
+
+        // Quantized byte-level split should preserve Q8_0 format
+        assert_eq!(layer.attn_q.dtype(), TensorDtype::Q8_0, "Q dtype preserved");
+        assert_eq!(layer.attn_k.dtype(), TensorDtype::Q8_0, "K dtype preserved");
+        assert_eq!(layer.attn_v.dtype(), TensorDtype::Q8_0, "V dtype preserved");
+
+        // Asymmetric shapes: Q=[h,h], K=[n_kv,h], V=[n_kv,h]
+        assert_eq!(layer.attn_q.shape(), &[h, h], "Q shape with GQA Q8_0");
+        assert_eq!(layer.attn_k.shape(), &[n_kv, h], "K shape with GQA Q8_0");
+        assert_eq!(layer.attn_v.shape(), &[n_kv, h], "V shape with GQA Q8_0");
+
+        std::fs::remove_file(&path).ok();
+    }
 }
