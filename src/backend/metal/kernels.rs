@@ -2139,6 +2139,123 @@ kernel void grouped_attn_decode_f16(
 }
 
 // ===========================================================================
+// Multi-workgroup vec decode attention (two-kernel approach)
+// ===========================================================================
+
+// attn_decode_vec_f16 — NWG=32 workgroups per head, each with 1 SIMD group.
+// Each workgroup processes strided KV positions (iwg, iwg+NWG, ...).
+// Partial online-softmax results (V, S, M) written to temp buffer for reduce.
+//
+// Temp buffer layout:
+//   [num_heads * NWG * head_dim] floats — V accumulators per workgroup
+//   [num_heads * NWG * 2]        floats — (S, M) pairs per workgroup
+//
+// Dispatch: gx = num_heads * NWG (e.g. 32*32 = 1024), tx = 32
+kernel void attn_decode_vec_f16(
+    device const float* Q       [[buffer(0)]],   // [num_heads * head_dim]
+    device const half*  K       [[buffer(1)]],   // [max_len * kv_dim]
+    device const half*  V       [[buffer(2)]],   // [max_len * kv_dim]
+    device       float* dst     [[buffer(3)]],   // temp buffer
+    constant     uint&  num_heads    [[buffer(4)]],
+    constant     uint&  num_kv_heads [[buffer(5)]],
+    constant     uint&  head_dim     [[buffer(6)]],
+    constant     uint&  total_len    [[buffer(7)]],
+    constant     float& attn_scale   [[buffer(8)]],
+    constant     float& softcap      [[buffer(9)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    const uint NWG = 32;
+    uint h   = tgpig.x / NWG;
+    uint iwg = tgpig.x % NWG;
+    if (h >= num_heads) return;
+
+    uint kv_head = h * num_kv_heads / num_heads;
+    uint kv_off  = kv_head * head_dim;
+    uint kv_dim  = num_kv_heads * head_dim;
+    device const float* q_head = Q + h * head_dim;
+    uint dpt = (head_dim + 31) / 32;
+
+    float M = -INFINITY, S = 0.0f;
+    float v_acc[8] = {0,0,0,0,0,0,0,0};
+
+    for (uint pos = iwg; pos < total_len; pos += NWG) {
+        // Q·K^T via simd_sum
+        device const half* k_row = K + pos * kv_dim + kv_off;
+        float partial = 0.0f;
+        for (uint di = 0; di < dpt; ++di) {
+            uint d = tiisg + di * 32;
+            if (d < head_dim) partial += q_head[d] * float(k_row[d]);
+        }
+        float score = simd_sum(partial) * attn_scale;
+        if (softcap > 0.0f) score = softcap * precise::tanh(score / softcap);
+
+        // Online softmax + V accumulation
+        device const half* v_row = V + pos * kv_dim + kv_off;
+        float old_M = M;
+        M = max(M, score);
+        float c = exp(old_M - M), w = exp(score - M);
+        S = S * c + w;
+        for (uint di = 0; di < dpt; ++di) {
+            uint d = tiisg + di * 32;
+            if (d < head_dim) v_acc[di] = v_acc[di] * c + w * float(v_row[d]);
+        }
+    }
+
+    // Write partial results: V contiguous per workgroup, then S/M
+    for (uint di = 0; di < dpt; ++di) {
+        uint d = tiisg + di * 32;
+        if (d < head_dim)
+            dst[h * NWG * head_dim + iwg * head_dim + d] = v_acc[di];
+    }
+    if (tiisg == 0) {
+        device float* sm = dst + num_heads * NWG * head_dim;
+        sm[h * NWG * 2 + iwg * 2 + 0] = S;
+        sm[h * NWG * 2 + iwg * 2 + 1] = M;
+    }
+}
+
+// attn_decode_vec_reduce_f16 — Reduce NWG=32 partial results per head.
+// Each thread i in a SIMD group handles workgroup i's partial results.
+// Uses simd_max for global max, simd_sum for reducing V.
+//
+// Dispatch: gx = num_heads (e.g. 32), tx = 32
+kernel void attn_decode_vec_reduce_f16(
+    device const float* src     [[buffer(0)]],   // temp buffer from vec kernel
+    device       float* output  [[buffer(1)]],   // [num_heads * head_dim]
+    constant     uint&  num_heads  [[buffer(2)]],
+    constant     uint&  head_dim   [[buffer(3)]],
+    uint gid   [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]])
+{
+    const uint NWG = 32;
+    uint h = gid;
+    if (h >= num_heads) return;
+    uint iwg = tiisg;  // thread i handles workgroup i
+
+    // Read S, M for this workgroup
+    device const float* sm = src + num_heads * NWG * head_dim;
+    float S = sm[h * NWG * 2 + iwg * 2 + 0];
+    float M = sm[h * NWG * 2 + iwg * 2 + 1];
+
+    float global_M = simd_max(M);
+    float ms = exp(M - global_M);
+    float global_S = simd_sum(S * ms);
+    float inv_S = (global_S > 0.0f) ? (1.0f / global_S) : 0.0f;
+
+    // Reduce V per dimension (float4 vectorized)
+    device const float* v_base = src + h * NWG * head_dim;
+    for (uint d4 = 0; d4 < head_dim; d4 += 4) {
+        float4 v = *(device const float4*)(v_base + iwg * head_dim + d4);
+        float4 r = float4(
+            simd_sum(v.x * ms), simd_sum(v.y * ms),
+            simd_sum(v.z * ms), simd_sum(v.w * ms));
+        if (tiisg == 0)
+            *(device float4*)(output + h * head_dim + d4) = r * inv_S;
+    }
+}
+
+// ===========================================================================
 // Phase 3: Batched causal attention for prefill
 // ===========================================================================
 
