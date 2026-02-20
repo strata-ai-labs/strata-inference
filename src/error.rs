@@ -50,4 +50,7 @@ pub enum InferenceError {
 
     #[error("Generation error: {0}")]
     Generation(String),
+
+    #[error("Registry error: {0}")]
+    Registry(String),
 }
