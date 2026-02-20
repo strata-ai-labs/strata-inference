@@ -242,6 +242,13 @@ pub(crate) struct DecodeGraph {
 /// Walk ModelWeights in a deterministic order, returning (weight_index, DeviceTensor)
 /// pairs. The engine uses the same order to build its weight_buf_ids array.
 pub(crate) fn weight_walk_order(weights: &ModelWeights) -> Vec<&crate::backend::DeviceTensor> {
+    weight_walk_order_with_factors(weights, false)
+}
+
+pub(crate) fn weight_walk_order_with_factors(
+    weights: &ModelWeights,
+    use_long_factors: bool,
+) -> Vec<&crate::backend::DeviceTensor> {
     let mut out = Vec::new();
 
     // Global weights
@@ -250,9 +257,15 @@ pub(crate) fn weight_walk_order(weights: &ModelWeights) -> Vec<&crate::backend::
     if let Some(ref w) = weights.output_norm_w { out.push(w); }
     if let Some(ref w) = weights.output_norm_b { out.push(w); }
     if let Some(ref w) = weights.output_projection { out.push(w); }
-    // LongRoPE frequency factors (Phi-3.5, etc.)
-    if let Some(ref w) = weights.rope_factors_short { out.push(w); }
-    if let Some(ref w) = weights.rope_factors_long { out.push(w); }
+    // LongRoPE frequency factors: put the active factors first.
+    // The graph always binds the first slot; the second is kept for potential runtime swap.
+    if use_long_factors {
+        if let Some(ref w) = weights.rope_factors_long { out.push(w); }
+        if let Some(ref w) = weights.rope_factors_short { out.push(w); }
+    } else {
+        if let Some(ref w) = weights.rope_factors_short { out.push(w); }
+        if let Some(ref w) = weights.rope_factors_long { out.push(w); }
+    }
 
     // Per-layer weights
     for layer in &weights.layers {
@@ -979,11 +992,10 @@ impl DecodeGraph {
         let output_norm_w = b.next_weight_opt(weights.output_norm_w.is_some());
         let output_norm_b = b.next_weight_opt(weights.output_norm_b.is_some());
         let output_proj = b.next_weight_opt(weights.output_projection.is_some());
-        // LongRoPE frequency factors — short factors used at graph level.
-        // At runtime, MetalExecutor swaps in long factors when seq_len > original_ctx.
+        // LongRoPE frequency factors — the active factors (short or long) are placed
+        // first in the walk order by weight_walk_order_with_factors().
         let rope_factors = b.next_weight_opt(weights.rope_factors_short.is_some());
-        let rope_factors_long = b.next_weight_opt(weights.rope_factors_long.is_some());
-        let _ = rope_factors_long; // consumed by next_weight_opt to maintain walk order
+        let _rope_factors_alt = b.next_weight_opt(weights.rope_factors_long.is_some());
 
         // ===================================================================
         // Pre-layer: embedding lookup + position embedding + scaling
@@ -1529,8 +1541,7 @@ impl PrefillGraph {
         let output_norm_b = b.next_weight_opt(weights.output_norm_b.is_some());
         let output_proj = b.next_weight_opt(weights.output_projection.is_some());
         let rope_factors = b.next_weight_opt(weights.rope_factors_short.is_some());
-        let rope_factors_long = b.next_weight_opt(weights.rope_factors_long.is_some());
-        let _ = rope_factors_long; // consumed by next_weight_opt to maintain walk order
+        let _rope_factors_alt = b.next_weight_opt(weights.rope_factors_long.is_some());
 
         // ===================================================================
         // Pre-layer: embedding lookup + position embedding + scaling
@@ -4971,5 +4982,149 @@ mod tests {
         let rms_count = graph.ops.iter().filter(|op| op.pso == PsoRef::RmsNorm).count();
         assert_eq!(rms_count, 3,
             "LLaMA without per-head norms should have 3 RmsNorm ops, got {}", rms_count);
+    }
+
+    // -----------------------------------------------------------------------
+    // LongRoPE factor walk order and graph alignment tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_weight_walk_order_with_factors_reorders() {
+        // When use_long_factors=true, the walk order should place long factors
+        // before short factors (so the graph binds long factors as the active set).
+        let config = phi3_1layer_config();
+        let weights = phi3_longrope_weights(&config);
+
+        let walk_false = weight_walk_order_with_factors(&weights, false);
+        let walk_true = weight_walk_order_with_factors(&weights, true);
+
+        // Same total count regardless of factor selection
+        assert_eq!(walk_false.len(), walk_true.len(),
+            "Walk order length should not change with use_long_factors");
+
+        // Find rope factor positions by scanning for the known factor tensors.
+        // Use raw pointer identity to distinguish short vs long DeviceTensors.
+        let short_ref = weights.rope_factors_short.as_ref().unwrap();
+        let long_ref = weights.rope_factors_long.as_ref().unwrap();
+        let short_ptr = short_ref as *const crate::backend::DeviceTensor;
+        let long_ptr = long_ref as *const crate::backend::DeviceTensor;
+
+        let is_factor = |w: &&crate::backend::DeviceTensor| {
+            let p = *w as *const crate::backend::DeviceTensor;
+            p == short_ptr || p == long_ptr
+        };
+
+        let pos_in_false: Vec<usize> = walk_false.iter().enumerate()
+            .filter(|(_, w)| is_factor(w))
+            .map(|(i, _)| i)
+            .collect();
+        let pos_in_true: Vec<usize> = walk_true.iter().enumerate()
+            .filter(|(_, w)| is_factor(w))
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(pos_in_false.len(), 2, "Both factors should be in walk order");
+        assert_eq!(pos_in_true.len(), 2);
+
+        // use_long_factors=false: short first, long second
+        let p0f = walk_false[pos_in_false[0]] as *const crate::backend::DeviceTensor;
+        let p1f = walk_false[pos_in_false[1]] as *const crate::backend::DeviceTensor;
+        assert_eq!(p0f, short_ptr, "use_long_factors=false should place short factors first");
+        assert_eq!(p1f, long_ptr, "use_long_factors=false should place long factors second");
+
+        // use_long_factors=true: long first, short second
+        let p0t = walk_true[pos_in_true[0]] as *const crate::backend::DeviceTensor;
+        let p1t = walk_true[pos_in_true[1]] as *const crate::backend::DeviceTensor;
+        assert_eq!(p0t, long_ptr, "use_long_factors=true should place long factors first");
+        assert_eq!(p1t, short_ptr, "use_long_factors=true should place short factors second");
+    }
+
+    #[test]
+    fn test_weight_walk_order_no_factors() {
+        // Models without LongRoPE factors: walk order should be identical
+        // regardless of use_long_factors.
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        assert!(weights.rope_factors_short.is_none());
+        assert!(weights.rope_factors_long.is_none());
+
+        let walk_false = weight_walk_order_with_factors(&weights, false);
+        let walk_true = weight_walk_order_with_factors(&weights, true);
+        assert_eq!(walk_false.len(), walk_true.len());
+
+        // Pointers should be identical since there's nothing to reorder.
+        for (i, (a, b)) in walk_false.iter().zip(walk_true.iter()).enumerate() {
+            assert!(std::ptr::eq(*a, *b),
+                "Walk order entry {} should be identical when no rope factors exist", i);
+        }
+    }
+
+    #[test]
+    fn test_longrope_graph_walk_order_alignment_both_factor_modes() {
+        // Verify that graph weight indices stay within bounds of the walk order
+        // for BOTH use_long_factors=false and use_long_factors=true.
+        // This catches misalignment where the graph hardcodes short-first but
+        // the walk order puts long-first.
+        let config = phi3_1layer_config();
+        let weights = phi3_longrope_weights(&config);
+
+        for use_long in [false, true] {
+            let walked = weight_walk_order_with_factors(&weights, use_long);
+            let decode = DecodeGraph::build(&config, &weights, false);
+            let prefill = PrefillGraph::build(&config, &weights, 4, false);
+
+            let decode_max = decode.ops.iter()
+                .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br).chain(op.reads.iter()))
+                .filter_map(|br| match br { BufferRef::Weight(i) => Some(*i as usize), _ => None })
+                .max()
+                .unwrap_or(0);
+
+            let prefill_max = prefill.ops.iter()
+                .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br).chain(op.reads.iter()))
+                .filter_map(|br| match br { BufferRef::Weight(i) => Some(*i as usize), _ => None })
+                .max()
+                .unwrap_or(0);
+
+            assert!(decode_max < walked.len(),
+                "use_long_factors={}: decode weight index {} out of bounds (walked {})",
+                use_long, decode_max, walked.len());
+            assert!(prefill_max < walked.len(),
+                "use_long_factors={}: prefill weight index {} out of bounds (walked {})",
+                use_long, prefill_max, walked.len());
+        }
+    }
+
+    #[test]
+    fn test_longrope_rope_factors_bind_active_set() {
+        // Verify that the graph's RopeNeoxFactors ops bind the FIRST factor
+        // weight slot (which weight_walk_order_with_factors places the active
+        // factors into), not the second (alternate) slot.
+        let config = phi3_1layer_config();
+        let weights = phi3_longrope_weights(&config);
+
+        let graph = DecodeGraph::build(&config, &weights, false);
+
+        // Find the weight index used by RopeNeoxFactors ops
+        let rope_factor_ops: Vec<&DecodeOp> = graph.ops.iter()
+            .filter(|op| op.pso == PsoRef::RopeNeoxFactors)
+            .collect();
+        assert_eq!(rope_factor_ops.len(), 2, "Should have 2 RopeNeoxFactors ops (Q+K)");
+
+        // All RopeNeoxFactors ops should reference the same factor weight index
+        let factor_weight_indices: Vec<u16> = rope_factor_ops.iter()
+            .flat_map(|op| op.bindings.iter().filter_map(|(br, _, _)| {
+                match br { BufferRef::Weight(i) => Some(*i), _ => None }
+            }))
+            .collect();
+
+        // The factor binding should be the FIRST factor slot (active),
+        // not the second (alternate). Compute expected first factor index:
+        // token_emb(0) + output_norm_w(1) = first factor at index 2
+        let expected_first_factor_idx: u16 = 2;
+        for &idx in &factor_weight_indices {
+            assert_eq!(idx, expected_first_factor_idx,
+                "RoPE factor ops should bind first factor slot (index {}), got {}",
+                expected_first_factor_idx, idx);
+        }
     }
 }

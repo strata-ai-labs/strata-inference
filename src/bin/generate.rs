@@ -66,6 +66,10 @@ struct Args {
     /// Enable per-token profiling (prints to stderr)
     #[arg(long)]
     profile: bool,
+
+    /// Context length override (default: 4096). Affects KV cache size and LongRoPE factor selection.
+    #[arg(short = 'c', long)]
+    ctx: Option<usize>,
 }
 
 fn validate_output_format(s: &str) -> Result<String, String> {
@@ -125,7 +129,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load model with explicit backend selection
     let load_start = Instant::now();
-    let mut engine = GenerationEngine::from_gguf_with_backend(&args.model, &args.backend)?;
+    let mut engine = GenerationEngine::from_gguf_with_options(&args.model, &args.backend, args.ctx)?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     // Build generation config

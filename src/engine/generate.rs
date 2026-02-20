@@ -27,7 +27,7 @@ use crate::tokenizer::{create_tokenizer_from_gguf, Tokenizer};
 use super::sampler::{SamplingConfig, XorShiftRng, sample_token};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use super::graph::{BufferRef, DecodeGraph, PrefillGraph, compute_barriers, patch_ops, weight_walk_order};
+use super::graph::{BufferRef, DecodeGraph, PrefillGraph, compute_barriers, patch_ops, weight_walk_order_with_factors};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::backend::metal::ffi::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -120,12 +120,6 @@ struct MetalExecutor {
     _f32_emb_tensors: Vec<DeviceTensor>,
     f32_token_emb_idx: Option<u16>,
     f32_pos_emb_idx: Option<u16>,
-    /// LongRoPE runtime factor swapping: index of rope_factors_short in weight_buf_ids.
-    rope_short_weight_idx: Option<u16>,
-    /// Metal buffer ID for rope_factors_long (to swap in when seq_len > original_ctx).
-    rope_long_buf_id: Option<Id>,
-    /// Original Metal buffer ID for rope_factors_short (to restore when seq_len < original_ctx).
-    rope_short_buf_id: Option<Id>,
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -174,10 +168,14 @@ impl GenerationEngine {
     ///
     /// Prefers Metal > CUDA > CPU.
     pub fn from_gguf(path: impl AsRef<Path>) -> Result<Self, InferenceError> {
+        Self::from_gguf_auto(path.as_ref(), None)
+    }
+
+    fn from_gguf_auto(path: &Path, ctx_size: Option<usize>) -> Result<Self, InferenceError> {
         // Auto-select: try Metal first, then fall back to CPU
         #[cfg(all(feature = "metal", target_os = "macos"))]
         {
-            match Self::from_gguf_metal(path.as_ref()) {
+            match Self::from_gguf_metal_with_ctx(path, ctx_size) {
                 Ok(engine) => return Ok(engine),
                 Err(e) => {
                     info!(error = %e, "Metal init failed, falling back to CPU");
@@ -185,7 +183,7 @@ impl GenerationEngine {
             }
         }
 
-        Self::from_gguf_cpu(path.as_ref())
+        Self::from_gguf_cpu_with_ctx(path, ctx_size)
     }
 
     /// Load with an explicit backend selection.
@@ -204,8 +202,8 @@ impl GenerationEngine {
     ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
         match backend {
-            "auto" => Self::from_gguf(path),
-            "cpu" => Self::from_gguf_cpu(path),
+            "auto" => Self::from_gguf_auto(path, ctx_size),
+            "cpu" => Self::from_gguf_cpu_with_ctx(path, ctx_size),
             #[cfg(all(feature = "metal", target_os = "macos"))]
             "metal" => Self::from_gguf_metal_with_ctx(path, ctx_size),
             #[cfg(not(all(feature = "metal", target_os = "macos")))]
@@ -220,10 +218,21 @@ impl GenerationEngine {
 
     /// Build a CPU-backed generation engine.
     fn from_gguf_cpu(path: &Path) -> Result<Self, InferenceError> {
+        Self::from_gguf_cpu_with_ctx(path, None)
+    }
+
+    /// Build a CPU-backed generation engine with optional context length override.
+    fn from_gguf_cpu_with_ctx(path: &Path, ctx_override: Option<usize>) -> Result<Self, InferenceError> {
         info!(path = %path.display(), "Loading generation engine (CPU) from GGUF");
 
         let gguf = GgufFile::open(path)?;
-        let config = ModelConfig::from_gguf(&gguf)?;
+        let mut config = ModelConfig::from_gguf(&gguf)?;
+
+        if let Some(ctx) = ctx_override {
+            if ctx < config.max_seq_len {
+                config.max_seq_len = ctx;
+            }
+        }
 
         if !config.causal {
             return Err(InferenceError::Generation(
@@ -256,11 +265,6 @@ impl GenerationEngine {
         })
     }
 
-    /// Build a Metal graph-based generation engine.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    fn from_gguf_metal(path: &Path) -> Result<Self, InferenceError> {
-        Self::from_gguf_metal_with_ctx(path, None)
-    }
 
     /// Build a Metal graph-based generation engine with an optional context length override.
     #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -311,8 +315,12 @@ impl GenerationEngine {
             "Model loaded, building decode graph"
         );
 
-        // Build decode graph with F16 KV cache
-        let kv_f16 = true;
+        // F16 KV cache halves memory bandwidth for attention, but LongRoPE with
+        // LONG factors loses too much precision in F16, causing output divergence.
+        // Use F32 KV cache when LONG factors are selected.
+        let use_long_factors = config.rope_scaling_original_ctx > 0
+            && config.max_seq_len > config.rope_scaling_original_ctx;
+        let kv_f16 = !use_long_factors;
         let mut decode_graph = DecodeGraph::build(&config, &weights, kv_f16);
         info!(
             ops = decode_graph.ops.len(),
@@ -344,8 +352,9 @@ impl GenerationEngine {
             MetalBufferPool::new(device, &metal_res.sels, &decode_graph.slot_sizes)
         };
 
-        // Extract raw buffer Ids from model weights
-        let walked = weight_walk_order(&weights);
+        // Extract raw buffer Ids from model weights.
+        // Factor selection was computed above for kv_f16 decision; reuse for walk order.
+        let walked = weight_walk_order_with_factors(&weights, use_long_factors);
         let mut weight_buf_ids: Vec<Id> = walked
             .iter()
             .map(|dt| extract_buffer_id(dt))
@@ -394,29 +403,6 @@ impl GenerationEngine {
 
         let kv_dim = config.num_kv_heads * config.head_dim;
 
-        // Compute LongRoPE factor indices in weight_buf_ids
-        let (rope_short_weight_idx, rope_long_buf_id, rope_short_buf_id) = {
-            if weights.rope_factors_short.is_some() {
-                // Compute index of rope_factors_short in walk order:
-                // token_embedding(1) + position_embedding? + output_norm_w? + output_norm_b?
-                // + output_projection? = offset for rope_factors_short
-                let mut idx: u16 = 1; // token_embedding always at 0
-                if weights.position_embedding.is_some() { idx += 1; }
-                if weights.output_norm_w.is_some() { idx += 1; }
-                if weights.output_norm_b.is_some() { idx += 1; }
-                if weights.output_projection.is_some() { idx += 1; }
-                let short_buf = weight_buf_ids[idx as usize];
-                let long_buf = if weights.rope_factors_long.is_some() {
-                    Some(weight_buf_ids[(idx + 1) as usize])
-                } else {
-                    None
-                };
-                (Some(idx), long_buf, Some(short_buf))
-            } else {
-                (None, None, None)
-            }
-        };
-
         // Pre-allocate tiny buffers for the token ID and position ID
         let token_id_buf = unsafe {
             msg_send_new_buffer_length(
@@ -452,9 +438,6 @@ impl GenerationEngine {
                 _f32_emb_tensors: f32_emb_tensors,
                 f32_token_emb_idx,
                 f32_pos_emb_idx,
-                rope_short_weight_idx,
-                rope_long_buf_id,
-                rope_short_buf_id,
             }),
             decode_graph: Some(decode_graph),
             kv_f16,
@@ -716,22 +699,6 @@ impl GenerationEngine {
         );
         if profiling {
             eprintln!("[profile-detail] graph build: {:.1}ms", prefill_start.elapsed().as_secs_f64() * 1000.0);
-        }
-
-        // LongRoPE: select long vs short factors based on configured context size (n_ctx).
-        // llama.cpp uses the configured n_ctx, not the current sequence position.
-        if self.config.rope_scaling_original_ctx > 0 {
-            if let Executor::Metal(ref mut m) = self.executor {
-                if let (Some(si), Some(li), Some(sbi)) =
-                    (m.rope_short_weight_idx, m.rope_long_buf_id, m.rope_short_buf_id)
-                {
-                    if self.config.max_seq_len > self.config.rope_scaling_original_ctx {
-                        m.weight_buf_ids[si as usize] = li;
-                    } else {
-                        m.weight_buf_ids[si as usize] = sbi;
-                    }
-                }
-            }
         }
 
         // Borrow executor fields
