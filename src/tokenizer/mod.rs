@@ -184,11 +184,26 @@ pub fn create_tokenizer_from_gguf(
             Vec::new()
         };
 
-        // Default add_bos/add_eos based on vocab type, matching llama.cpp:
+        // Read the pre-tokenizer type (determines regex pattern for rank-based BPE).
+        // SentencePiece models typically don't have this key.
+        let pre_type = gguf.get_str("tokenizer.ggml.pre");
+
+        // Default add_bos/add_eos based on vocab type AND pre-tokenizer, matching llama.cpp:
         // - SPM (model="llama"): add_bos=true, add_eos=false
-        // - BPE (model="gpt2"):  add_bos=false, add_eos=false
+        // - BPE (model="gpt2"):  depends on pre-tokenizer type
+        //   - llama-bpe/llama3/llama-v3/tekken/chameleon: add_bos=true
+        //   - all others: add_bos=false
         // The GGUF key overrides these defaults if present.
-        let default_add_bos = model_type != "gpt2"; // SPM/llama defaults to true
+        let default_add_bos = if model_type == "gpt2" {
+            // BPE models: check pre-tokenizer type (llama.cpp llama-vocab.cpp:1868-1999)
+            matches!(
+                pre_type.as_deref(),
+                Some("llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1"
+                    | "pixtral" | "midm-2.0" | "lfm2" | "tekken" | "chameleon")
+            )
+        } else {
+            true // SPM/llama defaults to true
+        };
         let add_bos = gguf.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(default_add_bos);
         let add_eos = gguf.get_bool("tokenizer.ggml.add_eos_token").unwrap_or(false);
         // SentencePiece models default to adding space prefix (leading underline).
@@ -196,10 +211,6 @@ pub fn create_tokenizer_from_gguf(
         let add_space_prefix = gguf
             .get_bool("tokenizer.ggml.add_space_prefix")
             .unwrap_or(true);
-
-        // Read the pre-tokenizer type (determines regex pattern for rank-based BPE).
-        // SentencePiece models typically don't have this key.
-        let pre_type = gguf.get_str("tokenizer.ggml.pre");
 
         // T5/UGM models need Viterbi DP because they lack intermediate merge
         // tokens. SPM models (LLaMA, Gemma) use greedy BPE merges.
