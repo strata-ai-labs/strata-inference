@@ -80,6 +80,11 @@ pub(crate) enum PsoRef {
     // Phase 6: Multi-workgroup vec decode attention
     AttnDecodeVecF16,
     AttnDecodeVecReduceF16,
+    // Phase 7: Q5_0 quantized matmul
+    QuantizedMatmulQ5_0,
+    QuantizedMatmulBiasQ5_0,
+    BatchedMatmulQ5_0,
+    BatchedMatmulBiasQ5_0,
 }
 
 impl PsoRef {
@@ -129,6 +134,10 @@ impl PsoRef {
             PsoRef::RopeNeoxFactors => "RopeNeoxFactors",
             PsoRef::AttnDecodeVecF16 => "AttnDecodeVecF16",
             PsoRef::AttnDecodeVecReduceF16 => "AttnDecodeVecReduceF16",
+            PsoRef::QuantizedMatmulQ5_0 => "QuantizedMatmulQ5_0",
+            PsoRef::QuantizedMatmulBiasQ5_0 => "QuantizedMatmulBiasQ5_0",
+            PsoRef::BatchedMatmulQ5_0 => "BatchedMatmulQ5_0",
+            PsoRef::BatchedMatmulBiasQ5_0 => "BatchedMatmulBiasQ5_0",
         }
     }
 }
@@ -441,6 +450,36 @@ impl GraphBuilder {
         });
     }
 
+    /// Emit per-head RMSNorm: reinterprets [rows * head_dim] as [rows, head_dim] and
+    /// normalizes each head independently. Used for Qwen3 per-head Q/K norms.
+    fn emit_per_head_rms_norm(
+        &mut self,
+        input: BufferSlot,
+        weight: BufferRef,
+        out: BufferSlot,
+        num_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) {
+        let threads_per_group = (head_dim.next_power_of_two()).min(256) as u32;
+        self.ops.push(DecodeOp {
+            pso: PsoRef::RmsNorm,
+            bindings: vec![
+                (BufferRef::Pool(input), 0, 0),
+                (weight, 1, 0),
+                (BufferRef::Pool(out), 2, 0),
+            ],
+            params: vec![
+                (ParamValue::U32(num_heads as u32), 3),
+                (ParamValue::U32(head_dim as u32), 4),
+                (ParamValue::F32(eps), 5),
+            ],
+            dispatch: DispatchDims::Rows { num_rows: num_heads as u32, threads_per_group },
+            reads: vec![BufferRef::Pool(input), weight],
+            writes: Some(BufferRef::Pool(out)),
+        });
+    }
+
     /// Emit a quantized matmul for single-row decode (M=1).
     fn emit_qmatmul(
         &mut self,
@@ -454,6 +493,7 @@ impl GraphBuilder {
         let (pso, threadgroups, threads) = match dtype {
             TensorDtype::Q8_0 => (PsoRef::QuantizedMatmulQ8_0, ((n + 7) / 8) as u32, 128u32),
             TensorDtype::Q4_0 => (PsoRef::QuantizedMatmulQ4_0, ((n + 7) / 8) as u32, 64u32),
+            TensorDtype::Q5_0 => (PsoRef::QuantizedMatmulQ5_0, ((n + 7) / 8) as u32, 64u32),
             TensorDtype::Q4_K => (PsoRef::QuantizedMatmulQ4K, ((n + 3) / 4) as u32, 64u32),
             TensorDtype::Q5_K => (PsoRef::QuantizedMatmulQ5K, ((n + 3) / 4) as u32, 64u32),
             TensorDtype::Q6_K => (PsoRef::QuantizedMatmulQ6K, ((n + 3) / 4) as u32, 64u32),
@@ -519,6 +559,7 @@ impl GraphBuilder {
         let (pso, threadgroups, threads) = match dtype {
             TensorDtype::Q8_0 => (PsoRef::QuantizedMatmulBiasQ8_0, ((n + 7) / 8) as u32, 128u32),
             TensorDtype::Q4_0 => (PsoRef::QuantizedMatmulBiasQ4_0, ((n + 7) / 8) as u32, 64u32),
+            TensorDtype::Q5_0 => (PsoRef::QuantizedMatmulBiasQ5_0, ((n + 7) / 8) as u32, 64u32),
             TensorDtype::Q4_K => (PsoRef::QuantizedMatmulBiasQ4K, ((n + 3) / 4) as u32, 64u32),
             TensorDtype::Q5_K => (PsoRef::QuantizedMatmulBiasQ5K, ((n + 3) / 4) as u32, 64u32),
             TensorDtype::Q6_K => (PsoRef::QuantizedMatmulBiasQ6K, ((n + 3) / 4) as u32, 64u32),
@@ -939,7 +980,7 @@ impl DecodeGraph {
         let output_norm_b = b.next_weight_opt(weights.output_norm_b.is_some());
         let output_proj = b.next_weight_opt(weights.output_projection.is_some());
         // LongRoPE frequency factors — short factors used at graph level.
-        // At runtime, MetalExecutor swaps in long factors when seq_len >= original_ctx.
+        // At runtime, MetalExecutor swaps in long factors when seq_len > original_ctx.
         let rope_factors = b.next_weight_opt(weights.rope_factors_short.is_some());
         let rope_factors_long = b.next_weight_opt(weights.rope_factors_long.is_some());
         let _ = rope_factors_long; // consumed by next_weight_opt to maintain walk order
@@ -1025,9 +1066,8 @@ impl DecodeGraph {
             let ffn_output_norm_b = b.next_weight_opt(layer.ffn_output_norm_b.is_some());
 
             // Per-head Q/K norms (Qwen3) and post-projection norms (GemmaEmbedding)
-            // Indexed to keep weight walk order consistent; ops not yet emitted.
-            let _attn_q_norm_w = b.next_weight_opt(layer.attn_q_norm_w.is_some());
-            let _attn_k_norm_w = b.next_weight_opt(layer.attn_k_norm_w.is_some());
+            let attn_q_norm_w = b.next_weight_opt(layer.attn_q_norm_w.is_some());
+            let attn_k_norm_w = b.next_weight_opt(layer.attn_k_norm_w.is_some());
             let _attn_post_norm_w = b.next_weight_opt(layer.attn_post_norm_w.is_some());
             let _ffn_post_norm_w = b.next_weight_opt(layer.ffn_post_norm_w.is_some());
 
@@ -1061,13 +1101,25 @@ impl DecodeGraph {
 
                 // 2. QKV projections (all read normed, write to different outputs)
                 let q_raw = b.alloc_slot(total_dim * f32_size);
-                let q_out = b.emit_linear(normed, w_q, q_bias, q_raw, total_dim, h, q_dtype);
+                let q_proj = b.emit_linear(normed, w_q, q_bias, q_raw, total_dim, h, q_dtype);
 
                 let k_raw = b.alloc_slot(kv_dim * f32_size);
-                let k_out = b.emit_linear(normed, w_k, k_bias, k_raw, kv_dim, h, k_dtype);
+                let k_proj = b.emit_linear(normed, w_k, k_bias, k_raw, kv_dim, h, k_dtype);
 
                 let v_raw = b.alloc_slot(kv_dim * f32_size);
                 let v_out = b.emit_linear(normed, w_v, v_bias, v_raw, kv_dim, h, v_dtype);
+
+                // 2b. Per-head Q/K RMSNorm (Qwen3)
+                let q_out = if let Some(qn_w) = attn_q_norm_w {
+                    let q_normed = b.alloc_slot(total_dim * f32_size);
+                    b.emit_per_head_rms_norm(q_proj, qn_w, q_normed, config.num_heads, config.head_dim, config.norm_eps);
+                    q_normed
+                } else { q_proj };
+                let k_out = if let Some(kn_w) = attn_k_norm_w {
+                    let k_normed = b.alloc_slot(kv_dim * f32_size);
+                    b.emit_per_head_rms_norm(k_proj, kn_w, k_normed, config.num_kv_heads, config.head_dim, config.norm_eps);
+                    k_normed
+                } else { k_proj };
 
                 // 3. RoPE (if configured) — applies to Q and K only
                 let (q_final, k_final) = if config.position_type == PositionType::RoPE {
@@ -1137,13 +1189,25 @@ impl DecodeGraph {
 
                 // 1. QKV projections (no pre-norm)
                 let q_raw = b.alloc_slot(total_dim * f32_size);
-                let q_out = b.emit_linear(current_hidden, w_q, q_bias, q_raw, total_dim, h, q_dtype);
+                let q_proj = b.emit_linear(current_hidden, w_q, q_bias, q_raw, total_dim, h, q_dtype);
 
                 let k_raw = b.alloc_slot(kv_dim * f32_size);
-                let k_out = b.emit_linear(current_hidden, w_k, k_bias, k_raw, kv_dim, h, k_dtype);
+                let k_proj = b.emit_linear(current_hidden, w_k, k_bias, k_raw, kv_dim, h, k_dtype);
 
                 let v_raw = b.alloc_slot(kv_dim * f32_size);
                 let v_out = b.emit_linear(current_hidden, w_v, v_bias, v_raw, kv_dim, h, v_dtype);
+
+                // 1b. Per-head Q/K RMSNorm (Qwen3)
+                let q_out = if let Some(qn_w) = attn_q_norm_w {
+                    let q_normed = b.alloc_slot(total_dim * f32_size);
+                    b.emit_per_head_rms_norm(q_proj, qn_w, q_normed, config.num_heads, config.head_dim, config.norm_eps);
+                    q_normed
+                } else { q_proj };
+                let k_out = if let Some(kn_w) = attn_k_norm_w {
+                    let k_normed = b.alloc_slot(kv_dim * f32_size);
+                    b.emit_per_head_rms_norm(k_proj, kn_w, k_normed, config.num_kv_heads, config.head_dim, config.norm_eps);
+                    k_normed
+                } else { k_proj };
 
                 // 2. RoPE (unlikely for post-norm, but be general)
                 let (q_final, k_final) = if config.position_type == PositionType::RoPE {
@@ -1529,8 +1593,8 @@ impl PrefillGraph {
             let ffn_output_norm_w = b.next_weight_opt(layer.ffn_output_norm_w.is_some());
             let ffn_output_norm_b = b.next_weight_opt(layer.ffn_output_norm_b.is_some());
 
-            let _attn_q_norm_w = b.next_weight_opt(layer.attn_q_norm_w.is_some());
-            let _attn_k_norm_w = b.next_weight_opt(layer.attn_k_norm_w.is_some());
+            let attn_q_norm_w = b.next_weight_opt(layer.attn_q_norm_w.is_some());
+            let attn_k_norm_w = b.next_weight_opt(layer.attn_k_norm_w.is_some());
             let _attn_post_norm_w = b.next_weight_opt(layer.attn_post_norm_w.is_some());
             let _ffn_post_norm_w = b.next_weight_opt(layer.ffn_post_norm_w.is_some());
 
@@ -1568,23 +1632,35 @@ impl PrefillGraph {
                 let v_raw = b.alloc_slot(m * kv_dim * f32_size);
                 emit_linear_multi(&mut b, normed, w_v, v_bias, v_raw, kv_dim, h, v_dtype, m);
 
+                // 2b. Per-head Q/K RMSNorm (Qwen3) — M tokens × num_heads rows
+                let q_normed = if let Some(qn_w) = attn_q_norm_w {
+                    let slot = b.alloc_slot(m * total_dim * f32_size);
+                    b.emit_per_head_rms_norm(q_raw, qn_w, slot, m * config.num_heads, config.head_dim, config.norm_eps);
+                    slot
+                } else { q_raw };
+                let k_normed = if let Some(kn_w) = attn_k_norm_w {
+                    let slot = b.alloc_slot(m * kv_dim * f32_size);
+                    b.emit_per_head_rms_norm(k_raw, kn_w, slot, m * config.num_kv_heads, config.head_dim, config.norm_eps);
+                    slot
+                } else { k_raw };
+
                 // 3. RoPE (if configured) — multi-token, gz = M
                 let (q_final, k_final) = if config.position_type == PositionType::RoPE {
                     let q_rope = b.alloc_slot(m * total_dim * f32_size);
                     emit_rope_multi(
-                        &mut b, config.rope_neox, q_raw, q_rope,
+                        &mut b, config.rope_neox, q_normed, q_rope,
                         config.num_heads, config.head_dim, config.rope_dim,
                         config.rope_freq_base, m, rope_factors, yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(m * kv_dim * f32_size);
                     emit_rope_multi(
-                        &mut b, config.rope_neox, k_raw, k_rope,
+                        &mut b, config.rope_neox, k_normed, k_rope,
                         config.num_kv_heads, config.head_dim, config.rope_dim,
                         config.rope_freq_base, m, rope_factors, yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
-                    (q_raw, k_raw)
+                    (q_normed, k_normed)
                 };
 
                 // 4. Copy K, V into KV cache (M rows at once)
@@ -1640,22 +1716,34 @@ impl PrefillGraph {
                 let v_raw = b.alloc_slot(m * kv_dim * f32_size);
                 emit_linear_multi(&mut b, current_hidden, w_v, v_bias, v_raw, kv_dim, h, v_dtype, m);
 
+                // Per-head Q/K RMSNorm (Qwen3)
+                let q_normed = if let Some(qn_w) = attn_q_norm_w {
+                    let slot = b.alloc_slot(m * total_dim * f32_size);
+                    b.emit_per_head_rms_norm(q_raw, qn_w, slot, m * config.num_heads, config.head_dim, config.norm_eps);
+                    slot
+                } else { q_raw };
+                let k_normed = if let Some(kn_w) = attn_k_norm_w {
+                    let slot = b.alloc_slot(m * kv_dim * f32_size);
+                    b.emit_per_head_rms_norm(k_raw, kn_w, slot, m * config.num_kv_heads, config.head_dim, config.norm_eps);
+                    slot
+                } else { k_raw };
+
                 let (q_final, k_final) = if config.position_type == PositionType::RoPE {
                     let q_rope = b.alloc_slot(m * total_dim * f32_size);
                     emit_rope_multi(
-                        &mut b, config.rope_neox, q_raw, q_rope,
+                        &mut b, config.rope_neox, q_normed, q_rope,
                         config.num_heads, config.head_dim, config.rope_dim,
                         config.rope_freq_base, m, rope_factors, yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(m * kv_dim * f32_size);
                     emit_rope_multi(
-                        &mut b, config.rope_neox, k_raw, k_rope,
+                        &mut b, config.rope_neox, k_normed, k_rope,
                         config.num_kv_heads, config.head_dim, config.rope_dim,
                         config.rope_freq_base, m, rope_factors, yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
-                    (q_raw, k_raw)
+                    (q_normed, k_normed)
                 };
 
                 emit_copy_to_cache_multi(&mut b, k_final, k_cache, kv_dim, m, kv_f16);
@@ -1943,6 +2031,7 @@ fn emit_linear_multi(
                 let (pso, threadgroups, threads) = match dtype {
                     TensorDtype::Q8_0 => (PsoRef::QuantizedMatmulBiasQ8_0, ((n + 7) / 8) as u32, 128u32),
                     TensorDtype::Q4_0 => (PsoRef::QuantizedMatmulBiasQ4_0, ((n + 7) / 8) as u32, 64u32),
+                    TensorDtype::Q5_0 => (PsoRef::QuantizedMatmulBiasQ5_0, ((n + 7) / 8) as u32, 64u32),
                     TensorDtype::Q4_K => (PsoRef::QuantizedMatmulBiasQ4K, ((n + 3) / 4) as u32, 64u32),
                     TensorDtype::Q5_K => (PsoRef::QuantizedMatmulBiasQ5K, ((n + 3) / 4) as u32, 64u32),
                     TensorDtype::Q6_K => (PsoRef::QuantizedMatmulBiasQ6K, ((n + 3) / 4) as u32, 64u32),
@@ -1968,6 +2057,7 @@ fn emit_linear_multi(
                 let (pso, threadgroups, threads) = match dtype {
                     TensorDtype::Q8_0 => (PsoRef::QuantizedMatmulQ8_0, ((n + 7) / 8) as u32, 128u32),
                     TensorDtype::Q4_0 => (PsoRef::QuantizedMatmulQ4_0, ((n + 7) / 8) as u32, 64u32),
+                    TensorDtype::Q5_0 => (PsoRef::QuantizedMatmulQ5_0, ((n + 7) / 8) as u32, 64u32),
                     TensorDtype::Q4_K => (PsoRef::QuantizedMatmulQ4K, ((n + 3) / 4) as u32, 64u32),
                     TensorDtype::Q5_K => (PsoRef::QuantizedMatmulQ5K, ((n + 3) / 4) as u32, 64u32),
                     TensorDtype::Q6_K => (PsoRef::QuantizedMatmulQ6K, ((n + 3) / 4) as u32, 64u32),
@@ -2002,6 +2092,7 @@ fn emit_linear_multi(
                 let pso = match dtype {
                     TensorDtype::Q8_0 => PsoRef::BatchedMatmulBiasQ8_0,
                     TensorDtype::Q4_0 => PsoRef::BatchedMatmulBiasQ4_0,
+                    TensorDtype::Q5_0 => PsoRef::BatchedMatmulBiasQ5_0,
                     TensorDtype::Q4_K => PsoRef::BatchedMatmulBiasQ4K,
                     TensorDtype::Q5_K => PsoRef::BatchedMatmulBiasQ5K,
                     TensorDtype::Q6_K => PsoRef::BatchedMatmulBiasQ6K,
@@ -2028,6 +2119,7 @@ fn emit_linear_multi(
                 let pso = match dtype {
                     TensorDtype::Q8_0 => PsoRef::BatchedMatmulQ8_0,
                     TensorDtype::Q4_0 => PsoRef::BatchedMatmulQ4_0,
+                    TensorDtype::Q5_0 => PsoRef::BatchedMatmulQ5_0,
                     TensorDtype::Q4_K => PsoRef::BatchedMatmulQ4K,
                     TensorDtype::Q5_K => PsoRef::BatchedMatmulQ5K,
                     TensorDtype::Q6_K => PsoRef::BatchedMatmulQ6K,
@@ -4665,5 +4757,219 @@ mod tests {
                     "Linear {}: N param should be {}, got {}", linear_idx, expected_n, n_val);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Qwen3-style per-head Q/K norm tests
+    // -----------------------------------------------------------------------
+
+    fn qwen3_config() -> ModelConfig {
+        ModelConfig {
+            arch: ModelArch::Qwen3,
+            arch_name: "qwen3".to_string(),
+            hidden_size: 2048,
+            num_layers: 1,
+            num_heads: 16,
+            num_kv_heads: 4, // GQA
+            head_dim: 128,
+            ffn_hidden: 5632,
+            vocab_size: 32000,
+            max_seq_len: 2048,
+            norm_type: NormType::RMSNorm,
+            norm_eps: 1e-6,
+            activation: Activation::SwiGLU,
+            position_type: PositionType::RoPE,
+            rope_freq_base: 1000000.0,
+            rope_dim: 128,
+            rope_neox: true,
+            rope_scaling_original_ctx: 0,
+            rope_scaling_attn_factor: 1.0,
+            causal: true,
+            attn_logit_softcap: 0.0,
+            attn_scale: None,
+            embedding_scale: 1.0,
+            pooling_type: PoolingType::None,
+            has_ffn_gate: true,
+            has_bias: false,
+            pre_norm: true,
+        }
+    }
+
+    fn qwen3_weights(config: &ModelConfig) -> ModelWeights {
+        let h = config.hidden_size;
+        let ffn = config.ffn_hidden;
+        let v = config.vocab_size;
+        let kv_dim = config.num_kv_heads * config.head_dim;
+        let total_dim = config.num_heads * config.head_dim;
+        let qtype = TensorDtype::Q8_0;
+
+        let layers: Vec<LayerWeights> = (0..config.num_layers)
+            .map(|_| LayerWeights {
+                attn_norm_w: Some(dt(vec![h], TensorDtype::F32)),
+                attn_norm_b: None,
+                ffn_norm_w: Some(dt(vec![h], TensorDtype::F32)),
+                ffn_norm_b: None,
+                attn_output_norm_w: None,
+                attn_output_norm_b: None,
+                ffn_output_norm_w: None,
+                ffn_output_norm_b: None,
+                attn_q: dt(vec![total_dim, h], qtype),
+                attn_k: dt(vec![kv_dim, h], qtype),
+                attn_v: dt(vec![kv_dim, h], qtype),
+                attn_output: dt(vec![h, total_dim], qtype),
+                attn_q_bias: None,
+                attn_k_bias: None,
+                attn_v_bias: None,
+                attn_output_bias: None,
+                ffn_up: dt(vec![ffn, h], qtype),
+                ffn_down: dt(vec![h, ffn], qtype),
+                ffn_gate: Some(dt(vec![ffn, h], qtype)),
+                ffn_up_bias: None,
+                ffn_down_bias: None,
+                attn_q_norm_w: Some(dt(vec![config.head_dim], TensorDtype::F32)),
+                attn_k_norm_w: Some(dt(vec![config.head_dim], TensorDtype::F32)),
+                attn_post_norm_w: None,
+                ffn_post_norm_w: None,
+            })
+            .collect();
+
+        ModelWeights {
+            token_embedding: dt(vec![v, h], TensorDtype::F32),
+            position_embedding: None,
+            token_type_embedding: None,
+            embedding_norm_w: None,
+            embedding_norm_b: None,
+            layers,
+            output_norm_w: Some(dt(vec![h], TensorDtype::F32)),
+            output_norm_b: None,
+            output_projection: None,
+            rope_factors_short: None,
+            rope_factors_long: None,
+        }
+    }
+
+    #[test]
+    fn test_qwen3_decode_per_head_norm_ops() {
+        // Qwen3 with per-head Q/K norms should emit 2 extra RmsNorm ops per layer
+        // between QKV projections and RoPE.
+        let config = qwen3_config();
+        let weights = qwen3_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, false);
+
+        // LLaMA-like 1-layer baseline: 20 ops. With per-head Q/K norms: +2 RmsNorm = 22.
+        assert_eq!(graph.ops.len(), 22,
+            "Qwen3 1-layer decode: expected 22 ops (20 + 2 per-head norms), got {}", graph.ops.len());
+
+        // Op sequence: embed(0), norm(1), Q(2), K(3), V(4),
+        //   Q_norm(5), K_norm(6), RoPE_Q(7), RoPE_K(8), ...
+        assert_op_pso(&graph, 0, PsoRef::EmbeddingLookup);
+        assert_op_pso(&graph, 1, PsoRef::RmsNorm); // pre-attn norm
+        assert_op_pso(&graph, 2, PsoRef::QuantizedMatmulQ8_0); // Q
+        assert_op_pso(&graph, 3, PsoRef::QuantizedMatmulQ8_0); // K
+        assert_op_pso(&graph, 4, PsoRef::QuantizedMatmulQ8_0); // V
+        assert_op_pso(&graph, 5, PsoRef::RmsNorm); // per-head Q norm
+        assert_op_pso(&graph, 6, PsoRef::RmsNorm); // per-head K norm
+        assert_op_pso(&graph, 7, PsoRef::RopeNeox); // RoPE Q
+        assert_op_pso(&graph, 8, PsoRef::RopeNeox); // RoPE K
+
+        // Verify Q norm dispatch: rows = num_heads, cols = head_dim
+        let q_norm_op = &graph.ops[5];
+        let q_rows = q_norm_op.params.iter().find(|(_, idx)| *idx == 3).unwrap();
+        let q_cols = q_norm_op.params.iter().find(|(_, idx)| *idx == 4).unwrap();
+        if let (ParamValue::U32(rows), ParamValue::U32(cols)) = (q_rows.0, q_cols.0) {
+            assert_eq!(rows, config.num_heads as u32,
+                "Q per-head norm rows should be num_heads={}, got {}", config.num_heads, rows);
+            assert_eq!(cols, config.head_dim as u32,
+                "Q per-head norm cols should be head_dim={}, got {}", config.head_dim, cols);
+        } else {
+            panic!("Q norm params should be U32");
+        }
+
+        // Verify K norm dispatch: rows = num_kv_heads, cols = head_dim
+        let k_norm_op = &graph.ops[6];
+        let k_rows = k_norm_op.params.iter().find(|(_, idx)| *idx == 3).unwrap();
+        let k_cols = k_norm_op.params.iter().find(|(_, idx)| *idx == 4).unwrap();
+        if let (ParamValue::U32(rows), ParamValue::U32(cols)) = (k_rows.0, k_cols.0) {
+            assert_eq!(rows, config.num_kv_heads as u32,
+                "K per-head norm rows should be num_kv_heads={}, got {}", config.num_kv_heads, rows);
+            assert_eq!(cols, config.head_dim as u32,
+                "K per-head norm cols should be head_dim={}, got {}", config.head_dim, cols);
+        } else {
+            panic!("K norm params should be U32");
+        }
+    }
+
+    #[test]
+    fn test_qwen3_prefill_per_head_norm_ops() {
+        // Prefill graph should also emit per-head norms with M*num_heads rows.
+        let config = qwen3_config();
+        let weights = qwen3_weights(&config);
+        let m = 8;
+        let graph = PrefillGraph::build(&config, &weights, m, false);
+
+        // Count per-head RmsNorm ops: should have 2 extra (Q norm + K norm)
+        // compared to LLaMA baseline.
+        let llama_cfg = llama_1layer_config();
+        let llama_wts = llama_weights(&llama_cfg);
+        let llama_graph = PrefillGraph::build(&llama_cfg, &llama_wts, m, false);
+        let qwen3_rms_count = graph.ops.iter().filter(|op| op.pso == PsoRef::RmsNorm).count();
+        let llama_rms_count = llama_graph.ops.iter().filter(|op| op.pso == PsoRef::RmsNorm).count();
+        assert_eq!(qwen3_rms_count, llama_rms_count + 2,
+            "Qwen3 prefill should have 2 more RmsNorm ops than LLaMA: {} vs {}",
+            qwen3_rms_count, llama_rms_count);
+
+        // Find the per-head Q norm op: it should have rows = m * num_heads
+        // It comes after the 3 QKV matmuls and pre-attn norm
+        let per_head_rms_ops: Vec<&DecodeOp> = graph.ops.iter()
+            .filter(|op| {
+                if op.pso != PsoRef::RmsNorm { return false; }
+                // Per-head norms have rows = m * num_heads or m * num_kv_heads,
+                // NOT rows = m (regular layer norms have rows = m).
+                let rows_param = op.params.iter().find(|(_, idx)| *idx == 3);
+                if let Some((ParamValue::U32(rows), _)) = rows_param {
+                    *rows != m as u32  // exclude regular layer norms
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert_eq!(per_head_rms_ops.len(), 2,
+            "Should have exactly 2 per-head RmsNorm ops, got {}", per_head_rms_ops.len());
+
+        // Q norm: rows = m * num_heads, cols = head_dim
+        let q_norm = per_head_rms_ops[0];
+        let q_rows = q_norm.params.iter().find(|(_, idx)| *idx == 3).unwrap();
+        let q_cols = q_norm.params.iter().find(|(_, idx)| *idx == 4).unwrap();
+        if let (ParamValue::U32(rows), ParamValue::U32(cols)) = (q_rows.0, q_cols.0) {
+            assert_eq!(rows, (m * config.num_heads) as u32,
+                "Prefill Q norm rows should be m*num_heads={}, got {}",
+                m * config.num_heads, rows);
+            assert_eq!(cols, config.head_dim as u32);
+        }
+
+        // K norm: rows = m * num_kv_heads, cols = head_dim
+        let k_norm = per_head_rms_ops[1];
+        let k_rows = k_norm.params.iter().find(|(_, idx)| *idx == 3).unwrap();
+        let k_cols = k_norm.params.iter().find(|(_, idx)| *idx == 4).unwrap();
+        if let (ParamValue::U32(rows), ParamValue::U32(cols)) = (k_rows.0, k_cols.0) {
+            assert_eq!(rows, (m * config.num_kv_heads) as u32,
+                "Prefill K norm rows should be m*num_kv_heads={}, got {}",
+                m * config.num_kv_heads, rows);
+            assert_eq!(cols, config.head_dim as u32);
+        }
+    }
+
+    #[test]
+    fn test_llama_no_per_head_norm_ops() {
+        // LLaMA with attn_q_norm_w: None should NOT emit any per-head norm ops.
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, false);
+
+        // Should be exactly 3 RmsNorm ops: pre-attn, pre-ffn, final output
+        let rms_count = graph.ops.iter().filter(|op| op.pso == PsoRef::RmsNorm).count();
+        assert_eq!(rms_count, 3,
+            "LLaMA without per-head norms should have 3 RmsNorm ops, got {}", rms_count);
     }
 }

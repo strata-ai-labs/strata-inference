@@ -85,11 +85,11 @@ pub struct ModelWeights {
     pub output_projection: Option<DeviceTensor>,
 
     /// LongRoPE short frequency factors: [rope_dim/2], F32.
-    /// Used when sequence length < rope_scaling_original_ctx.
+    /// Used when sequence length <= rope_scaling_original_ctx.
     pub rope_factors_short: Option<DeviceTensor>,
 
     /// LongRoPE long frequency factors: [rope_dim/2], F32.
-    /// Used when sequence length >= rope_scaling_original_ctx.
+    /// Used when sequence length > rope_scaling_original_ctx.
     pub rope_factors_long: Option<DeviceTensor>,
 }
 

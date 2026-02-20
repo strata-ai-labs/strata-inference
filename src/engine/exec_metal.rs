@@ -185,6 +185,11 @@ impl MetalResources {
             // Phase 6: Multi-workgroup vec decode attention
             "attn_decode_vec_f16",           // AttnDecodeVecF16 = 41
             "attn_decode_vec_reduce_f16",    // AttnDecodeVecReduceF16 = 42
+            // Phase 7: Q5_0 quantized matmul
+            "quantized_matmul_q5_0",         // QuantizedMatmulQ5_0 = 43
+            "quantized_matmul_bias_q5_0",    // QuantizedMatmulBiasQ5_0 = 44
+            "batched_matmul_q5_0",           // BatchedMatmulQ5_0 = 45
+            "batched_matmul_bias_q5_0",      // BatchedMatmulBiasQ5_0 = 46
         ];
 
         let mut psos = Vec::with_capacity(kernel_names.len());

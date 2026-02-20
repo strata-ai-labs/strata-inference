@@ -122,7 +122,7 @@ struct MetalExecutor {
     f32_pos_emb_idx: Option<u16>,
     /// LongRoPE runtime factor swapping: index of rope_factors_short in weight_buf_ids.
     rope_short_weight_idx: Option<u16>,
-    /// Metal buffer ID for rope_factors_long (to swap in when seq_len >= original_ctx).
+    /// Metal buffer ID for rope_factors_long (to swap in when seq_len > original_ctx).
     rope_long_buf_id: Option<Id>,
     /// Original Metal buffer ID for rope_factors_short (to restore when seq_len < original_ctx).
     rope_short_buf_id: Option<Id>,
@@ -725,7 +725,7 @@ impl GenerationEngine {
                 if let (Some(si), Some(li), Some(sbi)) =
                     (m.rope_short_weight_idx, m.rope_long_buf_id, m.rope_short_buf_id)
                 {
-                    if self.config.max_seq_len >= self.config.rope_scaling_original_ctx {
+                    if self.config.max_seq_len > self.config.rope_scaling_original_ctx {
                         m.weight_buf_ids[si as usize] = li;
                     } else {
                         m.weight_buf_ids[si as usize] = sbi;
