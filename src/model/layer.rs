@@ -678,7 +678,7 @@ pub fn model_forward(
     // Same logic as model_forward_step: llama.cpp selects short vs long factors
     // based on configured n_ctx (max_seq_len), not the current sequence position.
     let rope_factors_data: Option<Vec<f32>> = if config.rope_scaling_original_ctx > 0 {
-        let factors_tensor = if config.max_seq_len >= config.rope_scaling_original_ctx {
+        let factors_tensor = if config.max_seq_len > config.rope_scaling_original_ctx {
             weights.rope_factors_long.as_ref()
         } else {
             weights.rope_factors_short.as_ref()
@@ -1144,7 +1144,7 @@ pub fn model_forward_step(
     // not the current sequence position.
     // mscale = rope_scaling_attn_factor (applied to cos/sin in RoPE).
     let rope_factors_data: Option<Vec<f32>> = if config.rope_scaling_original_ctx > 0 {
-        let factors_tensor = if config.max_seq_len >= config.rope_scaling_original_ctx {
+        let factors_tensor = if config.max_seq_len > config.rope_scaling_original_ctx {
             weights.rope_factors_long.as_ref()
         } else {
             weights.rope_factors_short.as_ref()
@@ -3367,9 +3367,9 @@ mod tests {
         }
         assert!(any_different, "LongRoPE factors should change outputs vs unfactored RoPE");
 
-        // Now test long factor selection: max_seq_len >= original_ctx → uses long factors
+        // Now test long factor selection: max_seq_len > original_ctx → uses long factors
         let mut config_long = config.clone();
-        config_long.max_seq_len = 128; // >= original_ctx=64
+        config_long.max_seq_len = 128; // > original_ctx=64
 
         let mut cache3 = KvCache::new(&config_long);
         let out_long = model_forward_step(input_ids, &weights_with_factors, &config_long, &b, &mut cache3).unwrap();
@@ -3482,7 +3482,8 @@ mod tests {
     #[test]
     fn test_model_forward_noncached_longrope_factor_selection_boundary() {
         // Test the boundary condition: max_seq_len == rope_scaling_original_ctx
-        // should select LONG factors (>= comparison).
+        // should select SHORT factors (> comparison, matching llama.cpp).
+        // Only max_seq_len > original_ctx selects LONG factors.
         let b = cpu();
         let hidden_size = 8;
         let num_heads = 2;
@@ -3516,10 +3517,13 @@ mod tests {
         config_eq.rope_neox = true;
         config_eq.rope_scaling_original_ctx = 64;
         config_eq.rope_scaling_attn_factor = 1.19;
-        config_eq.max_seq_len = 64; // == original_ctx → should pick LONG
+        config_eq.max_seq_len = 64; // == original_ctx → should pick SHORT (matching llama.cpp)
 
         let mut config_below = config_eq.clone();
-        config_below.max_seq_len = 63; // < original_ctx → should pick SHORT
+        config_below.max_seq_len = 32; // clearly < original_ctx → definitely SHORT
+
+        let mut config_above = config_eq.clone();
+        config_above.max_seq_len = 65; // > original_ctx → should pick LONG
 
         let input_ids = &[1u32, 3, 5];
         let mask = &[1.0f32, 1.0, 1.0];
@@ -3528,19 +3532,28 @@ mod tests {
 
         let out_eq = model_forward(input_ids, mask, &weights, &config_eq, &b, 0).unwrap();
         let out_below = model_forward(input_ids, mask, &weights, &config_below, &b, 0).unwrap();
+        let out_above = model_forward(input_ids, mask, &weights, &config_above, &b, 0).unwrap();
 
         let data_eq = out_eq.as_tensor().as_f32();
         let data_below = out_below.as_tensor().as_f32();
+        let data_above = out_above.as_tensor().as_f32();
 
-        // max_seq_len=64 (long) vs max_seq_len=63 (short) should differ
+        // 1) max_seq_len == original_ctx must match clearly-short (both pick short factors)
+        for i in 0..data_eq.len() {
+            assert!((data_eq[i] - data_below[i]).abs() < 1e-5,
+                "Boundary: == original_ctx should pick SHORT, but differs from clearly-short at [{}]: {} vs {}",
+                i, data_eq[i], data_below[i]);
+        }
+
+        // 2) max_seq_len > original_ctx must differ from short (picks long factors)
         let mut any_different = false;
         for i in 0..data_eq.len() {
-            if (data_eq[i] - data_below[i]).abs() > 1e-5 {
+            if (data_eq[i] - data_above[i]).abs() > 1e-5 {
                 any_different = true;
                 break;
             }
         }
         assert!(any_different,
-            "Boundary: max_seq_len == original_ctx (long) vs < (short) should produce different outputs");
+            "Boundary: max_seq_len > original_ctx (long) should differ from == (short)");
     }
 }
