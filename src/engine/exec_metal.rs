@@ -57,6 +57,12 @@ impl MetalBufferPool {
     pub(crate) fn len(&self) -> usize {
         self.buffers.len()
     }
+
+    /// Get the byte size of a pool slot.
+    #[allow(dead_code)]
+    pub(crate) fn slot_size(&self, slot: BufferSlot) -> usize {
+        self.buffers[slot.0 as usize].1
+    }
 }
 
 impl Drop for MetalBufferPool {
@@ -588,6 +594,7 @@ pub(crate) unsafe fn encode_prefill_profiled(
         let gpu_start = msg_send_f64(cmd, res.sels.gpu_start_time);
         let gpu_end = msg_send_f64(cmd, res.sels.gpu_end_time);
         timings.push((op.pso, gpu_end - gpu_start));
+
     }
 
     // Read logits from pool

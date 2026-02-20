@@ -826,6 +826,8 @@ fn multi_head_attention_cached(
     config: &ModelConfig,
     backend: &dyn ComputeBackend,
     longrope: Option<&LongRopeParams>,
+    rope_freq_base: f32,
+    swa_window: usize,
 ) -> Result<DeviceTensor, InferenceError> {
     let n_new = q.shape()[0];
     let num_heads = config.num_heads;
@@ -840,16 +842,16 @@ fn multi_head_attention_cached(
         if let Some(params) = longrope {
             // LongRoPE with per-dimension frequency factors and mscale
             rope_neox_with_factors(
-                &q, &k_new, pos_offset, config.rope_freq_base,
+                &q, &k_new, pos_offset, rope_freq_base,
                 head_dim, config.rope_dim, params.factors, params.mscale, backend,
             )
         } else if config.rope_neox {
             backend.rope_neox(
-                &q, &k_new, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
+                &q, &k_new, pos_offset, rope_freq_base, head_dim, config.rope_dim,
             )
         } else {
             backend.rope(
-                &q, &k_new, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
+                &q, &k_new, pos_offset, rope_freq_base, head_dim, config.rope_dim,
             )
         }
     } else {
@@ -858,8 +860,9 @@ fn multi_head_attention_cached(
 
     // =====================================================================
     // GPU FAST PATH: single-token decode with GPU-resident KV cache
+    // (skipped when SWA is active — the graph path handles SWA on Metal)
     // =====================================================================
-    if n_new == 1 && cache.is_gpu() {
+    if n_new == 1 && cache.is_gpu() && swa_window == 0 {
         let total_len = pos_offset + n_new;
         let attn_scale = config.attn_scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
 
@@ -879,8 +882,9 @@ fn multi_head_attention_cached(
 
     // =====================================================================
     // GPU FAST PATH: multi-token prefill with GPU-resident KV cache
+    // (skipped when SWA is active — the graph path handles SWA on Metal)
     // =====================================================================
-    if n_new > 1 && cache.is_gpu() {
+    if n_new > 1 && cache.is_gpu() && swa_window == 0 {
         let total_len = pos_offset + n_new;
         let attn_scale = config.attn_scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
 
@@ -960,18 +964,17 @@ fn multi_head_attention_cached(
             scores
         };
 
-        // Causal mask: needed during prefill (n_new > 1)
-        // For decode (n_new == 1), the single query naturally attends to all cached positions
-        let scores = if config.causal && n_new > 1 {
-            // Build causal mask for prefill: scores shape is [n_new, total_len]
-            // Query position i (absolute: pos_offset + i) can attend to
-            // key position j if j <= pos_offset + i
+        // Causal + SWA mask: needed during prefill (n_new > 1) or when SWA is active
+        let needs_mask = (config.causal && n_new > 1) || swa_window > 0;
+        let scores = if needs_mask {
             let scores_tensor = backend.download(&scores);
             let mut scores_data = scores_tensor.as_f32().to_vec();
             for i in 0..n_new {
                 let abs_pos = pos_offset + i;
                 for j in 0..total_len {
-                    if j > abs_pos {
+                    let causal_mask = config.causal && j > abs_pos;
+                    let swa_mask = swa_window > 0 && abs_pos >= j + swa_window;
+                    if causal_mask || swa_mask {
                         scores_data[i * total_len + j] = f32::NEG_INFINITY;
                     }
                 }
@@ -1007,6 +1010,8 @@ fn transformer_layer_forward_cached(
     backend: &dyn ComputeBackend,
     cache: &mut KvCache,
     longrope: Option<&LongRopeParams>,
+    rope_freq_base: f32,
+    swa_window: usize,
 ) -> Result<DeviceTensor, InferenceError> {
     trace!(layer = layer_idx, "transformer_layer_forward_cached");
 
@@ -1028,7 +1033,7 @@ fn transformer_layer_forward_cached(
             rms_norm_per_head(k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
         } else { k };
 
-        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend, longrope)?;
+        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend, longrope, rope_freq_base, swa_window)?;
 
         let projected = linear_forward(
             &attn_out, &layer.attn_output, layer.attn_output_bias.as_ref(), backend,
@@ -1063,7 +1068,7 @@ fn transformer_layer_forward_cached(
         let k = linear_forward(input, &layer.attn_k, layer.attn_k_bias.as_ref(), backend);
         let v = linear_forward(input, &layer.attn_v, layer.attn_v_bias.as_ref(), backend);
 
-        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend, longrope)?;
+        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend, longrope, rope_freq_base, swa_window)?;
 
         let projected = linear_forward(
             &attn_out, &layer.attn_output, layer.attn_output_bias.as_ref(), backend,
@@ -1164,8 +1169,19 @@ pub fn model_forward_step(
     // 7. Run through all transformer layers with cache
     for (i, layer) in weights.layers.iter().enumerate() {
         trace!(layer = i, "Running cached layer");
+        let layer_rope_base = if config.swa_layers.get(i).copied().unwrap_or(false) {
+            config.rope_freq_base_swa
+        } else {
+            config.rope_freq_base
+        };
+        let layer_swa_window = if config.swa_layers.get(i).copied().unwrap_or(false) {
+            config.swa_window
+        } else {
+            0
+        };
         hidden = transformer_layer_forward_cached(
             &hidden, layer, i, config, backend, cache, longrope_params.as_ref(),
+            layer_rope_base, layer_swa_window,
         )?;
     }
 
@@ -1230,6 +1246,9 @@ mod tests {
             has_ffn_gate: true,
             has_bias: false,
             pre_norm: true,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 
@@ -1263,6 +1282,9 @@ mod tests {
             has_ffn_gate: false,
             has_bias: true,
             pre_norm: false,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 
@@ -2525,6 +2547,9 @@ mod tests {
             has_ffn_gate: true,
             has_bias: false,
             pre_norm: true,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 
@@ -2920,6 +2945,9 @@ mod tests {
             has_ffn_gate: true,
             has_bias: false,
             pre_norm: true,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 

@@ -301,8 +301,42 @@ impl GenerationEngine {
         }
 
         let backend = Arc::new(MetalBackend::try_new()?);
-        let weights = ModelWeights::from_gguf(&gguf, &config, backend.as_ref())?;
+        let mut weights = ModelWeights::from_gguf(&gguf, &config, backend.as_ref())?;
         let tokenizer = create_tokenizer_from_gguf(&gguf)?;
+
+        // Precompute RoPE frequencies on CPU to avoid per-thread pow() divergence
+        // in the Metal kernel. Replace factors tensor with precomputed:
+        //   freqs[i] = pow(freq_base, -2*i / rope_dim) / factor[i]
+        if let Some(ref factors_tensor) = weights.rope_factors_short {
+            let half_rope = config.rope_dim / 2;
+            let inv_ndims = -1.0f32 / config.rope_dim as f32;
+            let factor_data = backend.download(factors_tensor);
+            let factor_values = factor_data.as_f32();
+            let mut precomputed = Vec::with_capacity(half_rope);
+            for i in 0..half_rope {
+                precomputed.push(
+                    config.rope_freq_base.powf(inv_ndims * (2 * i) as f32) / factor_values[i]
+                );
+            }
+            let cpu_tensor = Tensor::new(vec![half_rope], precomputed);
+            weights.rope_factors_short = Some(backend.upload(&cpu_tensor));
+            info!("Precomputed RoPE short frequencies on CPU for Metal kernel");
+        }
+        if let Some(ref factors_tensor) = weights.rope_factors_long {
+            let half_rope = config.rope_dim / 2;
+            let inv_ndims = -1.0f32 / config.rope_dim as f32;
+            let factor_data = backend.download(factors_tensor);
+            let factor_values = factor_data.as_f32();
+            let mut precomputed = Vec::with_capacity(half_rope);
+            for i in 0..half_rope {
+                precomputed.push(
+                    config.rope_freq_base.powf(inv_ndims * (2 * i) as f32) / factor_values[i]
+                );
+            }
+            let cpu_tensor = Tensor::new(vec![half_rope], precomputed);
+            weights.rope_factors_long = Some(backend.upload(&cpu_tensor));
+            info!("Precomputed RoPE long frequencies on CPU for Metal kernel");
+        }
 
         info!(
             arch = %config.arch_name,
@@ -318,7 +352,8 @@ impl GenerationEngine {
         // F16 KV cache halves memory bandwidth for attention, but LongRoPE with
         // LONG factors loses too much precision in F16, causing output divergence.
         // Use F32 KV cache when LONG factors are selected.
-        let use_long_factors = config.rope_scaling_original_ctx > 0
+        let has_rope_factors = config.rope_scaling_original_ctx > 0;
+        let use_long_factors = has_rope_factors
             && config.max_seq_len > config.rope_scaling_original_ctx;
         let kv_f16 = !use_long_factors;
         let mut decode_graph = DecodeGraph::build(&config, &weights, kv_f16);
@@ -368,6 +403,7 @@ impl GenerationEngine {
         // Weight(0) is always token_embedding
         if weights.token_embedding.dtype() != TensorDtype::F32 {
             let f32_tensor = backend.download(&weights.token_embedding).to_f32();
+
             let f32_dt = backend.upload(&f32_tensor);
             let f32_buf = extract_buffer_id(&f32_dt);
             let new_idx = weight_buf_ids.len() as u16;
@@ -578,6 +614,7 @@ impl GenerationEngine {
         )?;
 
         let logits = self.project_to_logits_cpu(&hidden, prompt_ids.len() - 1, backend.as_ref());
+
         let mut next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
         let prefill_duration = prefill_start.elapsed();
 
@@ -1194,6 +1231,9 @@ mod tests {
             has_ffn_gate: true,
             has_bias: false,
             pre_norm: true,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 

@@ -845,6 +845,7 @@ impl GraphBuilder {
         softcap: f32,
         kv_f16: bool,
         attn_temp_slot: Option<BufferSlot>,
+        swa_window: u32,
     ) {
         if kv_f16 {
             if let Some(temp) = attn_temp_slot {
@@ -873,6 +874,7 @@ impl GraphBuilder {
                         (ParamValue::TotalLen, 7),
                         (ParamValue::F32(attn_scale), 8),
                         (ParamValue::F32(softcap), 9),
+                        (ParamValue::U32(swa_window), 10),
                     ],
                     dispatch: DispatchDims::Fixed {
                         gx: num_heads as u32 * NWG, gy: 1, gz: 1,
@@ -922,6 +924,7 @@ impl GraphBuilder {
                 (ParamValue::TotalLen, 7),
                 (ParamValue::F32(attn_scale), 8),
                 (ParamValue::F32(softcap), 9),
+                (ParamValue::U32(swa_window), 10),
             ],
             dispatch: DispatchDims::Fixed {
                 gx: num_heads as u32, gy: 1, gz: 1,
@@ -1080,8 +1083,8 @@ impl DecodeGraph {
             // Per-head Q/K norms (Qwen3) and post-projection norms (GemmaEmbedding)
             let attn_q_norm_w = b.next_weight_opt(layer.attn_q_norm_w.is_some());
             let attn_k_norm_w = b.next_weight_opt(layer.attn_k_norm_w.is_some());
-            let _attn_post_norm_w = b.next_weight_opt(layer.attn_post_norm_w.is_some());
-            let _ffn_post_norm_w = b.next_weight_opt(layer.ffn_post_norm_w.is_some());
+            let attn_post_norm_w = b.next_weight_opt(layer.attn_post_norm_w.is_some());
+            let ffn_post_norm_w = b.next_weight_opt(layer.ffn_post_norm_w.is_some());
 
             // KV cache references for this layer
             let k_cache = BufferRef::KvCache((layer_idx * 2) as u16);
@@ -1095,6 +1098,18 @@ impl DecodeGraph {
             let up_dtype = layer.ffn_up.dtype();
             let down_dtype = layer.ffn_down.dtype();
             let gate_dtype = layer.ffn_gate.as_ref().map(|w| w.dtype());
+
+            // Per-layer ISWA: SWA layers use different RoPE freq base and sliding window
+            let layer_rope_base = if config.swa_layers.get(layer_idx).copied().unwrap_or(false) {
+                config.rope_freq_base_swa
+            } else {
+                config.rope_freq_base
+            };
+            let layer_swa_window: u32 = if config.swa_layers.get(layer_idx).copied().unwrap_or(false) {
+                config.swa_window as u32
+            } else {
+                0
+            };
 
             if config.pre_norm {
                 // ===========================================================
@@ -1138,13 +1153,13 @@ impl DecodeGraph {
                     let q_rope = b.alloc_slot(total_dim * f32_size);
                     b.emit_rope(
                         config.rope_neox, q_out, q_rope,
-                        config.num_heads, config.head_dim, config.rope_dim, config.rope_freq_base,
+                        config.num_heads, config.head_dim, config.rope_dim, layer_rope_base,
                         rope_factors, yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(kv_dim * f32_size);
                     b.emit_rope(
                         config.rope_neox, k_out, k_rope,
-                        config.num_kv_heads, config.head_dim, config.rope_dim, config.rope_freq_base,
+                        config.num_kv_heads, config.head_dim, config.rope_dim, layer_rope_base,
                         rope_factors, yarn_mscale,
                     );
                     (q_rope, k_rope)
@@ -1162,15 +1177,25 @@ impl DecodeGraph {
                     q_final, k_cache, v_cache, attn_out,
                     config.num_heads, config.num_kv_heads, config.head_dim,
                     attn_scale, config.attn_logit_softcap, kv_f16,
-                    attn_temp_slot,
+                    attn_temp_slot, layer_swa_window,
                 );
 
-                // 6. Output projection + residual
+                // 6. Output projection
                 let proj_raw = b.alloc_slot(h * f32_size);
                 let proj_out = b.emit_linear(attn_out, w_o, o_bias, proj_raw, h, total_dim, o_dtype);
 
+                // 6b. Post-attention norm (Gemma3: before residual add)
+                let proj_normed = if let Some(w) = attn_post_norm_w {
+                    let normed = b.alloc_slot(h * f32_size);
+                    b.emit_rms_norm(proj_out, w, normed, h, config.norm_eps);
+                    normed
+                } else {
+                    proj_out
+                };
+
+                // 6c. Residual
                 let residual = b.alloc_slot(h * f32_size);
-                b.emit_add(current_hidden, proj_out, residual, h);
+                b.emit_add(current_hidden, proj_normed, residual, h);
 
                 // 7. Pre-FFN norm
                 let normed2 = b.alloc_slot(h * f32_size);
@@ -1189,9 +1214,18 @@ impl DecodeGraph {
                     up_dtype, down_dtype, gate_dtype,
                 );
 
+                // 8b. Post-FFN norm (Gemma3: before residual add)
+                let ffn_normed = if let Some(w) = ffn_post_norm_w {
+                    let normed = b.alloc_slot(h * f32_size);
+                    b.emit_rms_norm(ffn_out, w, normed, h, config.norm_eps);
+                    normed
+                } else {
+                    ffn_out
+                };
+
                 // 9. Residual
                 let layer_out = b.alloc_slot(h * f32_size);
-                b.emit_add(residual, ffn_out, layer_out, h);
+                b.emit_add(residual, ffn_normed, layer_out, h);
                 current_hidden = layer_out;
 
             } else {
@@ -1226,13 +1260,13 @@ impl DecodeGraph {
                     let q_rope = b.alloc_slot(total_dim * f32_size);
                     b.emit_rope(
                         config.rope_neox, q_out, q_rope,
-                        config.num_heads, config.head_dim, config.rope_dim, config.rope_freq_base,
+                        config.num_heads, config.head_dim, config.rope_dim, layer_rope_base,
                         rope_factors, yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(kv_dim * f32_size);
                     b.emit_rope(
                         config.rope_neox, k_out, k_rope,
-                        config.num_kv_heads, config.head_dim, config.rope_dim, config.rope_freq_base,
+                        config.num_kv_heads, config.head_dim, config.rope_dim, layer_rope_base,
                         rope_factors, yarn_mscale,
                     );
                     (q_rope, k_rope)
@@ -1250,7 +1284,7 @@ impl DecodeGraph {
                     q_final, k_cache, v_cache, attn_out,
                     config.num_heads, config.num_kv_heads, config.head_dim,
                     attn_scale, config.attn_logit_softcap, kv_f16,
-                    attn_temp_slot,
+                    attn_temp_slot, layer_swa_window,
                 );
 
                 // 5. Output projection + residual
@@ -1300,9 +1334,11 @@ impl DecodeGraph {
 
         // Logits projection: [1, hidden_size] x [vocab_size, hidden_size]^T -> [1, vocab_size]
         let proj_weight = output_proj.unwrap_or(token_emb); // tied embeddings fallback
+        // When output_projection is None (tied embeddings), the token_embedding
+        // buffer is pre-converted to F32 by generate.rs — so use F32 dtype.
         let proj_dtype = weights.output_projection.as_ref()
             .map(|w| w.dtype())
-            .unwrap_or(weights.token_embedding.dtype());
+            .unwrap_or(TensorDtype::F32);
 
         let logits_raw = b.alloc_slot(config.vocab_size * f32_size);
         let logits_slot = b.emit_linear(
@@ -1479,21 +1515,20 @@ pub(crate) struct PrefillGraph {
     pub kv_f16: bool,
 }
 
-/// Patch EmbeddingLookup ops in an op list to use a different weight index.
+/// Patch all ops that reference `old_ref` to use `new_ref` instead.
 ///
-/// Generic over both DecodeGraph and PrefillGraph ops.
+/// Used to redirect EmbeddingLookup (and tied-embedding logits projection)
+/// to a pre-converted F32 weight buffer.
 pub(crate) fn patch_ops(ops: &mut Vec<DecodeOp>, old_ref: BufferRef, new_ref: BufferRef) {
     for op in ops.iter_mut() {
-        if op.pso == PsoRef::EmbeddingLookup {
-            for binding in &mut op.bindings {
-                if binding.0 == old_ref && binding.1 == 0 {
-                    binding.0 = new_ref;
-                }
+        for binding in &mut op.bindings {
+            if binding.0 == old_ref {
+                binding.0 = new_ref;
             }
-            for read in &mut op.reads {
-                if *read == old_ref {
-                    *read = new_ref;
-                }
+        }
+        for read in &mut op.reads {
+            if *read == old_ref {
+                *read = new_ref;
             }
         }
     }
@@ -1606,8 +1641,8 @@ impl PrefillGraph {
 
             let attn_q_norm_w = b.next_weight_opt(layer.attn_q_norm_w.is_some());
             let attn_k_norm_w = b.next_weight_opt(layer.attn_k_norm_w.is_some());
-            let _attn_post_norm_w = b.next_weight_opt(layer.attn_post_norm_w.is_some());
-            let _ffn_post_norm_w = b.next_weight_opt(layer.ffn_post_norm_w.is_some());
+            let attn_post_norm_w = b.next_weight_opt(layer.attn_post_norm_w.is_some());
+            let ffn_post_norm_w = b.next_weight_opt(layer.ffn_post_norm_w.is_some());
 
             let k_cache = BufferRef::KvCache((layer_idx * 2) as u16);
             let v_cache = BufferRef::KvCache((layer_idx * 2 + 1) as u16);
@@ -1619,6 +1654,18 @@ impl PrefillGraph {
             let up_dtype = layer.ffn_up.dtype();
             let down_dtype = layer.ffn_down.dtype();
             let gate_dtype = layer.ffn_gate.as_ref().map(|w| w.dtype());
+
+            // Per-layer ISWA: SWA layers use different RoPE freq base and sliding window
+            let layer_rope_base = if config.swa_layers.get(layer_idx).copied().unwrap_or(false) {
+                config.rope_freq_base_swa
+            } else {
+                config.rope_freq_base
+            };
+            let layer_swa_window: u32 = if config.swa_layers.get(layer_idx).copied().unwrap_or(false) {
+                config.swa_window as u32
+            } else {
+                0
+            };
 
             if config.pre_norm {
                 // ===========================================================
@@ -1661,13 +1708,13 @@ impl PrefillGraph {
                     emit_rope_multi(
                         &mut b, config.rope_neox, q_normed, q_rope,
                         config.num_heads, config.head_dim, config.rope_dim,
-                        config.rope_freq_base, m, rope_factors, yarn_mscale,
+                        layer_rope_base, m, rope_factors, yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(m * kv_dim * f32_size);
                     emit_rope_multi(
                         &mut b, config.rope_neox, k_normed, k_rope,
                         config.num_kv_heads, config.head_dim, config.rope_dim,
-                        config.rope_freq_base, m, rope_factors, yarn_mscale,
+                        layer_rope_base, m, rope_factors, yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
@@ -1684,14 +1731,25 @@ impl PrefillGraph {
                     &mut b, q_final, k_cache, v_cache, attn_out,
                     config.num_heads, config.num_kv_heads, config.head_dim,
                     attn_scale, config.attn_logit_softcap, m, kv_f16,
+                    layer_swa_window,
                 );
 
-                // 6. Output projection + residual [M, total_dim] -> [M, h]
+                // 6. Output projection [M, total_dim] -> [M, h]
                 let proj_raw = b.alloc_slot(m * h * f32_size);
                 emit_linear_multi(&mut b, attn_out, w_o, o_bias, proj_raw, h, total_dim, o_dtype, m);
 
+                // 6b. Post-attention norm (Gemma3: before residual add)
+                let proj_normed = if let Some(w) = attn_post_norm_w {
+                    let normed = b.alloc_slot(m * h * f32_size);
+                    emit_rms_norm_multi(&mut b, proj_raw, w, normed, h, m, config.norm_eps);
+                    normed
+                } else {
+                    proj_raw
+                };
+
+                // 6c. Residual
                 let residual = b.alloc_slot(m * h * f32_size);
-                emit_add_multi(&mut b, current_hidden, proj_raw, residual, m * h);
+                emit_add_multi(&mut b, current_hidden, proj_normed, residual, m * h);
 
                 // 7. Pre-FFN norm [M, h] -> [M, h]
                 let normed2 = b.alloc_slot(m * h * f32_size);
@@ -1708,9 +1766,18 @@ impl PrefillGraph {
                     up_dtype, down_dtype, gate_dtype, m,
                 );
 
+                // 8b. Post-FFN norm (Gemma3: before residual add)
+                let ffn_normed = if let Some(w) = ffn_post_norm_w {
+                    let normed = b.alloc_slot(m * h * f32_size);
+                    emit_rms_norm_multi(&mut b, ffn_out, w, normed, h, m, config.norm_eps);
+                    normed
+                } else {
+                    ffn_out
+                };
+
                 // 9. Residual
                 let layer_out = b.alloc_slot(m * h * f32_size);
-                emit_add_multi(&mut b, residual, ffn_out, layer_out, m * h);
+                emit_add_multi(&mut b, residual, ffn_normed, layer_out, m * h);
                 current_hidden = layer_out;
 
             } else {
@@ -1744,13 +1811,13 @@ impl PrefillGraph {
                     emit_rope_multi(
                         &mut b, config.rope_neox, q_normed, q_rope,
                         config.num_heads, config.head_dim, config.rope_dim,
-                        config.rope_freq_base, m, rope_factors, yarn_mscale,
+                        layer_rope_base, m, rope_factors, yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(m * kv_dim * f32_size);
                     emit_rope_multi(
                         &mut b, config.rope_neox, k_normed, k_rope,
                         config.num_kv_heads, config.head_dim, config.rope_dim,
-                        config.rope_freq_base, m, rope_factors, yarn_mscale,
+                        layer_rope_base, m, rope_factors, yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
@@ -1765,6 +1832,7 @@ impl PrefillGraph {
                     &mut b, q_final, k_cache, v_cache, attn_out,
                     config.num_heads, config.num_kv_heads, config.head_dim,
                     attn_scale, config.attn_logit_softcap, m, kv_f16,
+                    layer_swa_window,
                 );
 
                 let proj_raw = b.alloc_slot(m * h * f32_size);
@@ -1831,9 +1899,11 @@ impl PrefillGraph {
 
         // Logits projection: [1, h] -> [1, vocab_size]
         let proj_weight = output_proj.unwrap_or(token_emb);
+        // When output_projection is None (tied embeddings), the token_embedding
+        // buffer is pre-converted to F32 by generate.rs — so use F32 dtype.
         let proj_dtype = weights.output_projection.as_ref()
             .map(|w| w.dtype())
-            .unwrap_or(weights.token_embedding.dtype());
+            .unwrap_or(TensorDtype::F32);
 
         let logits_raw = b.alloc_slot(config.vocab_size * f32_size);
         // Single-row logits projection (same as decode)
@@ -1976,6 +2046,36 @@ fn emit_norm_multi(
             });
         }
     }
+}
+
+/// Multi-token RMSNorm (no bias). Used for post-projection norms (Gemma3)
+/// where we need to normalize M rows independently.
+fn emit_rms_norm_multi(
+    b: &mut GraphBuilder,
+    input: BufferSlot,
+    weight: BufferRef,
+    out: BufferSlot,
+    cols: usize,
+    n_tokens: usize,
+    eps: f32,
+) {
+    let threads_per_group = (cols.next_power_of_two()).min(256) as u32;
+    b.ops.push(DecodeOp {
+        pso: PsoRef::RmsNorm,
+        bindings: vec![
+            (BufferRef::Pool(input), 0, 0),
+            (weight, 1, 0),
+            (BufferRef::Pool(out), 2, 0),
+        ],
+        params: vec![
+            (ParamValue::U32(n_tokens as u32), 3),
+            (ParamValue::U32(cols as u32), 4),
+            (ParamValue::F32(eps), 5),
+        ],
+        dispatch: DispatchDims::Rows { num_rows: n_tokens as u32, threads_per_group },
+        reads: vec![BufferRef::Pool(input), weight],
+        writes: Some(BufferRef::Pool(out)),
+    });
 }
 
 /// Multi-token linear: both quantized and F32 matmuls use native M>1 via the M
@@ -2311,6 +2411,7 @@ fn emit_batched_attention(
     softcap: f32,
     n_tokens: usize,
     kv_f16: bool,
+    swa_window: u32,
 ) {
     let pso = if kv_f16 { PsoRef::BatchedCausalAttentionF16 } else { PsoRef::BatchedCausalAttention };
     // gid = q_idx * num_heads + h, so dispatch n_tokens * num_heads groups
@@ -2331,6 +2432,7 @@ fn emit_batched_attention(
             (ParamValue::PrefillPosOffset, 9),  // pos_offset = 0 for initial prefill
             (ParamValue::F32(attn_scale), 10),
             (ParamValue::F32(softcap), 11),
+            (ParamValue::U32(swa_window), 12),
         ],
         dispatch: DispatchDims::Fixed {
             gx: (n_tokens * num_heads) as u32, gy: 1, gz: 1,
@@ -2503,6 +2605,9 @@ mod tests {
             has_ffn_gate: false,
             has_bias: true,
             pre_norm: true,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 
@@ -2535,6 +2640,9 @@ mod tests {
             has_ffn_gate: true,
             has_bias: false,
             pre_norm: true,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 
@@ -2939,6 +3047,9 @@ mod tests {
             has_ffn_gate: true,
             has_bias: false,
             pre_norm: true,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 
@@ -4803,6 +4914,9 @@ mod tests {
             has_ffn_gate: true,
             has_bias: false,
             pre_norm: true,
+            swa_window: 0,
+            swa_layers: vec![],
+            rope_freq_base_swa: 10000.0,
         }
     }
 

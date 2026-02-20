@@ -112,6 +112,14 @@ pub struct ModelConfig {
 
     // Norm ordering: true = pre-norm (Gemma/LLaMA), false = post-norm (BERT)
     pub pre_norm: bool,
+
+    // Sliding window attention (ISWA)
+    /// Sliding window size for SWA layers (0 = no SWA).
+    pub swa_window: usize,
+    /// Per-layer flag: true = this layer uses sliding window attention.
+    pub swa_layers: Vec<bool>,
+    /// RoPE frequency base for SWA layers (default 10000.0).
+    pub rope_freq_base_swa: f32,
 }
 
 impl ModelConfig {
@@ -207,6 +215,16 @@ impl ModelConfig {
 
         let attn_scale = gguf
             .get_f32(&format!("{}.attention.scale", arch_name));
+
+        // ---- Sliding window attention (ISWA) ----
+        let swa_window = gguf
+            .get_u32(&format!("{}.attention.sliding_window", arch_name))
+            .map(|v| v as usize)
+            .unwrap_or(0);
+
+        let rope_freq_base_swa = gguf
+            .get_f32(&format!("{}.rope.freq_base_swa", arch_name))
+            .unwrap_or(10000.0);
 
         // ---- Vocab size (with fallback to tokenizer.ggml.tokens array length) ----
         let vocab_size = gguf
@@ -360,6 +378,14 @@ impl ModelConfig {
             )));
         }
 
+        // Compute per-layer SWA flags.
+        // Gemma3 uses set_swa_pattern(6): layers il where il % 6 < 5 are SWA.
+        let swa_layers = if swa_window > 0 && matches!(arch, ModelArch::Gemma3) {
+            (0..num_layers).map(|il| il % 6 < 5).collect()
+        } else {
+            vec![false; num_layers]
+        };
+
         let config = ModelConfig {
             arch,
             arch_name,
@@ -388,6 +414,9 @@ impl ModelConfig {
             has_ffn_gate,
             has_bias,
             pre_norm,
+            swa_window,
+            swa_layers,
+            rope_freq_base_swa,
         };
 
         info!(
@@ -411,6 +440,7 @@ impl ModelConfig {
             embedding_scale = config.embedding_scale,
             has_ffn_gate = config.has_ffn_gate,
             has_bias = config.has_bias,
+            swa_window = config.swa_window,
             "model config loaded from GGUF"
         );
 
