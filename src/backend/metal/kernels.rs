@@ -22,13 +22,13 @@ using namespace metal;
 // Constants
 // =========================================================================
 
-// Simdgroup-matrix GEMM tiling constants (64x32 tiles, 4 simdgroups of 32)
+// Simdgroup-matrix GEMM tiling constants (32x32 tiles, 4 simdgroups of 32)
 constant constexpr uint BM = 32;
 constant constexpr uint BN = 32;
 constant constexpr uint BK = 32;
 
 // Batched GEMM tiling constants (64x32 tiles for higher arithmetic intensity)
-constant constexpr uint BBM = 64;  // Batched M-tile
+constant constexpr uint BBM = 64;  // Batched M-tile (doubled for prefill throughput)
 constant constexpr uint BBN = 32;  // Batched N-tile
 constant constexpr uint BBK = 32;  // Batched K-tile
 
@@ -1967,9 +1967,17 @@ kernel void gemm_transpose_bias(
 // -----------------------------------------------------------------------
 // grouped_attn_decode_f16 — Online softmax attention reading F16 K/V cache
 //
-//   Single-pass online softmax (Milakov & Gimelshein 2018):
-//   No separate max-finding pass needed. Updates running max, running sum,
-//   and V accumulator in a single scan over positions.
+//   SIMD-group-parallel online softmax:
+//   256 threads = 8 SIMD groups of 32.  Step A uses all 256 threads to
+//   compute QK scores (one per thread, float4 vectorized).
+//   Step B splits the 256 positions across 8 SIMD groups (32 each), with
+//   each thread handling ceil(head_dim/32) output dimensions.  This gives
+//   8x less sequential work per tile vs the single-group approach where
+//   only head_dim threads were active (and the rest idle at barriers).
+//
+//   After processing all tiles, the 8 partial online softmax states are
+//   merged with the standard correction formula:
+//     merged_v = v_a * exp(max_a - merged_max) + v_b * exp(max_b - merged_max)
 //
 //   Reads F16 K and V cache (half the bandwidth of F32).
 //   Q is still F32 (comes from matmul output).
@@ -1997,59 +2005,253 @@ kernel void grouped_attn_decode_f16(
     device const float* q_head = Q + h * head_dim;
     uint kv_off = kv_head * head_dim;
 
+    // SIMD group index (0..7) and thread index within group (0..31)
+    uint sg = lid / 32;
+    uint si = lid % 32;
+
+    // Shared memory for scores
     threadgroup float shared[256];
 
-    // ---- Single-pass online softmax ----
-    // Each thread processes positions strided by tpg, maintaining its own
-    // running_max, running_sum, and v_acc (for its output dimension lid).
-    float running_max = -INFINITY;
-    float running_sum = 0.0f;
-    float v_acc = 0.0f;
+    // Number of output dimensions per thread: ceil(head_dim / 32)
+    // Supports head_dim up to 256 (max dims_per_thread = 8)
+    uint dpt = (head_dim + 31) / 32;
+
+    // Per-SIMD-group online softmax state (maintained across ALL tiles).
+    // Each SIMD group processes a different 32-position slice per tile.
+    float sg_max = -INFINITY;
+    float sg_sum = 0.0f;
+    float sg_v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
     for (uint tile = 0; tile < total_len; tile += tpg) {
         uint j = tile + lid;
 
-        // Step A: each thread computes score for position j
+        // Step A: each thread computes score for position j (float4 vectorized)
         float score = -INFINITY;
         if (j < total_len) {
             float dot = 0.0f;
-            for (uint d = 0; d < head_dim; ++d) {
-                dot += q_head[d] * float(K[j * kv_dim + kv_off + d]);
+            device const half* k_row = K + j * kv_dim + kv_off;
+            for (uint d = 0; d < head_dim; d += 4) {
+                float4 q4 = *(device const float4*)(q_head + d);
+                half4  k4 = *(device const half4*)(k_row + d);
+                float4 kf = float4(k4);
+                dot += q4.x * kf.x + q4.y * kf.y + q4.z * kf.z + q4.w * kf.w;
             }
             score = dot * attn_scale;
             if (softcap > 0.0f) {
                 score = softcap * precise::tanh(score / softcap);
             }
         }
-        // Store score in shared memory so all threads can access all scores in this tile
         shared[lid] = score;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Step B: threads parallel over head_dim dimensions
-        // For each position in this tile, update online softmax state
-        uint active = min(tpg, total_len - tile);
-        if (lid < head_dim) {
-            for (uint t = 0; t < active; ++t) {
-                float s = shared[t];
-                if (s > running_max) {
-                    float correction = exp(running_max - s);
-                    running_sum = running_sum * correction + 1.0f;
-                    v_acc = v_acc * correction + float(V[(tile + t) * kv_dim + kv_off + lid]);
-                    running_max = s;
-                } else {
-                    float w = exp(s - running_max);
-                    running_sum += w;
-                    v_acc += w * float(V[(tile + t) * kv_dim + kv_off + lid]);
+        // Step B: SIMD-group-parallel V accumulation.
+        // Each of 8 SIMD groups processes 32 consecutive positions.
+        // Within a group, each thread handles dpt output dimensions.
+        uint pos_base = sg * 32;
+        uint tile_active = min(tpg, total_len - tile);
+        uint pos_end = min(pos_base + 32, tile_active);
+
+        for (uint t = pos_base; t < pos_end; ++t) {
+            float s = shared[t];
+            device const half* v_row = V + (tile + t) * kv_dim + kv_off;
+            if (s > sg_max) {
+                float correction = exp(sg_max - s);
+                sg_sum = sg_sum * correction + 1.0f;
+                for (uint di = 0; di < dpt; ++di) {
+                    uint d = si + di * 32;
+                    if (d < head_dim) {
+                        sg_v[di] = sg_v[di] * correction + float(v_row[d]);
+                    }
+                }
+                sg_max = s;
+            } else {
+                float w = exp(s - sg_max);
+                sg_sum += w;
+                for (uint di = 0; di < dpt; ++di) {
+                    uint d = si + di * 32;
+                    if (d < head_dim) {
+                        sg_v[di] += w * float(v_row[d]);
+                    }
                 }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write normalized output
-    if (lid < head_dim) {
+    // ---- Merge across 8 SIMD groups ----
+    // Each group has partial (sg_max, sg_sum, sg_v[]) for its position slice.
+    // Store to shared memory, then group 0 merges all.
+    threadgroup float sg_maxs[8];
+    threadgroup float sg_sums[8];
+    threadgroup float sg_vs[8 * 256]; // 8 groups × max 256 head_dim
+
+    // Store partial state (only thread 0 per group writes max/sum)
+    if (si == 0) {
+        sg_maxs[sg] = sg_max;
+        sg_sums[sg] = sg_sum;
+    }
+    for (uint di = 0; di < dpt; ++di) {
+        uint d = si + di * 32;
+        if (d < head_dim) {
+            sg_vs[sg * 256 + d] = sg_v[di];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Group 0 merges all partial results and writes output
+    if (sg == 0) {
+        float m_max = sg_maxs[0];
+        float m_sum = sg_sums[0];
+        float m_v[8];
+        for (uint di = 0; di < dpt; ++di) {
+            uint d = si + di * 32;
+            m_v[di] = (d < head_dim) ? sg_vs[d] : 0.0f;
+        }
+
+        for (uint g = 1; g < 8; ++g) {
+            float g_max = sg_maxs[g];
+            float g_sum = sg_sums[g];
+            if (g_sum == 0.0f) continue; // empty group (no valid positions)
+
+            float new_max = max(m_max, g_max);
+            float c_old = exp(m_max - new_max);
+            float c_new = exp(g_max - new_max);
+
+            m_sum = m_sum * c_old + g_sum * c_new;
+            for (uint di = 0; di < dpt; ++di) {
+                uint d = si + di * 32;
+                if (d < head_dim) {
+                    m_v[di] = m_v[di] * c_old + sg_vs[g * 256 + d] * c_new;
+                }
+            }
+            m_max = new_max;
+        }
+
+        // Write normalized output
         device float* out_head = output + h * head_dim;
-        out_head[lid] = (running_sum > 0.0f) ? (v_acc / running_sum) : 0.0f;
+        for (uint di = 0; di < dpt; ++di) {
+            uint d = si + di * 32;
+            if (d < head_dim) {
+                out_head[d] = (m_sum > 0.0f) ? (m_v[di] / m_sum) : 0.0f;
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Multi-workgroup vec decode attention (two-kernel approach)
+// ===========================================================================
+
+// attn_decode_vec_f16 — NWG=32 workgroups per head, each with 1 SIMD group.
+// Each workgroup processes strided KV positions (iwg, iwg+NWG, ...).
+// Partial online-softmax results (V, S, M) written to temp buffer for reduce.
+//
+// Temp buffer layout:
+//   [num_heads * NWG * head_dim] floats — V accumulators per workgroup
+//   [num_heads * NWG * 2]        floats — (S, M) pairs per workgroup
+//
+// Dispatch: gx = num_heads * NWG (e.g. 32*32 = 1024), tx = 32
+kernel void attn_decode_vec_f16(
+    device const float* Q       [[buffer(0)]],   // [num_heads * head_dim]
+    device const half*  K       [[buffer(1)]],   // [max_len * kv_dim]
+    device const half*  V       [[buffer(2)]],   // [max_len * kv_dim]
+    device       float* dst     [[buffer(3)]],   // temp buffer
+    constant     uint&  num_heads    [[buffer(4)]],
+    constant     uint&  num_kv_heads [[buffer(5)]],
+    constant     uint&  head_dim     [[buffer(6)]],
+    constant     uint&  total_len    [[buffer(7)]],
+    constant     float& attn_scale   [[buffer(8)]],
+    constant     float& softcap      [[buffer(9)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]])
+{
+    const uint NWG = 32;
+    uint h   = tgpig.x / NWG;
+    uint iwg = tgpig.x % NWG;
+    if (h >= num_heads) return;
+
+    uint kv_head = h * num_kv_heads / num_heads;
+    uint kv_off  = kv_head * head_dim;
+    uint kv_dim  = num_kv_heads * head_dim;
+    device const float* q_head = Q + h * head_dim;
+    uint dpt = (head_dim + 31) / 32;
+
+    float M = -INFINITY, S = 0.0f;
+    float v_acc[8] = {0,0,0,0,0,0,0,0};
+
+    for (uint pos = iwg; pos < total_len; pos += NWG) {
+        // Q·K^T via simd_sum
+        device const half* k_row = K + pos * kv_dim + kv_off;
+        float partial = 0.0f;
+        for (uint di = 0; di < dpt; ++di) {
+            uint d = tiisg + di * 32;
+            if (d < head_dim) partial += q_head[d] * float(k_row[d]);
+        }
+        float score = simd_sum(partial) * attn_scale;
+        if (softcap > 0.0f) score = softcap * precise::tanh(score / softcap);
+
+        // Online softmax + V accumulation
+        device const half* v_row = V + pos * kv_dim + kv_off;
+        float old_M = M;
+        M = max(M, score);
+        float c = exp(old_M - M), w = exp(score - M);
+        S = S * c + w;
+        for (uint di = 0; di < dpt; ++di) {
+            uint d = tiisg + di * 32;
+            if (d < head_dim) v_acc[di] = v_acc[di] * c + w * float(v_row[d]);
+        }
+    }
+
+    // Write partial results: V contiguous per workgroup, then S/M
+    for (uint di = 0; di < dpt; ++di) {
+        uint d = tiisg + di * 32;
+        if (d < head_dim)
+            dst[h * NWG * head_dim + iwg * head_dim + d] = v_acc[di];
+    }
+    if (tiisg == 0) {
+        device float* sm = dst + num_heads * NWG * head_dim;
+        sm[h * NWG * 2 + iwg * 2 + 0] = S;
+        sm[h * NWG * 2 + iwg * 2 + 1] = M;
+    }
+}
+
+// attn_decode_vec_reduce_f16 — Reduce NWG=32 partial results per head.
+// Each thread i in a SIMD group handles workgroup i's partial results.
+// Uses simd_max for global max, simd_sum for reducing V.
+//
+// Dispatch: gx = num_heads (e.g. 32), tx = 32
+kernel void attn_decode_vec_reduce_f16(
+    device const float* src     [[buffer(0)]],   // temp buffer from vec kernel
+    device       float* output  [[buffer(1)]],   // [num_heads * head_dim]
+    constant     uint&  num_heads  [[buffer(2)]],
+    constant     uint&  head_dim   [[buffer(3)]],
+    uint gid   [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]])
+{
+    const uint NWG = 32;
+    uint h = gid;
+    if (h >= num_heads) return;
+    uint iwg = tiisg;  // thread i handles workgroup i
+
+    // Read S, M for this workgroup
+    device const float* sm = src + num_heads * NWG * head_dim;
+    float S = sm[h * NWG * 2 + iwg * 2 + 0];
+    float M = sm[h * NWG * 2 + iwg * 2 + 1];
+
+    float global_M = simd_max(M);
+    float ms = exp(M - global_M);
+    float global_S = simd_sum(S * ms);
+    float inv_S = (global_S > 0.0f) ? (1.0f / global_S) : 0.0f;
+
+    // Reduce V per dimension (float4 vectorized)
+    device const float* v_base = src + h * NWG * head_dim;
+    for (uint d4 = 0; d4 < head_dim; d4 += 4) {
+        float4 v = *(device const float4*)(v_base + iwg * head_dim + d4);
+        float4 r = float4(
+            simd_sum(v.x * ms), simd_sum(v.y * ms),
+            simd_sum(v.z * ms), simd_sum(v.w * ms));
+        if (tiisg == 0)
+            *(device float4*)(output + h * head_dim + d4) = r * inv_S;
     }
 }
 
@@ -2274,16 +2476,24 @@ kernel void batched_matmul_q8_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Vectorized A-loading with row clamping — always takes the fast float4 path.
-        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
-        // K is always a multiple of BBK for all supported quant types, so no K boundary.
-        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-            uint base = idx * 4;
-            uint r = base / BBK;
-            uint c = base % BBK;
-            uint gr = min(tile_row + r, M - 1);
-            float4 v = *(device const float4*)(input + gr * K + k_base + c);
-            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2388,16 +2598,24 @@ kernel void batched_matmul_bias_q8_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Vectorized A-loading with row clamping — always takes the fast float4 path.
-        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
-        // K is always a multiple of BBK for all supported quant types, so no K boundary.
-        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-            uint base = idx * 4;
-            uint r = base / BBK;
-            uint c = base % BBK;
-            uint gr = min(tile_row + r, M - 1);
-            float4 v = *(device const float4*)(input + gr * K + k_base + c);
-            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2493,16 +2711,24 @@ kernel void batched_matmul_q4_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Vectorized A-loading with row clamping — always takes the fast float4 path.
-        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
-        // K is always a multiple of BBK for all supported quant types, so no K boundary.
-        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-            uint base = idx * 4;
-            uint r = base / BBK;
-            uint c = base % BBK;
-            uint gr = min(tile_row + r, M - 1);
-            float4 v = *(device const float4*)(input + gr * K + k_base + c);
-            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2613,16 +2839,24 @@ kernel void batched_matmul_bias_q4_0(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Vectorized A-loading with row clamping — always takes the fast float4 path.
-        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
-        // K is always a multiple of BBK for all supported quant types, so no K boundary.
-        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-            uint base = idx * 4;
-            uint r = base / BBK;
-            uint c = base % BBK;
-            uint gr = min(tile_row + r, M - 1);
-            float4 v = *(device const float4*)(input + gr * K + k_base + c);
-            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2724,16 +2958,24 @@ kernel void batched_matmul_q4_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Vectorized A-loading with row clamping — always takes the fast float4 path.
-        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
-        // K is always a multiple of BBK for all supported quant types, so no K boundary.
-        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-            uint base = idx * 4;
-            uint r = base / BBK;
-            uint c = base % BBK;
-            uint gr = min(tile_row + r, M - 1);
-            float4 v = *(device const float4*)(input + gr * K + k_base + c);
-            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2859,16 +3101,24 @@ kernel void batched_matmul_bias_q4_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Vectorized A-loading with row clamping — always takes the fast float4 path.
-        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
-        // K is always a multiple of BBK for all supported quant types, so no K boundary.
-        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-            uint base = idx * 4;
-            uint r = base / BBK;
-            uint c = base % BBK;
-            uint gr = min(tile_row + r, M - 1);
-            float4 v = *(device const float4*)(input + gr * K + k_base + c);
-            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -2985,16 +3235,24 @@ kernel void batched_matmul_q5_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Vectorized A-loading with row clamping — always takes the fast float4 path.
-        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
-        // K is always a multiple of BBK for all supported quant types, so no K boundary.
-        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-            uint base = idx * 4;
-            uint r = base / BBK;
-            uint c = base % BBK;
-            uint gr = min(tile_row + r, M - 1);
-            float4 v = *(device const float4*)(input + gr * K + k_base + c);
-            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -3123,16 +3381,24 @@ kernel void batched_matmul_bias_q5_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Vectorized A-loading with row clamping — always takes the fast float4 path.
-        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
-        // K is always a multiple of BBK for all supported quant types, so no K boundary.
-        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-            uint base = idx * 4;
-            uint r = base / BBK;
-            uint c = base % BBK;
-            uint gr = min(tile_row + r, M - 1);
-            float4 v = *(device const float4*)(input + gr * K + k_base + c);
-            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -3252,16 +3518,24 @@ kernel void batched_matmul_q6_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Vectorized A-loading with row clamping — always takes the fast float4 path.
-        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
-        // K is always a multiple of BBK for all supported quant types, so no K boundary.
-        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-            uint base = idx * 4;
-            uint r = base / BBK;
-            uint c = base % BBK;
-            uint gr = min(tile_row + r, M - 1);
-            float4 v = *(device const float4*)(input + gr * K + k_base + c);
-            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {
@@ -3387,16 +3661,24 @@ kernel void batched_matmul_bias_q6_k(
     for (uint kt = 0; kt < num_k_tiles; ++kt) {
         uint k_base = kt * BBK;
 
-        // Vectorized A-loading with row clamping — always takes the fast float4 path.
-        // Rows beyond M clamp to M-1 (duplicated data discarded by output bounds check).
-        // K is always a multiple of BBK for all supported quant types, so no K boundary.
-        for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
-            uint base = idx * 4;
-            uint r = base / BBK;
-            uint c = base % BBK;
-            uint gr = min(tile_row + r, M - 1);
-            float4 v = *(device const float4*)(input + gr * K + k_base + c);
-            *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+        // Interior tile: vectorized float4→half4 loads (4x fewer memory transactions)
+        if (tile_row + BBM <= M && k_base + BBK <= K) {
+            for (uint idx = lid; idx < (BBM * BBK) / 4; idx += 128) {
+                uint base = idx * 4;
+                uint r = base / BBK;
+                uint c = base % BBK;
+                float4 v = *(device const float4*)(input + (tile_row + r) * K + k_base + c);
+                *(threadgroup half4*)(tgA + r * BBK + c) = half4(v);
+            }
+        } else {
+            // Boundary tile: scalar with bounds checking
+            for (uint idx = lid; idx < BBM * BBK; idx += 128) {
+                uint r = idx / BBK;
+                uint c = idx % BBK;
+                uint gr = tile_row + r;
+                uint gc = k_base + c;
+                tgA[r * BBK + c] = (gr < M && gc < K) ? half(input[gr * K + gc]) : 0.0h;
+            }
         }
 
         {

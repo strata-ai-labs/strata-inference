@@ -182,6 +182,9 @@ impl MetalResources {
             "batched_matmul_bias_q6_k",      // BatchedMatmulBiasQ6K = 39
             // Phase 5: RoPE with per-dimension frequency factors (LongRoPE)
             "rope_neox_factors",             // RopeNeoxFactors = 40
+            // Phase 6: Multi-workgroup vec decode attention
+            "attn_decode_vec_f16",           // AttnDecodeVecF16 = 41
+            "attn_decode_vec_reduce_f16",    // AttnDecodeVecReduceF16 = 42
         ];
 
         let mut psos = Vec::with_capacity(kernel_names.len());

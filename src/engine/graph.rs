@@ -77,6 +77,9 @@ pub(crate) enum PsoRef {
     BatchedMatmulBiasQ6K,
     // Phase 5: RoPE with per-dimension frequency factors (LongRoPE)
     RopeNeoxFactors,
+    // Phase 6: Multi-workgroup vec decode attention
+    AttnDecodeVecF16,
+    AttnDecodeVecReduceF16,
 }
 
 impl PsoRef {
@@ -124,6 +127,8 @@ impl PsoRef {
             PsoRef::BatchedMatmulQ6K => "BatchedMatmulQ6K",
             PsoRef::BatchedMatmulBiasQ6K => "BatchedMatmulBiasQ6K",
             PsoRef::RopeNeoxFactors => "RopeNeoxFactors",
+            PsoRef::AttnDecodeVecF16 => "AttnDecodeVecF16",
+            PsoRef::AttnDecodeVecReduceF16 => "AttnDecodeVecReduceF16",
         }
     }
 }
@@ -767,7 +772,12 @@ impl GraphBuilder {
     }
 
     /// Emit grouped_attention_decode (fused Q@K^T + softmax + @V).
-    /// When `kv_f16` is true, uses the online softmax F16 variant.
+    ///
+    /// When `kv_f16` is true and `attn_temp_slot` is provided, emits the
+    /// two-kernel vec+reduce path (NWG=32 workgroups per head) for better
+    /// GPU utilization at long context lengths.  When `kv_f16` is true but
+    /// no temp slot, falls back to the single-kernel online-softmax variant.
+    /// When `kv_f16` is false, uses the F32 variant.
     fn emit_grouped_attn_decode(
         &mut self,
         q: BufferSlot,
@@ -780,7 +790,68 @@ impl GraphBuilder {
         attn_scale: f32,
         softcap: f32,
         kv_f16: bool,
+        attn_temp_slot: Option<BufferSlot>,
     ) {
+        if kv_f16 {
+            if let Some(temp) = attn_temp_slot {
+                // Two-kernel vec+reduce path: NWG=32 workgroups per head
+                const NWG: u32 = 32;
+
+                // Vec kernel uses v_acc[8] (max 8 dims per thread = head_dim 256).
+                // Reduce kernel uses float4 loads requiring head_dim % 4 == 0.
+                assert!(head_dim <= 256, "vec decode attention: head_dim {} exceeds max 256", head_dim);
+                assert!(head_dim % 4 == 0, "vec decode attention: head_dim {} must be divisible by 4", head_dim);
+
+                // Kernel 1: attn_decode_vec_f16
+                // Each workgroup (1 SIMD group) processes strided KV positions
+                self.ops.push(DecodeOp {
+                    pso: PsoRef::AttnDecodeVecF16,
+                    bindings: vec![
+                        (BufferRef::Pool(q), 0, 0),
+                        (k_cache, 1, 0),
+                        (v_cache, 2, 0),
+                        (BufferRef::Pool(temp), 3, 0),
+                    ],
+                    params: vec![
+                        (ParamValue::U32(num_heads as u32), 4),
+                        (ParamValue::U32(num_kv_heads as u32), 5),
+                        (ParamValue::U32(head_dim as u32), 6),
+                        (ParamValue::TotalLen, 7),
+                        (ParamValue::F32(attn_scale), 8),
+                        (ParamValue::F32(softcap), 9),
+                    ],
+                    dispatch: DispatchDims::Fixed {
+                        gx: num_heads as u32 * NWG, gy: 1, gz: 1,
+                        tx: 32, ty: 1, tz: 1,
+                    },
+                    reads: vec![BufferRef::Pool(q), k_cache, v_cache],
+                    writes: Some(BufferRef::Pool(temp)),
+                });
+
+                // Kernel 2: attn_decode_vec_reduce_f16
+                // One threadgroup per head, 32 threads reduce NWG partial results
+                self.ops.push(DecodeOp {
+                    pso: PsoRef::AttnDecodeVecReduceF16,
+                    bindings: vec![
+                        (BufferRef::Pool(temp), 0, 0),
+                        (BufferRef::Pool(out), 1, 0),
+                    ],
+                    params: vec![
+                        (ParamValue::U32(num_heads as u32), 2),
+                        (ParamValue::U32(head_dim as u32), 3),
+                    ],
+                    dispatch: DispatchDims::Fixed {
+                        gx: num_heads as u32, gy: 1, gz: 1,
+                        tx: 32, ty: 1, tz: 1,
+                    },
+                    reads: vec![BufferRef::Pool(temp)],
+                    writes: Some(BufferRef::Pool(out)),
+                });
+                return;
+            }
+        }
+
+        // Fallback: single-kernel path (F32 or F16 without temp buffer)
         let pso = if kv_f16 { PsoRef::GroupedAttnDecodeF16 } else { PsoRef::GroupedAttnDecode };
         self.ops.push(DecodeOp {
             pso,
@@ -794,7 +865,7 @@ impl GraphBuilder {
                 (ParamValue::U32(num_heads as u32), 4),
                 (ParamValue::U32(num_kv_heads as u32), 5),
                 (ParamValue::U32(head_dim as u32), 6),
-                (ParamValue::TotalLen, 7), // total_len = pos + 1 (patched at encode)
+                (ParamValue::TotalLen, 7),
                 (ParamValue::F32(attn_scale), 8),
                 (ParamValue::F32(softcap), 9),
             ],
@@ -907,6 +978,23 @@ impl DecodeGraph {
         // Per-layer transformer (cached single-token decode)
         // ===================================================================
 
+        // Allocate shared temp buffer for vec decode attention (reused across layers).
+        // Layout: [num_heads * NWG * head_dim] V accumulators + [num_heads * NWG * 2] (S,M) pairs.
+        //
+        // Safety: The same temp slot is reused across layers. This is safe because
+        // compute_barriers() inserts a barrier between the reduce op (reads temp) and
+        // the output projection (reads attn_out which reduce wrote), guaranteeing
+        // reduce completes before any subsequent op — including the next layer's vec
+        // write to temp.
+        let attn_temp_slot = if kv_f16 {
+            const NWG: usize = 32;
+            let temp_bytes = (config.num_heads * NWG * config.head_dim
+                            + config.num_heads * NWG * 2) * f32_size;
+            Some(b.alloc_slot(temp_bytes))
+        } else {
+            None
+        };
+
         // Index per-layer weights and emit per-layer ops
         for layer_idx in 0..config.num_layers {
             let layer = &weights.layers[layer_idx];
@@ -1010,6 +1098,7 @@ impl DecodeGraph {
                     q_final, k_cache, v_cache, attn_out,
                     config.num_heads, config.num_kv_heads, config.head_dim,
                     attn_scale, config.attn_logit_softcap, kv_f16,
+                    attn_temp_slot,
                 );
 
                 // 6. Output projection + residual
@@ -1085,6 +1174,7 @@ impl DecodeGraph {
                     q_final, k_cache, v_cache, attn_out,
                     config.num_heads, config.num_kv_heads, config.head_dim,
                     attn_scale, config.attn_logit_softcap, kv_f16,
+                    attn_temp_slot,
                 );
 
                 // 5. Output projection + residual
@@ -3053,6 +3143,241 @@ mod tests {
             }
             _ => panic!("grouped_attn dispatch should be Fixed"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // F16 vec+reduce decode attention
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_f16_vec_reduce_attn_ops() {
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, true);
+
+        // Should have vec + reduce ops, NOT the old single-kernel F16 path
+        let vec_ops: Vec<&DecodeOp> = graph.ops.iter()
+            .filter(|op| op.pso == PsoRef::AttnDecodeVecF16)
+            .collect();
+        let reduce_ops: Vec<&DecodeOp> = graph.ops.iter()
+            .filter(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
+            .collect();
+        let old_f16_ops: Vec<&DecodeOp> = graph.ops.iter()
+            .filter(|op| op.pso == PsoRef::GroupedAttnDecodeF16)
+            .collect();
+
+        assert_eq!(vec_ops.len(), 1, "Should have 1 vec decode op per layer");
+        assert_eq!(reduce_ops.len(), 1, "Should have 1 reduce op per layer");
+        assert_eq!(old_f16_ops.len(), 0, "Old F16 kernel should not be emitted");
+    }
+
+    #[test]
+    fn test_f16_vec_dispatch_dims() {
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, true);
+
+        let vec_op = graph.ops.iter()
+            .find(|op| op.pso == PsoRef::AttnDecodeVecF16)
+            .expect("Should have a vec decode op");
+
+        // Dispatch: gx = num_heads * NWG = 32 * 32 = 1024, tx = 32
+        match vec_op.dispatch {
+            DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } => {
+                assert_eq!(gx, 32 * 32, "gx should be num_heads * NWG");
+                assert_eq!(gy, 1);
+                assert_eq!(gz, 1);
+                assert_eq!(tx, 32, "tx should be 32 (1 SIMD group)");
+                assert_eq!(ty, 1);
+                assert_eq!(tz, 1);
+            }
+            _ => panic!("vec dispatch should be Fixed"),
+        }
+    }
+
+    #[test]
+    fn test_f16_reduce_dispatch_dims() {
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, true);
+
+        let reduce_op = graph.ops.iter()
+            .find(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
+            .expect("Should have a reduce op");
+
+        // Dispatch: gx = num_heads = 32, tx = 32
+        match reduce_op.dispatch {
+            DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } => {
+                assert_eq!(gx, 32, "gx should be num_heads");
+                assert_eq!(gy, 1);
+                assert_eq!(gz, 1);
+                assert_eq!(tx, 32, "tx should be 32 (1 SIMD group)");
+                assert_eq!(ty, 1);
+                assert_eq!(tz, 1);
+            }
+            _ => panic!("reduce dispatch should be Fixed"),
+        }
+    }
+
+    #[test]
+    fn test_f16_vec_bindings_and_params() {
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, true);
+
+        let vec_op = graph.ops.iter()
+            .find(|op| op.pso == PsoRef::AttnDecodeVecF16)
+            .expect("Should have a vec decode op");
+
+        // Vec kernel bindings: Q(pool), K_cache, V_cache, temp(pool)
+        assert_eq!(vec_op.bindings.len(), 4);
+        assert!(matches!(vec_op.bindings[0].0, BufferRef::Pool(_)), "binding 0 should be Q (pool)");
+        assert!(matches!(vec_op.bindings[1].0, BufferRef::KvCache(_)), "binding 1 should be K cache");
+        assert!(matches!(vec_op.bindings[2].0, BufferRef::KvCache(_)), "binding 2 should be V cache");
+        assert!(matches!(vec_op.bindings[3].0, BufferRef::Pool(_)), "binding 3 should be temp (pool)");
+
+        // Should have TotalLen at binding 7
+        let has_total_len = vec_op.params.iter()
+            .any(|(p, b)| matches!(p, ParamValue::TotalLen) && *b == 7);
+        assert!(has_total_len, "vec kernel should have TotalLen at binding 7");
+
+        // Check num_heads param at binding 4
+        let num_heads_param = vec_op.params.iter()
+            .find(|(_, b)| *b == 4)
+            .expect("Should have param at binding 4");
+        assert!(matches!(num_heads_param.0, ParamValue::U32(32)), "num_heads should be 32");
+    }
+
+    #[test]
+    fn test_f16_reduce_bindings() {
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, true);
+
+        let reduce_op = graph.ops.iter()
+            .find(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
+            .expect("Should have a reduce op");
+
+        // Reduce kernel bindings: temp(pool), output(pool)
+        assert_eq!(reduce_op.bindings.len(), 2);
+        assert!(matches!(reduce_op.bindings[0].0, BufferRef::Pool(_)), "binding 0 should be temp (pool)");
+        assert!(matches!(reduce_op.bindings[1].0, BufferRef::Pool(_)), "binding 1 should be output (pool)");
+
+        // Check that num_heads is at binding 2, head_dim at binding 3
+        let num_heads_param = reduce_op.params.iter()
+            .find(|(_, b)| *b == 2)
+            .expect("Should have param at binding 2");
+        assert!(matches!(num_heads_param.0, ParamValue::U32(32)), "num_heads should be 32");
+
+        let head_dim_param = reduce_op.params.iter()
+            .find(|(_, b)| *b == 3)
+            .expect("Should have param at binding 3");
+        assert!(matches!(head_dim_param.0, ParamValue::U32(64)), "head_dim should be 64");
+    }
+
+    #[test]
+    fn test_f16_vec_reduce_share_temp_slot() {
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, true);
+
+        let vec_op = graph.ops.iter()
+            .find(|op| op.pso == PsoRef::AttnDecodeVecF16)
+            .expect("Should have a vec decode op");
+        let reduce_op = graph.ops.iter()
+            .find(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
+            .expect("Should have a reduce op");
+
+        // Vec writes to temp (binding 3), reduce reads from temp (binding 0)
+        let vec_temp = vec_op.bindings[3].0;
+        let reduce_temp = reduce_op.bindings[0].0;
+        assert_eq!(vec_temp, reduce_temp, "vec and reduce should share the same temp buffer slot");
+
+        // Vec output (temp) should NOT be the same as reduce output
+        let reduce_out = reduce_op.bindings[1].0;
+        assert_ne!(reduce_temp, reduce_out, "temp and output should be different slots");
+    }
+
+    #[test]
+    fn test_f16_vec_reduce_barrier() {
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, true);
+
+        // Find the indices of vec and reduce ops
+        let vec_idx = graph.ops.iter().position(|op| op.pso == PsoRef::AttnDecodeVecF16)
+            .expect("Should have vec op");
+        let reduce_idx = graph.ops.iter().position(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
+            .expect("Should have reduce op");
+
+        // Reduce must come after vec
+        assert!(reduce_idx == vec_idx + 1, "reduce should immediately follow vec");
+
+        // There should be a barrier between vec and reduce (reduce reads temp that vec wrote)
+        assert!(graph.barriers.contains(&reduce_idx),
+            "barrier should be inserted before reduce op (index {}), barriers: {:?}",
+            reduce_idx, graph.barriers);
+    }
+
+    #[test]
+    fn test_f16_temp_buffer_size() {
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, true);
+
+        let vec_op = graph.ops.iter()
+            .find(|op| op.pso == PsoRef::AttnDecodeVecF16)
+            .expect("Should have a vec decode op");
+
+        // Get the temp buffer slot index
+        if let BufferRef::Pool(temp_slot) = vec_op.bindings[3].0 {
+            let temp_bytes = graph.slot_sizes[temp_slot.0 as usize];
+            // Expected: (num_heads * NWG * head_dim + num_heads * NWG * 2) * sizeof(f32)
+            // = (32 * 32 * 64 + 32 * 32 * 2) * 4 = (65536 + 2048) * 4 = 270336
+            let expected = (32 * 32 * 64 + 32 * 32 * 2) * 4;
+            assert_eq!(temp_bytes, expected,
+                "temp buffer should be {} bytes, got {}", expected, temp_bytes);
+        } else {
+            panic!("vec binding 3 should be a pool slot");
+        }
+    }
+
+    #[test]
+    fn test_f16_multilayer_temp_reuse() {
+        // With 2 layers, both should share the same temp slot
+        let config = ModelConfig {
+            num_layers: 2,
+            ..llama_config()
+        };
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, true);
+
+        let vec_ops: Vec<(usize, &DecodeOp)> = graph.ops.iter().enumerate()
+            .filter(|(_, op)| op.pso == PsoRef::AttnDecodeVecF16)
+            .collect();
+        assert_eq!(vec_ops.len(), 2, "Should have 2 vec ops for 2 layers");
+
+        // Both vec ops should write to the same temp slot
+        let temp1 = vec_ops[0].1.bindings[3].0;
+        let temp2 = vec_ops[1].1.bindings[3].0;
+        assert_eq!(temp1, temp2, "Both layers should reuse the same temp buffer slot");
+    }
+
+    #[test]
+    fn test_f32_decode_no_vec_ops() {
+        // F32 path should NOT use vec+reduce
+        let config = llama_1layer_config();
+        let weights = llama_weights(&config);
+        let graph = DecodeGraph::build(&config, &weights, false);
+
+        let vec_count = graph.ops.iter().filter(|op| op.pso == PsoRef::AttnDecodeVecF16).count();
+        let reduce_count = graph.ops.iter().filter(|op| op.pso == PsoRef::AttnDecodeVecReduceF16).count();
+        assert_eq!(vec_count, 0, "F32 path should not emit vec ops");
+        assert_eq!(reduce_count, 0, "F32 path should not emit reduce ops");
+
+        // Should use the old single-kernel path
+        let old_count = graph.ops.iter().filter(|op| op.pso == PsoRef::GroupedAttnDecode).count();
+        assert_eq!(old_count, 1, "F32 path should use GroupedAttnDecode");
     }
 
     #[test]
