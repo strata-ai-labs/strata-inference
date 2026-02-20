@@ -1,6 +1,7 @@
 //! Shared CLI utilities for strata-inference binary tools.
 
 pub mod backend;
+pub mod model;
 
 use std::io::Read;
 use std::path::Path;

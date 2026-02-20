@@ -13,9 +13,9 @@ use strata_inference::tokenizer::create_tokenizer_from_gguf;
 #[derive(Parser)]
 #[command(name = "strata-tokenize", about = "Tokenize text using a GGUF model")]
 struct Args {
-    /// Path to GGUF model file
+    /// Model name or path to GGUF file (e.g., "tinyllama" or "./model.gguf")
     #[arg(short = 'm', long)]
-    model: PathBuf,
+    model: String,
 
     /// Text to tokenize
     #[arg(short = 'p', long, conflicts_with_all = ["file", "stdin"])]
@@ -80,13 +80,14 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let model_path = cli::model::resolve_model(&args.model)?;
     let input = cli::read_input(
         args.prompt.as_deref(),
         args.file.as_deref(),
         args.stdin,
     )?;
 
-    let gguf = GgufFile::open(&args.model)?;
+    let gguf = GgufFile::open(&model_path)?;
     let tokenizer = create_tokenizer_from_gguf(&gguf)?;
 
     let add_special_tokens = !args.no_bos;

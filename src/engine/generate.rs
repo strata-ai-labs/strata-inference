@@ -164,6 +164,16 @@ pub struct GenerationEngine {
 }
 
 impl GenerationEngine {
+    /// Load a generation engine by model name from the registry.
+    ///
+    /// Resolves the name (e.g., `"qwen3:8b"`) to a local GGUF file path
+    /// and auto-selects the best available compute backend.
+    pub fn from_registry(name: &str) -> Result<Self, InferenceError> {
+        let registry = crate::registry::ModelRegistry::new();
+        let path = registry.resolve(name)?;
+        Self::from_gguf(path)
+    }
+
     /// Load a generation engine from a GGUF file, auto-selecting the best backend.
     ///
     /// Prefers Metal > CUDA > CPU.
