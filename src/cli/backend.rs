@@ -17,9 +17,7 @@ pub fn resolve_backend(name: Option<&str>) -> Result<Arc<dyn ComputeBackend>, In
         "metal" => {
             #[cfg(all(feature = "metal", target_os = "macos"))]
             {
-                Ok(Arc::new(
-                    crate::backend::metal::MetalBackend::try_new()?,
-                ))
+                Ok(Arc::new(crate::backend::metal::MetalBackend::try_new()?))
             }
             #[cfg(not(all(feature = "metal", target_os = "macos")))]
             {
@@ -97,7 +95,11 @@ mod tests {
         {
             match resolve_backend(Some("metal")) {
                 Err(InferenceError::Backend(msg)) => {
-                    assert!(msg.contains("Metal backend not available"), "Error: {}", msg);
+                    assert!(
+                        msg.contains("Metal backend not available"),
+                        "Error: {}",
+                        msg
+                    );
                 }
                 Err(other) => panic!("Expected Backend error, got: {:?}", other),
                 Ok(_) => panic!("Expected error for unavailable metal backend"),

@@ -29,7 +29,13 @@ impl Default for CpuBackend {
 impl ComputeBackend for CpuBackend {
     fn upload(&self, tensor: &Tensor) -> DeviceTensor {
         trace!(shape = ?tensor.shape(), dtype = ?tensor.dtype(), "CPU upload (clone)");
-        DeviceTensor::new(tensor.clone())
+        // Convert F16 to F32 at upload time — CPUs have no native F16 compute,
+        // so all downstream ops (matmul, etc.) expect F32 data.
+        if tensor.dtype() == TensorDtype::F16 {
+            DeviceTensor::new(tensor.to_f32())
+        } else {
+            DeviceTensor::new(tensor.clone())
+        }
     }
 
     fn download(&self, tensor: &DeviceTensor) -> Tensor {
@@ -44,8 +50,18 @@ impl ComputeBackend for CpuBackend {
         let a_shape = a.shape();
         let b_shape = b.shape();
 
-        assert_eq!(a_shape.len(), 2, "matmul: a must be 2D, got shape {:?}", a_shape);
-        assert_eq!(b_shape.len(), 2, "matmul: b must be 2D, got shape {:?}", b_shape);
+        assert_eq!(
+            a_shape.len(),
+            2,
+            "matmul: a must be 2D, got shape {:?}",
+            a_shape
+        );
+        assert_eq!(
+            b_shape.len(),
+            2,
+            "matmul: b must be 2D, got shape {:?}",
+            b_shape
+        );
 
         let m = a_shape[0];
         let k = a_shape[1];
@@ -81,8 +97,18 @@ impl ComputeBackend for CpuBackend {
         let a_shape = a.shape();
         let b_shape = b.shape();
 
-        assert_eq!(a_shape.len(), 2, "matmul_transpose: a must be 2D, got shape {:?}", a_shape);
-        assert_eq!(b_shape.len(), 2, "matmul_transpose: b must be 2D, got shape {:?}", b_shape);
+        assert_eq!(
+            a_shape.len(),
+            2,
+            "matmul_transpose: a must be 2D, got shape {:?}",
+            a_shape
+        );
+        assert_eq!(
+            b_shape.len(),
+            2,
+            "matmul_transpose: b must be 2D, got shape {:?}",
+            b_shape
+        );
 
         let m = a_shape[0];
         let k = a_shape[1];
@@ -121,7 +147,11 @@ impl ComputeBackend for CpuBackend {
         let weight_shape = weights.shape();
 
         assert_eq!(input_shape.len(), 2, "quantized_matmul: input must be 2D");
-        assert_eq!(weight_shape.len(), 2, "quantized_matmul: weights must be 2D");
+        assert_eq!(
+            weight_shape.len(),
+            2,
+            "quantized_matmul: weights must be 2D"
+        );
 
         let dtype = weights.dtype();
         assert!(
@@ -226,12 +256,14 @@ impl ComputeBackend for CpuBackend {
 
                         for block_idx in 0..blocks_per_row {
                             let bs = row_start + block_idx * 20;
-                            let d = half::f16::from_bits(
-                                u16::from_le_bytes([raw[bs], raw[bs + 1]])
-                            ).to_f32();
-                            let m_val = half::f16::from_bits(
-                                u16::from_le_bytes([raw[bs + 2], raw[bs + 3]])
-                            ).to_f32();
+                            let d =
+                                half::f16::from_bits(u16::from_le_bytes([raw[bs], raw[bs + 1]]))
+                                    .to_f32();
+                            let m_val = half::f16::from_bits(u16::from_le_bytes([
+                                raw[bs + 2],
+                                raw[bs + 3],
+                            ]))
+                            .to_f32();
 
                             let elem_start = block_idx * 32;
                             let elem_end = std::cmp::min(elem_start + 32, k);
@@ -263,11 +295,14 @@ impl ComputeBackend for CpuBackend {
 
                         for block_idx in 0..blocks_per_row {
                             let bs = row_start + block_idx * 22;
-                            let d = half::f16::from_bits(
-                                u16::from_le_bytes([raw[bs], raw[bs + 1]])
-                            ).to_f32();
+                            let d =
+                                half::f16::from_bits(u16::from_le_bytes([raw[bs], raw[bs + 1]]))
+                                    .to_f32();
                             let qh = u32::from_le_bytes([
-                                raw[bs + 2], raw[bs + 3], raw[bs + 4], raw[bs + 5],
+                                raw[bs + 2],
+                                raw[bs + 3],
+                                raw[bs + 4],
+                                raw[bs + 5],
                             ]);
 
                             let elem_start = block_idx * 32;
@@ -282,7 +317,7 @@ impl ComputeBackend for CpuBackend {
                                 } else {
                                     let li = local_idx - 16;
                                     let n = (raw[bs + 6 + li] >> 4) & 0x0F;
-                                    let h = ((qh >> (li as u32 + 12))) & 0x10;
+                                    let h = (qh >> (li as u32 + 12)) & 0x10;
                                     (n as u32, h)
                                 };
                                 let qs = (nibble | high_bit) as i32 - 16;
@@ -305,14 +340,19 @@ impl ComputeBackend for CpuBackend {
 
                         for block_idx in 0..blocks_per_row {
                             let bs = row_start + block_idx * 24;
-                            let d = half::f16::from_bits(
-                                u16::from_le_bytes([raw[bs], raw[bs + 1]])
-                            ).to_f32();
-                            let m_val = half::f16::from_bits(
-                                u16::from_le_bytes([raw[bs + 2], raw[bs + 3]])
-                            ).to_f32();
+                            let d =
+                                half::f16::from_bits(u16::from_le_bytes([raw[bs], raw[bs + 1]]))
+                                    .to_f32();
+                            let m_val = half::f16::from_bits(u16::from_le_bytes([
+                                raw[bs + 2],
+                                raw[bs + 3],
+                            ]))
+                            .to_f32();
                             let qh = u32::from_le_bytes([
-                                raw[bs + 4], raw[bs + 5], raw[bs + 6], raw[bs + 7],
+                                raw[bs + 4],
+                                raw[bs + 5],
+                                raw[bs + 6],
+                                raw[bs + 7],
                             ]);
 
                             let elem_start = block_idx * 32;
@@ -327,7 +367,7 @@ impl ComputeBackend for CpuBackend {
                                 } else {
                                     let li = local_idx - 16;
                                     let n = (raw[bs + 8 + li] >> 4) & 0x0F;
-                                    let h = ((qh >> (li as u32 + 12))) & 0x10;
+                                    let h = (qh >> (li as u32 + 12)) & 0x10;
                                     (n as u32, h)
                                 };
                                 let val = (nibble | high_bit) as f32 * d + m_val;
@@ -351,12 +391,14 @@ impl ComputeBackend for CpuBackend {
 
                         for block_idx in 0..blocks_per_row {
                             let bs = row_start + block_idx * 144;
-                            let d_val = half::f16::from_bits(
-                                u16::from_le_bytes([raw[bs], raw[bs + 1]])
-                            ).to_f32();
-                            let dmin = half::f16::from_bits(
-                                u16::from_le_bytes([raw[bs + 2], raw[bs + 3]])
-                            ).to_f32();
+                            let d_val =
+                                half::f16::from_bits(u16::from_le_bytes([raw[bs], raw[bs + 1]]))
+                                    .to_f32();
+                            let dmin = half::f16::from_bits(u16::from_le_bytes([
+                                raw[bs + 2],
+                                raw[bs + 3],
+                            ]))
+                            .to_f32();
                             let scales: [u8; 12] = raw[bs + 4..bs + 16].try_into().unwrap();
                             let qs_start = bs + 16; // qs[128]
 
@@ -409,12 +451,14 @@ impl ComputeBackend for CpuBackend {
 
                         for block_idx in 0..blocks_per_row {
                             let bs = row_start + block_idx * 176;
-                            let d_val = half::f16::from_bits(
-                                u16::from_le_bytes([raw[bs], raw[bs + 1]])
-                            ).to_f32();
-                            let dmin = half::f16::from_bits(
-                                u16::from_le_bytes([raw[bs + 2], raw[bs + 3]])
-                            ).to_f32();
+                            let d_val =
+                                half::f16::from_bits(u16::from_le_bytes([raw[bs], raw[bs + 1]]))
+                                    .to_f32();
+                            let dmin = half::f16::from_bits(u16::from_le_bytes([
+                                raw[bs + 2],
+                                raw[bs + 3],
+                            ]))
+                            .to_f32();
                             let scales: [u8; 12] = raw[bs + 4..bs + 16].try_into().unwrap();
                             let qh_start = bs + 16; // qh[32]
                             let qs_start = bs + 48; // qs[128]
@@ -436,7 +480,11 @@ impl ComputeBackend for CpuBackend {
                                 for l in 0..32 {
                                     let e = elem_start + is / 2 * 64 + l;
                                     if e < k {
-                                        let high = if raw[qh_start + l] & u1 != 0 { 16u32 } else { 0 };
+                                        let high = if raw[qh_start + l] & u1 != 0 {
+                                            16u32
+                                        } else {
+                                            0
+                                        };
                                         let q = (raw[qs_start + ql_off + l] & 0xF) as u32 + high;
                                         sum += (d1 * q as f32 - m1) * input_row[e];
                                     }
@@ -444,7 +492,11 @@ impl ComputeBackend for CpuBackend {
                                 for l in 0..32 {
                                     let e = elem_start + is / 2 * 64 + 32 + l;
                                     if e < k {
-                                        let high = if raw[qh_start + l] & u2 != 0 { 16u32 } else { 0 };
+                                        let high = if raw[qh_start + l] & u2 != 0 {
+                                            16u32
+                                        } else {
+                                            0
+                                        };
                                         let q = (raw[qs_start + ql_off + l] >> 4) as u32 + high;
                                         sum += (d2 * q as f32 - m2) * input_row[e];
                                     }
@@ -475,9 +527,11 @@ impl ComputeBackend for CpuBackend {
                             let ql_start = bs;
                             let qh_start = bs + 128;
                             let sc_start = bs + 192;
-                            let d_val = half::f16::from_bits(
-                                u16::from_le_bytes([raw[bs + 208], raw[bs + 209]])
-                            ).to_f32();
+                            let d_val = half::f16::from_bits(u16::from_le_bytes([
+                                raw[bs + 208],
+                                raw[bs + 209],
+                            ]))
+                            .to_f32();
 
                             let elem_start = block_idx * 256;
                             let mut ql_off = 0usize;
@@ -493,28 +547,34 @@ impl ComputeBackend for CpuBackend {
                                     let qh_byte = raw[qh_start + qh_off + l];
                                     let sc = raw[sc_start + sc_off + is] as i8;
 
-                                    let q1 = ((ql_byte0 & 0xF) | (((qh_byte >> 0) & 3) << 4)) as i32 - 32;
+                                    let q1 = ((ql_byte0 & 0xF) | (((qh_byte >> 0) & 3) << 4))
+                                        as i32
+                                        - 32;
                                     let e1 = elem_start + _n_chunk * 128 + l;
                                     if e1 < k {
                                         sum += d_val * sc as f32 * q1 as f32 * input_row[e1];
                                     }
 
                                     let sc2 = raw[sc_start + sc_off + is + 2] as i8;
-                                    let q2 = ((ql_byte1 & 0xF) | (((qh_byte >> 2) & 3) << 4)) as i32 - 32;
+                                    let q2 = ((ql_byte1 & 0xF) | (((qh_byte >> 2) & 3) << 4))
+                                        as i32
+                                        - 32;
                                     let e2 = elem_start + _n_chunk * 128 + l + 32;
                                     if e2 < k {
                                         sum += d_val * sc2 as f32 * q2 as f32 * input_row[e2];
                                     }
 
                                     let sc3 = raw[sc_start + sc_off + is + 4] as i8;
-                                    let q3 = ((ql_byte0 >> 4) | (((qh_byte >> 4) & 3) << 4)) as i32 - 32;
+                                    let q3 =
+                                        ((ql_byte0 >> 4) | (((qh_byte >> 4) & 3) << 4)) as i32 - 32;
                                     let e3 = elem_start + _n_chunk * 128 + l + 64;
                                     if e3 < k {
                                         sum += d_val * sc3 as f32 * q3 as f32 * input_row[e3];
                                     }
 
                                     let sc4 = raw[sc_start + sc_off + is + 6] as i8;
-                                    let q4 = ((ql_byte1 >> 4) | (((qh_byte >> 6) & 3) << 4)) as i32 - 32;
+                                    let q4 =
+                                        ((ql_byte1 >> 4) | (((qh_byte >> 6) & 3) << 4)) as i32 - 32;
                                     let e4 = elem_start + _n_chunk * 128 + l + 96;
                                     if e4 < k {
                                         sum += d_val * sc4 as f32 * q4 as f32 * input_row[e4];
@@ -549,7 +609,11 @@ impl ComputeBackend for CpuBackend {
 
         trace!(shape = ?a.shape(), "CPU add");
 
-        let result: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(&x, &y)| x + y).collect();
+        let result: Vec<f32> = a_data
+            .iter()
+            .zip(b_data.iter())
+            .map(|(&x, &y)| x + y)
+            .collect();
         DeviceTensor::new(Tensor::new(a.shape().to_vec(), result))
     }
 
@@ -560,17 +624,25 @@ impl ComputeBackend for CpuBackend {
         let a_shape = a.shape();
         let bias_shape = bias.shape();
 
-        assert_eq!(a_shape.len(), 2, "add_bias: a must be 2D, got shape {:?}", a_shape);
-        assert_eq!(bias_shape.len(), 1, "add_bias: bias must be 1D, got shape {:?}", bias_shape);
+        assert_eq!(
+            a_shape.len(),
+            2,
+            "add_bias: a must be 2D, got shape {:?}",
+            a_shape
+        );
+        assert_eq!(
+            bias_shape.len(),
+            1,
+            "add_bias: bias must be 1D, got shape {:?}",
+            bias_shape
+        );
 
         let m = a_shape[0];
         let n = a_shape[1];
         assert_eq!(
-            n,
-            bias_shape[0],
+            n, bias_shape[0],
             "add_bias: a cols ({}) must match bias length ({})",
-            n,
-            bias_shape[0]
+            n, bias_shape[0]
         );
 
         trace!(m, n, "CPU add_bias");
@@ -595,9 +667,7 @@ impl ComputeBackend for CpuBackend {
 
         let result: Vec<f32> = data
             .iter()
-            .map(|&x| {
-                0.5 * x * (1.0 + libm::erff(x * sqrt_2_inv))
-            })
+            .map(|&x| 0.5 * x * (1.0 + libm::erff(x * sqrt_2_inv)))
             .collect();
 
         DeviceTensor::new(Tensor::new(t.shape().to_vec(), result))
@@ -662,8 +732,16 @@ impl ComputeBackend for CpuBackend {
         let hidden_size = shape[ndim - 1];
         let n_rows: usize = shape[..ndim - 1].iter().product::<usize>().max(1);
 
-        assert_eq!(w.len(), hidden_size, "layer_norm: weight length must match hidden size");
-        assert_eq!(b.len(), hidden_size, "layer_norm: bias length must match hidden size");
+        assert_eq!(
+            w.len(),
+            hidden_size,
+            "layer_norm: weight length must match hidden size"
+        );
+        assert_eq!(
+            b.len(),
+            hidden_size,
+            "layer_norm: bias length must match hidden size"
+        );
 
         trace!(n_rows, hidden_size, eps, "CPU layer_norm");
 
@@ -678,8 +756,11 @@ impl ComputeBackend for CpuBackend {
             let mean: f32 = row_data.iter().sum::<f32>() / hidden_size as f32;
 
             // Compute variance
-            let variance: f32 =
-                row_data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / hidden_size as f32;
+            let variance: f32 = row_data
+                .iter()
+                .map(|&x| (x - mean) * (x - mean))
+                .sum::<f32>()
+                / hidden_size as f32;
 
             let inv_std = 1.0 / (variance + eps).sqrt();
 
@@ -703,7 +784,11 @@ impl ComputeBackend for CpuBackend {
         let hidden_size = shape[ndim - 1];
         let n_rows: usize = shape[..ndim - 1].iter().product::<usize>().max(1);
 
-        assert_eq!(w.len(), hidden_size, "rms_norm: weight length must match hidden size");
+        assert_eq!(
+            w.len(),
+            hidden_size,
+            "rms_norm: weight length must match hidden size"
+        );
 
         trace!(n_rows, hidden_size, eps, "CPU rms_norm");
 
@@ -715,8 +800,7 @@ impl ComputeBackend for CpuBackend {
             let row_data = &data[start..end];
 
             // mean(x^2)
-            let mean_sq: f32 =
-                row_data.iter().map(|&x| x * x).sum::<f32>() / hidden_size as f32;
+            let mean_sq: f32 = row_data.iter().map(|&x| x * x).sum::<f32>() / hidden_size as f32;
 
             let rms_inv = 1.0 / (mean_sq + eps).sqrt();
 
@@ -749,10 +833,7 @@ impl ComputeBackend for CpuBackend {
             let row_data = &data[start..end];
 
             // Numerical stability: subtract max
-            let max_val = row_data
-                .iter()
-                .cloned()
-                .fold(f32::NEG_INFINITY, f32::max);
+            let max_val = row_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
             let mut sum = 0.0f32;
             for i in 0..last_dim {
@@ -822,7 +903,12 @@ impl ComputeBackend for CpuBackend {
         rope_dim: usize,
     ) -> (DeviceTensor, DeviceTensor) {
         assert!(head_dim > 0, "rope: head_dim must be > 0");
-        assert!(rope_dim <= head_dim, "rope: rope_dim ({}) must be <= head_dim ({})", rope_dim, head_dim);
+        assert!(
+            rope_dim <= head_dim,
+            "rope: rope_dim ({}) must be <= head_dim ({})",
+            rope_dim,
+            head_dim
+        );
         // q, k: [seq_len, total_dim] where total_dim = n_heads * head_dim
         // Apply rotary position embeddings to each head independently.
         // Only the first `rope_dim` dimensions of each head are rotated;
@@ -839,16 +925,23 @@ impl ComputeBackend for CpuBackend {
         let q_shape = q.shape();
         let k_shape = k.shape();
 
-        assert_eq!(q_shape.len(), 2, "rope: q must be 2D, got shape {:?}", q_shape);
-        assert_eq!(k_shape.len(), 2, "rope: k must be 2D, got shape {:?}", k_shape);
+        assert_eq!(
+            q_shape.len(),
+            2,
+            "rope: q must be 2D, got shape {:?}",
+            q_shape
+        );
+        assert_eq!(
+            k_shape.len(),
+            2,
+            "rope: k must be 2D, got shape {:?}",
+            k_shape
+        );
 
         let seq_len = q_shape[0];
         let total_dim = q_shape[1];
 
-        assert_eq!(
-            k_shape[0], seq_len,
-            "rope: q and k must have same seq_len"
-        );
+        assert_eq!(k_shape[0], seq_len, "rope: q and k must have same seq_len");
         assert!(
             total_dim % head_dim == 0,
             "rope: total_dim ({}) must be divisible by head_dim ({})",
@@ -935,7 +1028,12 @@ impl ComputeBackend for CpuBackend {
         let data = hidden.as_tensor().as_f32();
         let shape = hidden.shape();
 
-        assert_eq!(shape.len(), 2, "mean_pool: hidden must be 2D, got shape {:?}", shape);
+        assert_eq!(
+            shape.len(),
+            2,
+            "mean_pool: hidden must be 2D, got shape {:?}",
+            shape
+        );
 
         let seq_len = shape[0];
         let hidden_size = shape[1];
@@ -1000,7 +1098,12 @@ impl ComputeBackend for CpuBackend {
         let vocab_size = shape[0];
         let hidden_size = shape[1];
 
-        trace!(vocab_size, hidden_size, n_tokens = ids.len(), "CPU embedding_lookup");
+        trace!(
+            vocab_size,
+            hidden_size,
+            n_tokens = ids.len(),
+            "CPU embedding_lookup"
+        );
 
         // Handle quantized embedding tables by dequantizing first
         let table_f32;
@@ -1041,7 +1144,11 @@ impl ComputeBackend for CpuBackend {
         if a_shape == b_shape {
             // Same-shape element-wise multiply
             trace!(shape = ?a_shape, "CPU mul (same shape)");
-            let result: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(&x, &y)| x * y).collect();
+            let result: Vec<f32> = a_data
+                .iter()
+                .zip(b_data.iter())
+                .map(|(&x, &y)| x * y)
+                .collect();
             DeviceTensor::new(Tensor::new(a_shape.to_vec(), result))
         } else if b_shape.len() == 1 && a_shape.len() == 2 && a_shape[1] == b_shape[0] {
             // Broadcast: [M, N] * [N] -> [M, N]
@@ -1056,10 +1163,7 @@ impl ComputeBackend for CpuBackend {
             }
             DeviceTensor::new(Tensor::new(vec![m, n], result))
         } else {
-            panic!(
-                "mul: unsupported shapes {:?} and {:?}",
-                a_shape, b_shape
-            );
+            panic!("mul: unsupported shapes {:?} and {:?}", a_shape, b_shape);
         }
     }
 
@@ -1110,28 +1214,64 @@ impl ComputeBackend for CpuBackend {
     ) -> (DeviceTensor, DeviceTensor) {
         // NeoX-style RoPE: pairs (x[i], x[i + rope_dim/2]) instead of (x[2i], x[2i+1])
         assert!(head_dim > 0, "rope_neox: head_dim must be > 0");
-        assert!(rope_dim <= head_dim, "rope_neox: rope_dim ({}) must be <= head_dim ({})", rope_dim, head_dim);
-        assert!(rope_dim % 2 == 0, "rope_neox: rope_dim ({}) must be even", rope_dim);
+        assert!(
+            rope_dim <= head_dim,
+            "rope_neox: rope_dim ({}) must be <= head_dim ({})",
+            rope_dim,
+            head_dim
+        );
+        assert!(
+            rope_dim % 2 == 0,
+            "rope_neox: rope_dim ({}) must be even",
+            rope_dim
+        );
 
         let q_data = q.as_tensor().as_f32();
         let k_data = k.as_tensor().as_f32();
         let q_shape = q.shape();
         let k_shape = k.shape();
 
-        assert_eq!(q_shape.len(), 2, "rope_neox: q must be 2D, got shape {:?}", q_shape);
-        assert_eq!(k_shape.len(), 2, "rope_neox: k must be 2D, got shape {:?}", k_shape);
+        assert_eq!(
+            q_shape.len(),
+            2,
+            "rope_neox: q must be 2D, got shape {:?}",
+            q_shape
+        );
+        assert_eq!(
+            k_shape.len(),
+            2,
+            "rope_neox: k must be 2D, got shape {:?}",
+            k_shape
+        );
 
         let seq_len = q_shape[0];
         let total_dim = q_shape[1];
 
-        assert_eq!(k_shape[0], seq_len, "rope_neox: q and k must have same seq_len");
-        assert!(total_dim % head_dim == 0, "rope_neox: total_dim ({}) must be divisible by head_dim ({})", total_dim, head_dim);
+        assert_eq!(
+            k_shape[0], seq_len,
+            "rope_neox: q and k must have same seq_len"
+        );
+        assert!(
+            total_dim % head_dim == 0,
+            "rope_neox: total_dim ({}) must be divisible by head_dim ({})",
+            total_dim,
+            head_dim
+        );
 
         let n_heads = total_dim / head_dim;
         let k_total_dim = k_shape[1];
         let k_n_heads = k_total_dim / head_dim;
 
-        trace!(seq_len, total_dim, head_dim, rope_dim, n_heads, pos_offset, freq_base, "CPU rope_neox");
+        trace!(
+            seq_len,
+            total_dim,
+            head_dim,
+            rope_dim,
+            n_heads,
+            pos_offset,
+            freq_base,
+            "CPU rope_neox"
+        );
 
         // Matches llama.cpp: freq = pow(base, -1/rope_dim * 2*i)
         let half_rope_dim = rope_dim / 2;
@@ -1187,12 +1327,7 @@ impl ComputeBackend for CpuBackend {
         )
     }
 
-    fn copy_rows_into(
-        &self,
-        dest: &DeviceTensor,
-        src: &DeviceTensor,
-        dest_row_offset: usize,
-    ) {
+    fn copy_rows_into(&self, dest: &DeviceTensor, src: &DeviceTensor, dest_row_offset: usize) {
         let dest_data = dest.as_tensor().as_f32();
         let src_data = src.as_tensor().as_f32();
         let cols = dest.shape().last().copied().unwrap_or(0);
@@ -1303,7 +1438,14 @@ mod tests {
     }
 
     fn assert_close(a: &[f32], b: &[f32], tol: f32, msg: &str) {
-        assert_eq!(a.len(), b.len(), "{}: length mismatch {} vs {}", msg, a.len(), b.len());
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "{}: length mismatch {} vs {}",
+            msg,
+            a.len(),
+            b.len()
+        );
         for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
             assert!(
                 (x - y).abs() < tol,
@@ -1338,7 +1480,12 @@ mod tests {
         let a = dt(Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]));
         let id = dt(Tensor::new(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]));
         let result = b.matmul(&a, &id);
-        assert_close(result.as_tensor().as_f32(), &[1.0, 2.0, 3.0, 4.0], 1e-6, "matmul identity");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[1.0, 2.0, 3.0, 4.0],
+            1e-6,
+            "matmul identity",
+        );
     }
 
     #[test]
@@ -1346,12 +1493,20 @@ mod tests {
         let b = backend();
         // [2,3] x [3,2] -> [2,2]
         let a = dt(Tensor::new(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
-        let bm = dt(Tensor::new(vec![3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]));
+        let bm = dt(Tensor::new(
+            vec![3, 2],
+            vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        ));
         let result = b.matmul(&a, &bm);
         assert_eq!(result.shape(), &[2, 2]);
         // Row 0: 1*7+2*9+3*11 = 7+18+33=58, 1*8+2*10+3*12=8+20+36=64
         // Row 1: 4*7+5*9+6*11=28+45+66=139, 4*8+5*10+6*12=32+50+72=154
-        assert_close(result.as_tensor().as_f32(), &[58.0, 64.0, 139.0, 154.0], 1e-5, "matmul basic");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[58.0, 64.0, 139.0, 154.0],
+            1e-5,
+            "matmul basic",
+        );
     }
 
     #[test]
@@ -1386,7 +1541,10 @@ mod tests {
         //          row 1 of A dot row 0 of B = 4*7+5*8+6*9=28+40+54=122
         //          row 1 of A dot row 1 of B = 4*10+5*11+6*12=40+55+72=167
         let a = dt(Tensor::new(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
-        let bm = dt(Tensor::new(vec![2, 3], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]));
+        let bm = dt(Tensor::new(
+            vec![2, 3],
+            vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        ));
         let result = b.matmul_transpose(&a, &bm);
         assert_eq!(result.shape(), &[2, 2]);
         assert_close(
@@ -1407,7 +1565,10 @@ mod tests {
 
         // B^T: transpose [3,2] -> [2,3]
         // [[7,9,11],[8,10,12]]
-        let bt = dt(Tensor::new(vec![2, 3], vec![7.0, 9.0, 11.0, 8.0, 10.0, 12.0]));
+        let bt = dt(Tensor::new(
+            vec![2, 3],
+            vec![7.0, 9.0, 11.0, 8.0, 10.0, 12.0],
+        ));
         let result_transpose = b.matmul_transpose(&a, &bt);
 
         assert_close(
@@ -1496,7 +1657,12 @@ mod tests {
         let a = dt(Tensor::new(vec![3], vec![1.0, 2.0, 3.0]));
         let bv = dt(Tensor::new(vec![3], vec![10.0, 20.0, 30.0]));
         let result = b.add(&a, &bv);
-        assert_close(result.as_tensor().as_f32(), &[11.0, 22.0, 33.0], 1e-6, "add");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[11.0, 22.0, 33.0],
+            1e-6,
+            "add",
+        );
     }
 
     #[test]
@@ -1505,7 +1671,12 @@ mod tests {
         let a = dt(Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]));
         let bv = dt(Tensor::new(vec![2, 2], vec![10.0, 20.0, 30.0, 40.0]));
         let result = b.add(&a, &bv);
-        assert_close(result.as_tensor().as_f32(), &[11.0, 22.0, 33.0, 44.0], 1e-6, "add 2d");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[11.0, 22.0, 33.0, 44.0],
+            1e-6,
+            "add 2d",
+        );
     }
 
     // ---- add_bias ----
@@ -1545,7 +1716,11 @@ mod tests {
         let result = b.gelu(&t);
         let data = result.as_tensor().as_f32();
         assert!((data[0] - 0.8412).abs() < 0.001, "gelu(1.0) = {}", data[0]);
-        assert!((data[1] - (-0.1588)).abs() < 0.001, "gelu(-1.0) = {}", data[1]);
+        assert!(
+            (data[1] - (-0.1588)).abs() < 0.001,
+            "gelu(-1.0) = {}",
+            data[1]
+        );
     }
 
     #[test]
@@ -1554,7 +1729,10 @@ mod tests {
         // For large x, gelu(x) ~ x
         let t = dt(Tensor::new(vec![1], vec![10.0]));
         let result = b.gelu(&t);
-        assert!((result.as_tensor().as_f32()[0] - 10.0).abs() < 0.001, "gelu(10.0) ~ 10.0");
+        assert!(
+            (result.as_tensor().as_f32()[0] - 10.0).abs() < 0.001,
+            "gelu(10.0) ~ 10.0"
+        );
     }
 
     // ---- silu ----
@@ -1577,7 +1755,11 @@ mod tests {
         let result = b.silu(&t);
         let data = result.as_tensor().as_f32();
         assert!((data[0] - 0.7311).abs() < 0.001, "silu(1.0) = {}", data[0]);
-        assert!((data[1] - (-0.2689)).abs() < 0.001, "silu(-1.0) = {}", data[1]);
+        assert!(
+            (data[1] - (-0.2689)).abs() < 0.001,
+            "silu(-1.0) = {}",
+            data[1]
+        );
     }
 
     // ---- swiglu ----
@@ -1596,7 +1778,11 @@ mod tests {
         // silu(-1.0) * 4.0 = -0.2689 * 4.0 = -1.0756
         assert!((data[0] - 1.4621).abs() < 0.01, "swiglu[0] = {}", data[0]);
         assert!((data[1] - 0.0).abs() < 0.01, "swiglu[1] = {}", data[1]);
-        assert!((data[2] - (-1.0756)).abs() < 0.01, "swiglu[2] = {}", data[2]);
+        assert!(
+            (data[2] - (-1.0756)).abs() < 0.01,
+            "swiglu[2] = {}",
+            data[2]
+        );
     }
 
     // ---- layer_norm ----
@@ -1614,7 +1800,11 @@ mod tests {
         // mean = 2.0, var = 1.0
         // (1 - 2) / sqrt(1 + 1e-5) = -1.0
         // (3 - 2) / sqrt(1 + 1e-5) = 1.0
-        assert!((data[0] - (-1.0)).abs() < 0.01, "layer_norm[0] = {}", data[0]);
+        assert!(
+            (data[0] - (-1.0)).abs() < 0.01,
+            "layer_norm[0] = {}",
+            data[0]
+        );
         assert!((data[1] - 1.0).abs() < 0.01, "layer_norm[1] = {}", data[1]);
     }
 
@@ -1734,15 +1924,26 @@ mod tests {
     #[test]
     fn test_softmax_multi_row() {
         let b = backend();
-        let t = dt(Tensor::new(vec![2, 3], vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0]));
+        let t = dt(Tensor::new(
+            vec![2, 3],
+            vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0],
+        ));
         let result = b.softmax(&t);
         let data = result.as_tensor().as_f32();
 
         // Each row should sum to 1
         let sum_row0: f32 = data[0..3].iter().sum();
         let sum_row1: f32 = data[3..6].iter().sum();
-        assert!((sum_row0 - 1.0).abs() < 1e-5, "softmax row0 sum = {}", sum_row0);
-        assert!((sum_row1 - 1.0).abs() < 1e-5, "softmax row1 sum = {}", sum_row1);
+        assert!(
+            (sum_row0 - 1.0).abs() < 1e-5,
+            "softmax row0 sum = {}",
+            sum_row0
+        );
+        assert!(
+            (sum_row1 - 1.0).abs() < 1e-5,
+            "softmax row1 sum = {}",
+            sum_row1
+        );
     }
 
     #[test]
@@ -1753,18 +1954,22 @@ mod tests {
         let result = b.softmax(&t);
         let data = result.as_tensor().as_f32();
         let sum: f32 = data.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "softmax large values sum = {}", sum);
-        assert!(data.iter().all(|&v| v.is_finite()), "softmax produced non-finite values");
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "softmax large values sum = {}",
+            sum
+        );
+        assert!(
+            data.iter().all(|&v| v.is_finite()),
+            "softmax produced non-finite values"
+        );
     }
 
     #[test]
     fn test_softmax_with_neg_infinity() {
         let b = backend();
         // Masked positions (neg infinity) should get zero probability
-        let t = dt(Tensor::new(
-            vec![1, 3],
-            vec![1.0, f32::NEG_INFINITY, 2.0],
-        ));
+        let t = dt(Tensor::new(vec![1, 3], vec![1.0, f32::NEG_INFINITY, 2.0]));
         let result = b.softmax(&t);
         let data = result.as_tensor().as_f32();
         assert!((data[1] - 0.0).abs() < 1e-6, "masked position should be 0");
@@ -1787,7 +1992,12 @@ mod tests {
         let b = backend();
         let t = dt(Tensor::new(vec![3], vec![1.0, 2.0, 3.0]));
         let result = b.scale(&t, 0.0);
-        assert_close(result.as_tensor().as_f32(), &[0.0, 0.0, 0.0], 1e-6, "scale by 0");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[0.0, 0.0, 0.0],
+            1e-6,
+            "scale by 0",
+        );
     }
 
     // ---- apply_causal_mask ----
@@ -1833,8 +2043,18 @@ mod tests {
         let q = dt(Tensor::new(vec![1, 4], vec![1.0, 2.0, 3.0, 4.0]));
         let k = dt(Tensor::new(vec![1, 4], vec![5.0, 6.0, 7.0, 8.0]));
         let (q_rot, k_rot) = b.rope(&q, &k, 0, 10000.0, 4, 4);
-        assert_close(q_rot.as_tensor().as_f32(), &[1.0, 2.0, 3.0, 4.0], 1e-5, "rope q at pos 0");
-        assert_close(k_rot.as_tensor().as_f32(), &[5.0, 6.0, 7.0, 8.0], 1e-5, "rope k at pos 0");
+        assert_close(
+            q_rot.as_tensor().as_f32(),
+            &[1.0, 2.0, 3.0, 4.0],
+            1e-5,
+            "rope q at pos 0",
+        );
+        assert_close(
+            k_rot.as_tensor().as_f32(),
+            &[5.0, 6.0, 7.0, 8.0],
+            1e-5,
+            "rope k at pos 0",
+        );
     }
 
     #[test]
@@ -1864,8 +2084,20 @@ mod tests {
         let k = dt(Tensor::new(vec![1, 4], vec![5.0, 6.0, 7.0, 8.0]));
         let (q_rot, _) = b.rope(&q, &k, 5, 10000.0, 4, 4);
 
-        let norm_before: f32 = q.as_tensor().as_f32().iter().map(|&x| x * x).sum::<f32>().sqrt();
-        let norm_after: f32 = q_rot.as_tensor().as_f32().iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let norm_before: f32 = q
+            .as_tensor()
+            .as_f32()
+            .iter()
+            .map(|&x| x * x)
+            .sum::<f32>()
+            .sqrt();
+        let norm_after: f32 = q_rot
+            .as_tensor()
+            .as_f32()
+            .iter()
+            .map(|&x| x * x)
+            .sum::<f32>()
+            .sqrt();
         assert!(
             (norm_before - norm_after).abs() < 1e-4,
             "RoPE changed norm: {} -> {}",
@@ -1917,8 +2149,14 @@ mod tests {
         let b = backend();
         // head_dim=8, rope_dim=4: first 4 dims rotated, last 4 unchanged
         // 1 head, seq_len=1
-        let q = dt(Tensor::new(vec![1, 8], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
-        let k = dt(Tensor::new(vec![1, 8], vec![1.0, 0.0, 1.0, 0.0, 9.0, 10.0, 11.0, 12.0]));
+        let q = dt(Tensor::new(
+            vec![1, 8],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        ));
+        let k = dt(Tensor::new(
+            vec![1, 8],
+            vec![1.0, 0.0, 1.0, 0.0, 9.0, 10.0, 11.0, 12.0],
+        ));
         let (q_rot, k_rot) = b.rope(&q, &k, 5, 10000.0, 8, 4);
 
         let q_data = q_rot.as_tensor().as_f32();
@@ -2036,7 +2274,7 @@ mod tests {
     fn test_quantized_matmul_q4_0_asymmetric_nibbles() {
         // Verify that quantized_matmul matches dequantize_q4_0 reference
         // when low and high nibbles differ within each byte.
-        use crate::gguf::quant::{BlockQ4_0, dequantize_q4_0, f32_to_f16};
+        use crate::gguf::quant::{dequantize_q4_0, f32_to_f16, BlockQ4_0};
 
         let b = backend();
         let scale_f16 = f32_to_f16(1.0);
@@ -2076,7 +2314,7 @@ mod tests {
 
     #[test]
     fn test_quantized_matmul_q4_1_vs_dequant() {
-        use crate::gguf::quant::{BlockQ4_1, dequantize_q4_1, f32_to_f16};
+        use crate::gguf::quant::{dequantize_q4_1, f32_to_f16, BlockQ4_1};
 
         let b = backend();
         let block = BlockQ4_1 {
@@ -2084,7 +2322,9 @@ mod tests {
             m: f32_to_f16(0.25),
             qs: {
                 let mut qs = [0u8; 16];
-                for j in 0..16 { qs[j] = (j as u8) | ((j as u8) << 4); }
+                for j in 0..16 {
+                    qs[j] = (j as u8) | ((j as u8) << 4);
+                }
                 qs
             },
         };
@@ -2093,7 +2333,9 @@ mod tests {
         let mut raw = Vec::new();
         raw.extend_from_slice(&f32_to_f16(0.5).to_le_bytes());
         raw.extend_from_slice(&f32_to_f16(0.25).to_le_bytes());
-        for j in 0..16u8 { raw.push(j | (j << 4)); }
+        for j in 0..16u8 {
+            raw.push(j | (j << 4));
+        }
 
         let weights = Tensor::from_quantized(vec![1, 32], TensorDtype::Q4_1, raw);
         let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
@@ -2104,13 +2346,14 @@ mod tests {
         assert!(
             (matmul_val - ref_sum).abs() < 0.1,
             "Q4_1 matmul ({}) must match dequant reference ({})",
-            matmul_val, ref_sum
+            matmul_val,
+            ref_sum
         );
     }
 
     #[test]
     fn test_quantized_matmul_q6_k_vs_dequant() {
-        use crate::gguf::quant::{BlockQ6K, dequantize_q6_k, f32_to_f16};
+        use crate::gguf::quant::{dequantize_q6_k, f32_to_f16, BlockQ6K};
 
         let b = backend();
         // Create a Q6_K block with known scale and data
@@ -2141,13 +2384,14 @@ mod tests {
         assert!(
             (matmul_val - ref_sum).abs() < 0.1,
             "Q6_K matmul ({}) must match dequant reference ({})",
-            matmul_val, ref_sum
+            matmul_val,
+            ref_sum
         );
     }
 
     #[test]
     fn test_quantized_matmul_q4_k_vs_dequant() {
-        use crate::gguf::quant::{BlockQ4K, dequantize_q4_k, f32_to_f16};
+        use crate::gguf::quant::{dequantize_q4_k, f32_to_f16, BlockQ4K};
 
         let b = backend();
         let mut block = BlockQ4K {
@@ -2180,13 +2424,14 @@ mod tests {
         assert!(
             (matmul_val - ref_sum).abs() < 0.1,
             "Q4_K matmul ({}) must match dequant reference ({})",
-            matmul_val, ref_sum
+            matmul_val,
+            ref_sum
         );
     }
 
     #[test]
     fn test_quantized_matmul_q5_0_vs_dequant() {
-        use crate::gguf::quant::{BlockQ5_0, dequantize_q5_0, f32_to_f16};
+        use crate::gguf::quant::{dequantize_q5_0, f32_to_f16, BlockQ5_0};
 
         let b = backend();
         // d=2.0, qs with varied nibbles, qh with some bits set
@@ -2199,7 +2444,9 @@ mod tests {
             },
             qs: {
                 let mut qs = [0u8; 16];
-                for j in 0..16 { qs[j] = ((j as u8) & 0xF) | (((15 - j) as u8) << 4); }
+                for j in 0..16 {
+                    qs[j] = ((j as u8) & 0xF) | (((15 - j) as u8) << 4);
+                }
                 qs
             },
         };
@@ -2221,13 +2468,14 @@ mod tests {
         assert!(
             (matmul_val - ref_sum).abs() < 0.1,
             "Q5_0 matmul ({}) must match dequant reference ({})",
-            matmul_val, ref_sum
+            matmul_val,
+            ref_sum
         );
     }
 
     #[test]
     fn test_quantized_matmul_q5_1_vs_dequant() {
-        use crate::gguf::quant::{BlockQ5_1, dequantize_q5_1, f32_to_f16};
+        use crate::gguf::quant::{dequantize_q5_1, f32_to_f16, BlockQ5_1};
 
         let b = backend();
         let block = BlockQ5_1 {
@@ -2239,7 +2487,9 @@ mod tests {
             },
             qs: {
                 let mut qs = [0u8; 16];
-                for j in 0..16 { qs[j] = 0xA5; } // low=5, high=10
+                for j in 0..16 {
+                    qs[j] = 0xA5;
+                } // low=5, high=10
                 qs
             },
         };
@@ -2262,25 +2512,26 @@ mod tests {
         assert!(
             (matmul_val - ref_sum).abs() < 0.1,
             "Q5_1 matmul ({}) must match dequant reference ({})",
-            matmul_val, ref_sum
+            matmul_val,
+            ref_sum
         );
     }
 
     #[test]
     fn test_quantized_matmul_q5_k_vs_dequant() {
-        use crate::gguf::quant::{BlockQ5K, dequantize_q5_k, f32_to_f16};
+        use crate::gguf::quant::{dequantize_q5_k, f32_to_f16, BlockQ5K};
 
         let b = backend();
         let mut block = BlockQ5K {
             d: f32_to_f16(1.0),
             dmin: f32_to_f16(0.5),
             scales: [0; 12],
-            qh: [0xFF; 32], // all high bits set — exercises wrapping_shl path
+            qh: [0xFF; 32],  // all high bits set — exercises wrapping_shl path
             qs: [0x33; 128], // nibbles = 3
         };
         // Set scales for first 4 sub-blocks
         for i in 0..4 {
-            block.scales[i] = 2;     // scale
+            block.scales[i] = 2; // scale
             block.scales[i + 4] = 1; // min
         }
 
@@ -2304,7 +2555,8 @@ mod tests {
         assert!(
             (matmul_val - ref_sum).abs() < 0.5,
             "Q5_K matmul ({}) must match dequant reference ({})",
-            matmul_val, ref_sum
+            matmul_val,
+            ref_sum
         );
     }
 
@@ -2313,28 +2565,32 @@ mod tests {
     #[test]
     fn test_mean_pool_all_ones_mask() {
         let b = backend();
-        let hidden = dt(Tensor::new(
-            vec![3, 2],
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        ));
+        let hidden = dt(Tensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
         let mask = vec![1.0, 1.0, 1.0];
         let result = b.mean_pool(&hidden, &mask);
         assert_eq!(result.shape(), &[2]);
         // Mean: [(1+3+5)/3, (2+4+6)/3] = [3, 4]
-        assert_close(result.as_tensor().as_f32(), &[3.0, 4.0], 1e-5, "mean_pool all ones");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[3.0, 4.0],
+            1e-5,
+            "mean_pool all ones",
+        );
     }
 
     #[test]
     fn test_mean_pool_partial_mask() {
         let b = backend();
-        let hidden = dt(Tensor::new(
-            vec![3, 2],
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        ));
+        let hidden = dt(Tensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
         let mask = vec![1.0, 1.0, 0.0]; // Only first two tokens
         let result = b.mean_pool(&hidden, &mask);
         // Mean: [(1+3)/2, (2+4)/2] = [2, 3]
-        assert_close(result.as_tensor().as_f32(), &[2.0, 3.0], 1e-5, "mean_pool partial mask");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[2.0, 3.0],
+            1e-5,
+            "mean_pool partial mask",
+        );
     }
 
     #[test]
@@ -2343,7 +2599,12 @@ mod tests {
         let hidden = dt(Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]));
         let mask = vec![0.0, 0.0];
         let result = b.mean_pool(&hidden, &mask);
-        assert_close(result.as_tensor().as_f32(), &[0.0, 0.0], 1e-5, "mean_pool zero mask");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[0.0, 0.0],
+            1e-5,
+            "mean_pool zero mask",
+        );
     }
 
     // ---- l2_normalize ----
@@ -2365,7 +2626,11 @@ mod tests {
         let result = b.l2_normalize(&t);
         let data = result.as_tensor().as_f32();
         let norm: f32 = data.iter().map(|&x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "normalized vector should have norm 1, got {}", norm);
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "normalized vector should have norm 1, got {}",
+            norm
+        );
     }
 
     #[test]
@@ -2373,7 +2638,12 @@ mod tests {
         let b = backend();
         let t = dt(Tensor::new(vec![3], vec![0.0, 0.0, 0.0]));
         let result = b.l2_normalize(&t);
-        assert_close(result.as_tensor().as_f32(), &[0.0, 0.0, 0.0], 1e-6, "l2_normalize zero");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[0.0, 0.0, 0.0],
+            1e-6,
+            "l2_normalize zero",
+        );
     }
 
     // ---- embedding_lookup ----
@@ -2405,22 +2675,21 @@ mod tests {
     #[test]
     fn test_embedding_lookup_single() {
         let b = backend();
-        let table = dt(Tensor::new(
-            vec![3, 2],
-            vec![0.0, 0.1, 1.0, 1.1, 2.0, 2.1],
-        ));
+        let table = dt(Tensor::new(vec![3, 2], vec![0.0, 0.1, 1.0, 1.1, 2.0, 2.1]));
         let result = b.embedding_lookup(&table, &[1]);
         assert_eq!(result.shape(), &[1, 2]);
-        assert_close(result.as_tensor().as_f32(), &[1.0, 1.1], 1e-6, "embedding single");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[1.0, 1.1],
+            1e-6,
+            "embedding single",
+        );
     }
 
     #[test]
     fn test_embedding_lookup_repeated() {
         let b = backend();
-        let table = dt(Tensor::new(
-            vec![2, 2],
-            vec![10.0, 20.0, 30.0, 40.0],
-        ));
+        let table = dt(Tensor::new(vec![2, 2], vec![10.0, 20.0, 30.0, 40.0]));
         let result = b.embedding_lookup(&table, &[0, 0, 1, 0]);
         assert_eq!(result.shape(), &[4, 2]);
         assert_close(
@@ -2534,13 +2803,28 @@ mod tests {
         let data = result.as_tensor().as_f32();
 
         // gelu(-5) should be close to 0
-        assert!(data[0].abs() < 0.01, "gelu(-5) should be ~0, got {}", data[0]);
+        assert!(
+            data[0].abs() < 0.01,
+            "gelu(-5) should be ~0, got {}",
+            data[0]
+        );
         // gelu(0) = 0
-        assert!((data[2]).abs() < 1e-6, "gelu(0) should be 0, got {}", data[2]);
+        assert!(
+            (data[2]).abs() < 1e-6,
+            "gelu(0) should be 0, got {}",
+            data[2]
+        );
         // gelu(5) should be close to 5
-        assert!((data[4] - 5.0).abs() < 0.01, "gelu(5) should be ~5, got {}", data[4]);
+        assert!(
+            (data[4] - 5.0).abs() < 0.01,
+            "gelu(5) should be ~5, got {}",
+            data[4]
+        );
         // For positive inputs, gelu should be monotonically increasing
-        assert!(data[3] < data[4], "gelu should increase for positive values");
+        assert!(
+            data[3] < data[4],
+            "gelu should increase for positive values"
+        );
     }
 
     // ====================================================================
@@ -2613,10 +2897,7 @@ mod tests {
         let gate_weights = dt(Tensor::new(
             vec![4, 4],
             vec![
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0,
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
             ],
         ));
         let gate = b.matmul(&normed, &gate_weights);
@@ -2634,7 +2915,9 @@ mod tests {
             assert!(
                 (swiglu_data[i] - expected).abs() < 1e-4,
                 "swiglu at {}: got {}, expected {}",
-                i, swiglu_data[i], expected
+                i,
+                swiglu_data[i],
+                expected
             );
         }
 
@@ -2655,7 +2938,12 @@ mod tests {
         let a = dt(Tensor::new(vec![1, 1], vec![3.0]));
         let bm = dt(Tensor::new(vec![1, 1], vec![4.0]));
         let result = b.matmul_transpose(&a, &bm);
-        assert_close(result.as_tensor().as_f32(), &[12.0], 1e-6, "matmul_transpose 1x1");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[12.0],
+            1e-6,
+            "matmul_transpose 1x1",
+        );
     }
 
     // -- Layer norm with constant input --
@@ -2697,7 +2985,10 @@ mod tests {
         let b = backend();
         let t = dt(Tensor::new(vec![1, 1], vec![42.0]));
         let result = b.softmax(&t);
-        assert!((result.as_tensor().as_f32()[0] - 1.0).abs() < 1e-6, "softmax of single element");
+        assert!(
+            (result.as_tensor().as_f32()[0] - 1.0).abs() < 1e-6,
+            "softmax of single element"
+        );
     }
 
     // -- Scale with negative factor --
@@ -2707,7 +2998,12 @@ mod tests {
         let b = backend();
         let t = dt(Tensor::new(vec![3], vec![1.0, -2.0, 3.0]));
         let result = b.scale(&t, -1.0);
-        assert_close(result.as_tensor().as_f32(), &[-1.0, 2.0, -3.0], 1e-6, "scale by -1");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[-1.0, 2.0, -3.0],
+            1e-6,
+            "scale by -1",
+        );
     }
 
     // -- Causal mask on non-square matrix --
@@ -2715,10 +3011,7 @@ mod tests {
     #[test]
     fn test_causal_mask_2x3() {
         let b = backend();
-        let scores = dt(Tensor::new(
-            vec![2, 3],
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        ));
+        let scores = dt(Tensor::new(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
         let result = b.apply_causal_mask(&scores, 2);
         let data = result.as_tensor().as_f32();
         // Row 0: [1.0, -inf, -inf]
@@ -2782,7 +3075,12 @@ mod tests {
         let hidden = dt(Tensor::new(vec![1, 3], vec![1.0, 2.0, 3.0]));
         let mask = vec![1.0];
         let result = b.mean_pool(&hidden, &mask);
-        assert_close(result.as_tensor().as_f32(), &[1.0, 2.0, 3.0], 1e-5, "single token mean_pool");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[1.0, 2.0, 3.0],
+            1e-5,
+            "single token mean_pool",
+        );
     }
 
     // -- L2 normalize already-unit vector --
@@ -2823,9 +3121,7 @@ mod tests {
                 raw.push(((row * 10 + i) % 127) as u8);
             }
         }
-        let table = DeviceTensor::new(
-            Tensor::from_quantized(vec![3, 32], TensorDtype::Q8_0, raw),
-        );
+        let table = DeviceTensor::new(Tensor::from_quantized(vec![3, 32], TensorDtype::Q8_0, raw));
         let result = b.embedding_lookup(&table, &[1, 0]);
         assert_eq!(result.shape(), &[2, 32]);
         // Verify it returns finite values
@@ -2871,7 +3167,12 @@ mod tests {
         let up = dt(Tensor::new(vec![3], vec![100.0, 200.0, 300.0]));
         let result = b.swiglu(&gate, &up);
         // silu(0) = 0, so output is all zeros
-        assert_close(result.as_tensor().as_f32(), &[0.0, 0.0, 0.0], 1e-6, "swiglu zero gate");
+        assert_close(
+            result.as_tensor().as_f32(),
+            &[0.0, 0.0, 0.0],
+            1e-6,
+            "swiglu zero gate",
+        );
     }
 
     // -- Softmax then matmul (attention pattern) --
@@ -2923,12 +3224,7 @@ mod tests {
         let b = backend();
         let table = dt(Tensor::new(
             vec![4, 3],
-            vec![
-                1.0, 0.0, 0.0,
-                0.0, 1.0, 0.0,
-                0.0, 0.0, 1.0,
-                1.0, 1.0, 1.0,
-            ],
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
         ));
         let ids = &[0, 1, 2];
         let embedded = b.embedding_lookup(&table, ids);
@@ -2943,8 +3239,18 @@ mod tests {
         assert_eq!(pooled.shape(), &[3]);
 
         let normalized = b.l2_normalize(&pooled);
-        let norm: f32 = normalized.as_tensor().as_f32().iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "l2 norm should be 1.0, got {}", norm);
+        let norm: f32 = normalized
+            .as_tensor()
+            .as_f32()
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "l2 norm should be 1.0, got {}",
+            norm
+        );
     }
 
     // -- Send + Sync --
@@ -2974,7 +3280,10 @@ mod tests {
                 assert!(
                     (data[i * cols + j] - expected).abs() < 1e-6,
                     "add_bias[{},{}]: got {}, expected {}",
-                    i, j, data[i * cols + j], expected
+                    i,
+                    j,
+                    data[i * cols + j],
+                    expected
                 );
             }
         }
@@ -3002,7 +3311,11 @@ mod tests {
         assert_eq!(result.shape(), &[1, 1]);
         // Sum of 32 ones = 32.0 (within f16 precision)
         let val = result.as_tensor().as_f32()[0];
-        assert!((val - 32.0).abs() < 0.5, "identity-like Q8_0 matmul: got {}", val);
+        assert!(
+            (val - 32.0).abs() < 0.5,
+            "identity-like Q8_0 matmul: got {}",
+            val
+        );
     }
 
     // --- Tests for Phase 0 new methods ---
@@ -3023,7 +3336,10 @@ mod tests {
         let c = dt(Tensor::new(vec![3], vec![10.0, 20.0, 30.0]));
         let result = b.mul(&a, &c);
         assert_eq!(result.shape(), &[2, 3]);
-        assert_eq!(result.as_tensor().as_f32(), &[10.0, 40.0, 90.0, 40.0, 100.0, 180.0]);
+        assert_eq!(
+            result.as_tensor().as_f32(),
+            &[10.0, 40.0, 90.0, 40.0, 100.0, 180.0]
+        );
     }
 
     #[test]
@@ -3069,13 +3385,25 @@ mod tests {
         assert_eq!(result.shape(), &[4]);
 
         // geglu(-1, 1) = gelu(-1) * 1; gelu(-1) ≈ -0.1588
-        assert!((data[0] - (-0.1588)).abs() < 0.01, "geglu(-1, 1) = {}", data[0]);
+        assert!(
+            (data[0] - (-0.1588)).abs() < 0.01,
+            "geglu(-1, 1) = {}",
+            data[0]
+        );
         // geglu(0, 2) = gelu(0) * 2 = 0
         assert!((data[1] - 0.0).abs() < 1e-6, "geglu(0, 2) = {}", data[1]);
         // geglu(1, 3) = gelu(1) * 3; gelu(1) ≈ 0.8412
-        assert!((data[2] - 0.8412 * 3.0).abs() < 0.05, "geglu(1, 3) = {}", data[2]);
+        assert!(
+            (data[2] - 0.8412 * 3.0).abs() < 0.05,
+            "geglu(1, 3) = {}",
+            data[2]
+        );
         // geglu(2, 4) = gelu(2) * 4; gelu(2) ≈ 1.9545
-        assert!((data[3] - 1.9545 * 4.0).abs() < 0.05, "geglu(2, 4) = {}", data[3]);
+        assert!(
+            (data[3] - 1.9545 * 4.0).abs() < 0.05,
+            "geglu(2, 4) = {}",
+            data[3]
+        );
     }
 
     #[test]
@@ -3100,8 +3428,14 @@ mod tests {
         // At position 0, all rotations are by angle 0, so cos=1, sin=0 -> no change
         let q_data = q_rot.as_tensor().as_f32();
         let k_data = k_rot.as_tensor().as_f32();
-        assert!((q_data[0] - 1.0).abs() < 1e-5, "rope_neox pos=0 should preserve q");
-        assert!((k_data[1] - 1.0).abs() < 1e-5, "rope_neox pos=0 should preserve k");
+        assert!(
+            (q_data[0] - 1.0).abs() < 1e-5,
+            "rope_neox pos=0 should preserve q"
+        );
+        assert!(
+            (k_data[1] - 1.0).abs() < 1e-5,
+            "rope_neox pos=0 should preserve k"
+        );
     }
 
     #[test]
@@ -3119,15 +3453,35 @@ mod tests {
 
         // RoPE is a rotation, so it should preserve the norm of each head
         for head_start in (0..16).step_by(4) {
-            let orig_q_norm: f32 = (0..4).map(|j| q_data[head_start + j].powi(2)).sum::<f32>().sqrt();
-            let rot_q_norm: f32 = (0..4).map(|j| q_rot_data[head_start + j].powi(2)).sum::<f32>().sqrt();
-            assert!((orig_q_norm - rot_q_norm).abs() < 1e-4,
-                "rope_neox Q norm: orig={}, rot={}", orig_q_norm, rot_q_norm);
+            let orig_q_norm: f32 = (0..4)
+                .map(|j| q_data[head_start + j].powi(2))
+                .sum::<f32>()
+                .sqrt();
+            let rot_q_norm: f32 = (0..4)
+                .map(|j| q_rot_data[head_start + j].powi(2))
+                .sum::<f32>()
+                .sqrt();
+            assert!(
+                (orig_q_norm - rot_q_norm).abs() < 1e-4,
+                "rope_neox Q norm: orig={}, rot={}",
+                orig_q_norm,
+                rot_q_norm
+            );
 
-            let orig_k_norm: f32 = (0..4).map(|j| k_data[head_start + j].powi(2)).sum::<f32>().sqrt();
-            let rot_k_norm: f32 = (0..4).map(|j| k_rot_data[head_start + j].powi(2)).sum::<f32>().sqrt();
-            assert!((orig_k_norm - rot_k_norm).abs() < 1e-4,
-                "rope_neox K norm: orig={}, rot={}", orig_k_norm, rot_k_norm);
+            let orig_k_norm: f32 = (0..4)
+                .map(|j| k_data[head_start + j].powi(2))
+                .sum::<f32>()
+                .sqrt();
+            let rot_k_norm: f32 = (0..4)
+                .map(|j| k_rot_data[head_start + j].powi(2))
+                .sum::<f32>()
+                .sqrt();
+            assert!(
+                (orig_k_norm - rot_k_norm).abs() < 1e-4,
+                "rope_neox K norm: orig={}, rot={}",
+                orig_k_norm,
+                rot_k_norm
+            );
         }
     }
 
@@ -3149,8 +3503,14 @@ mod tests {
         let q_neox_data = q_neox.as_tensor().as_f32();
 
         // They should differ (different pairing schemes)
-        let differs = q_norm_data.iter().zip(q_neox_data).any(|(a, b)| (a - b).abs() > 1e-6);
-        assert!(differs, "rope_neox should produce different results from rope for non-zero positions");
+        let differs = q_norm_data
+            .iter()
+            .zip(q_neox_data)
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(
+            differs,
+            "rope_neox should produce different results from rope for non-zero positions"
+        );
     }
 
     #[test]
@@ -3167,7 +3527,10 @@ mod tests {
         let k_rot_data = k_rot.as_tensor().as_f32();
 
         // Dims 4-7 should be unchanged (pass-through)
-        assert!((q_rot_data[4] - 5.0).abs() < 1e-6, "rope_neox should pass through unrotated dims");
+        assert!(
+            (q_rot_data[4] - 5.0).abs() < 1e-6,
+            "rope_neox should pass through unrotated dims"
+        );
         assert!((q_rot_data[5] - 6.0).abs() < 1e-6);
         assert!((q_rot_data[6] - 7.0).abs() < 1e-6);
         assert!((q_rot_data[7] - 8.0).abs() < 1e-6);
@@ -3203,20 +3566,29 @@ mod tests {
         // Q: [1, 4] (2 heads * 2 dim)
         let q = dt(Tensor::new(vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]));
         // K: [3, 4], V: [3, 4]
-        let k = dt(Tensor::new(vec![3, 4], vec![
-            1.0, 0.0, 0.0, 1.0,   // pos 0
-            0.0, 1.0, 1.0, 0.0,   // pos 1
-            1.0, 1.0, 1.0, 1.0,   // pos 2
-        ]));
-        let v = dt(Tensor::new(vec![3, 4], vec![
-            1.0, 0.0, 0.0, 1.0,
-            0.0, 1.0, 1.0, 0.0,
-            0.5, 0.5, 0.5, 0.5,
-        ]));
+        let k = dt(Tensor::new(
+            vec![3, 4],
+            vec![
+                1.0, 0.0, 0.0, 1.0, // pos 0
+                0.0, 1.0, 1.0, 0.0, // pos 1
+                1.0, 1.0, 1.0, 1.0, // pos 2
+            ],
+        ));
+        let v = dt(Tensor::new(
+            vec![3, 4],
+            vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.5, 0.5, 0.5, 0.5],
+        ));
 
         let result = b.grouped_attention_decode(
-            &q, &k, &v, total_len, num_heads, num_kv_heads, head_dim,
-            1.0 / (head_dim as f32).sqrt(), 0.0,
+            &q,
+            &k,
+            &v,
+            total_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            1.0 / (head_dim as f32).sqrt(),
+            0.0,
         );
 
         assert_eq!(result.shape(), &[1, 4]);
@@ -3238,26 +3610,36 @@ mod tests {
         let total_len = 2;
 
         // Q: [1, 8] (4 heads * 2 dim)
-        let q = dt(Tensor::new(vec![1, 8], vec![
-            1.0, 0.0,  // head 0 (maps to kv_head 0)
-            0.0, 1.0,  // head 1 (maps to kv_head 0)
-            1.0, 1.0,  // head 2 (maps to kv_head 1)
-            -1.0, 0.0, // head 3 (maps to kv_head 1)
-        ]));
+        let q = dt(Tensor::new(
+            vec![1, 8],
+            vec![
+                1.0, 0.0, // head 0 (maps to kv_head 0)
+                0.0, 1.0, // head 1 (maps to kv_head 0)
+                1.0, 1.0, // head 2 (maps to kv_head 1)
+                -1.0, 0.0, // head 3 (maps to kv_head 1)
+            ],
+        ));
         // K: [2, 4] (2 kv_heads * 2 dim)
-        let k = dt(Tensor::new(vec![2, 4], vec![
-            1.0, 0.0, 0.0, 1.0,
-            0.0, 1.0, 1.0, 0.0,
-        ]));
+        let k = dt(Tensor::new(
+            vec![2, 4],
+            vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+        ));
         // V: [2, 4]
-        let v = dt(Tensor::new(vec![2, 4], vec![
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-        ]));
+        let v = dt(Tensor::new(
+            vec![2, 4],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        ));
 
         let result = b.grouped_attention_decode(
-            &q, &k, &v, total_len, num_heads, num_kv_heads, head_dim,
-            1.0 / (head_dim as f32).sqrt(), 0.0,
+            &q,
+            &k,
+            &v,
+            total_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            1.0 / (head_dim as f32).sqrt(),
+            0.0,
         );
 
         assert_eq!(result.shape(), &[1, 8]);
@@ -3284,26 +3666,34 @@ mod tests {
 
         // Large Q to produce large dot products
         let q = dt(Tensor::new(vec![1, 2], vec![10.0, 10.0]));
-        let k = dt(Tensor::new(vec![2, 2], vec![
-            10.0, 10.0,
-            -10.0, -10.0,
-        ]));
-        let v = dt(Tensor::new(vec![2, 2], vec![
-            1.0, 0.0,
-            0.0, 1.0,
-        ]));
+        let k = dt(Tensor::new(vec![2, 2], vec![10.0, 10.0, -10.0, -10.0]));
+        let v = dt(Tensor::new(vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]));
 
         // Without softcap
         let result_no_cap = b.grouped_attention_decode(
-            &q, &k, &v, total_len, num_heads, num_kv_heads, head_dim,
-            1.0, 0.0,
+            &q,
+            &k,
+            &v,
+            total_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            1.0,
+            0.0,
         );
         let out_no_cap = b.download(&result_no_cap).as_f32().to_vec();
 
         // With softcap=1.0 (aggressive capping)
         let result_cap = b.grouped_attention_decode(
-            &q, &k, &v, total_len, num_heads, num_kv_heads, head_dim,
-            1.0, 1.0,
+            &q,
+            &k,
+            &v,
+            total_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            1.0,
+            1.0,
         );
         let out_cap = b.download(&result_cap).as_f32().to_vec();
 
@@ -3314,7 +3704,8 @@ mod tests {
         assert!(
             diff_cap < diff_no_cap,
             "Softcap should make output more uniform: diff_no_cap={}, diff_cap={}",
-            diff_no_cap, diff_cap
+            diff_no_cap,
+            diff_cap
         );
     }
 
@@ -3326,13 +3717,15 @@ mod tests {
         let k = dt(Tensor::new(vec![1, 4], vec![0.5, 0.5, 0.5, 0.5]));
         let v = dt(Tensor::new(vec![1, 4], vec![10.0, 20.0, 30.0, 40.0]));
 
-        let result = b.grouped_attention_decode(
-            &q, &k, &v, 1, 2, 2, 2,
-            1.0 / (2.0f32).sqrt(), 0.0,
-        );
+        let result = b.grouped_attention_decode(&q, &k, &v, 1, 2, 2, 2, 1.0 / (2.0f32).sqrt(), 0.0);
 
         let out = b.download(&result).as_f32().to_vec();
         // With a single position, output should equal V (softmax = 1.0)
-        assert_close(&out, &[10.0, 20.0, 30.0, 40.0], 1e-5, "single token attention");
+        assert_close(
+            &out,
+            &[10.0, 20.0, 30.0, 40.0],
+            1e-5,
+            "single token attention",
+        );
     }
 }

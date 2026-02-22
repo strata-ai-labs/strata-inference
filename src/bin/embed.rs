@@ -47,7 +47,9 @@ struct Args {
 }
 
 fn validate_normalize(s: &str) -> Result<i32, String> {
-    let n: i32 = s.parse().map_err(|_| format!("'{}' is not a valid integer", s))?;
+    let n: i32 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid integer", s))?;
     match n {
         2 => Ok(n),
         _ => Err(format!(

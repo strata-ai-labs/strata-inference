@@ -100,6 +100,7 @@ pub struct CudaBackend {
     fn_tanh_kernel: CUfunction,
     fn_l2_normalize: CUfunction,
     fn_embedding_lookup: CUfunction,
+    fn_grouped_attn_decode: CUfunction,
 }
 
 // SAFETY: All CUDA function handles are process-global, and the Driver API is
@@ -153,8 +154,9 @@ impl CudaBackend {
                 let cname = concat!($name, "\0");
                 let cstr =
                     unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(cname.as_bytes()) };
-                api.module_get_function(module, cstr)
-                    .map_err(|e| InferenceError::Backend(format!("CUDA kernel '{}': {}", $name, e)))?
+                api.module_get_function(module, cstr).map_err(|e| {
+                    InferenceError::Backend(format!("CUDA kernel '{}': {}", $name, e))
+                })?
             }};
         }
 
@@ -180,8 +182,9 @@ impl CudaBackend {
         let fn_tanh_kernel = get_fn!("tanh_kernel");
         let fn_l2_normalize = get_fn!("l2_normalize");
         let fn_embedding_lookup = get_fn!("embedding_lookup");
+        let fn_grouped_attn_decode = get_fn!("grouped_attn_decode");
 
-        debug!("CudaBackend initialized with 22 kernel functions");
+        debug!("CudaBackend initialized with 23 kernel functions");
 
         Ok(Self {
             api,
@@ -210,6 +213,7 @@ impl CudaBackend {
             fn_tanh_kernel,
             fn_l2_normalize,
             fn_embedding_lookup,
+            fn_grouped_attn_decode,
         })
     }
 
@@ -357,22 +361,14 @@ impl CudaBackend {
         }
     }
 
-    /// Copy device memory from src to dst buffer (same size).
+    /// Copy device memory from src to dst (device-to-device via cuMemcpy).
     fn copy_device_to_device(
         &self,
         dst: CUdeviceptr,
         src: CUdeviceptr,
         bytesize: usize,
     ) -> Result<(), String> {
-        // Use cuMemcpyDtoD via H2D trick: read src to host, write to dst.
-        // For simplicity, we use memcpy_d_to_h + memcpy_h_to_d.
-        // A proper implementation would use cuMemcpy, but our FFI doesn't expose it.
-        let mut temp = vec![0u8; bytesize];
-        self.api
-            .memcpy_d_to_h(temp.as_mut_ptr() as *mut c_void, src, bytesize)?;
-        self.api
-            .memcpy_h_to_d(dst, temp.as_ptr() as *const c_void, bytesize)?;
-        Ok(())
+        self.api.memcpy(dst, src, bytesize)
     }
 
     // -----------------------------------------------------------------------
@@ -456,48 +452,51 @@ impl ComputeBackend for CudaBackend {
         let shape = tensor.shape().to_vec();
         let dtype = tensor.dtype();
 
-        let buf = match tensor.storage() {
+        let (buf, effective_dtype) = match tensor.storage() {
             TensorStorage::F32(data) => {
                 trace!(shape = ?shape, dtype = ?dtype, "CUDA upload F32");
-                match self.upload_f32(data) {
+                let buf = match self.upload_f32(data) {
                     Ok(buf) => buf,
                     Err(e) => {
                         tracing::warn!(error = %e, "CUDA: upload F32 failed");
                         panic!("CUDA: failed to upload F32 tensor: {}", e);
                     }
-                }
+                };
+                (buf, TensorDtype::F32)
             }
             TensorStorage::F16(data) => {
-                // Upload raw f16 bits as bytes
-                trace!(shape = ?shape, dtype = ?dtype, "CUDA upload F16");
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        data.as_ptr() as *const u8,
-                        data.len() * 2,
-                    )
-                };
-                match self.upload_raw(bytes) {
+                // Convert F16 to F32 on the host before uploading.
+                // All compute kernels (matmul, add, etc.) operate on F32 data,
+                // so we dequantize once at upload time.
+                trace!(shape = ?shape, dtype = ?dtype, "CUDA upload F16 (convert to F32)");
+                let f32_data: Vec<f32> = data
+                    .iter()
+                    .map(|&b| half::f16::from_bits(b).to_f32())
+                    .collect();
+                let buf = match self.upload_f32(&f32_data) {
                     Ok(buf) => buf,
                     Err(e) => {
                         tracing::warn!(error = %e, "CUDA: upload F16 failed");
                         panic!("CUDA: failed to upload F16 tensor: {}", e);
                     }
-                }
+                };
+                (buf, TensorDtype::F32)
             }
             TensorStorage::Quantized(data) => {
                 // Upload raw quantized block data as bytes
                 trace!(shape = ?shape, dtype = ?dtype, "CUDA upload Quantized");
-                match self.upload_raw(data) {
+                let buf = match self.upload_raw(data) {
                     Ok(buf) => buf,
                     Err(e) => {
                         tracing::warn!(error = %e, "CUDA: upload Quantized failed");
                         panic!("CUDA: failed to upload Quantized tensor: {}", e);
                     }
-                }
+                };
+                (buf, dtype)
             }
         };
 
-        Self::wrap(buf, shape, dtype)
+        Self::wrap(buf, shape, effective_dtype)
     }
 
     fn download(&self, dt: &DeviceTensor) -> Tensor {
@@ -547,7 +546,9 @@ impl ComputeBackend for CudaBackend {
                     }
                 }
             }
-            TensorDtype::Q8_0 | TensorDtype::Q4_0 => {
+            _ => {
+                // Generic quantized download: compute block count from dtype methods.
+                // Handles Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K.
                 let n_elements: usize = shape.iter().product();
                 let block_size = dtype.block_size();
                 let block_byte_size = dtype.block_byte_size();
@@ -570,7 +571,11 @@ impl ComputeBackend for CudaBackend {
     fn matmul(&self, a: &DeviceTensor, b: &DeviceTensor) -> DeviceTensor {
         let (m, k) = Self::shape_2d(a);
         let (k2, n) = Self::shape_2d(b);
-        assert_eq!(k, k2, "matmul dimension mismatch: a cols {} != b rows {}", k, k2);
+        assert_eq!(
+            k, k2,
+            "matmul dimension mismatch: a cols {} != b rows {}",
+            k, k2
+        );
 
         let out = match self.alloc_zeros_f32(m * n) {
             Ok(buf) => buf,
@@ -721,16 +726,18 @@ impl ComputeBackend for CudaBackend {
         let weight_shape = weights.shape();
         let dtype = weights.dtype();
 
-        let m = if input_shape.len() == 1 { 1 } else { input_shape[0] };
+        let m = if input_shape.len() == 1 {
+            1
+        } else {
+            input_shape[0]
+        };
         let k = *input_shape.last().unwrap();
         let n = weight_shape[0];
 
         assert_eq!(
-            k,
-            weight_shape[1],
+            k, weight_shape[1],
             "quantized_matmul: input cols ({}) must match weight cols ({})",
-            k,
-            weight_shape[1]
+            k, weight_shape[1]
         );
 
         let out = match self.alloc_zeros_f32(m * n) {
@@ -755,12 +762,14 @@ impl ComputeBackend for CudaBackend {
             }
             _ if dtype.is_quantized() => {
                 // K-quant and other types without native CUDA kernels: dequant fallback.
+                // Download quantized weights from GPU, dequantize on CPU, re-upload as F32.
                 tracing::debug!(
                     ?dtype,
                     "CUDA quantized_matmul: no native kernel for {:?}, using dequant fallback",
                     dtype
                 );
-                let weights_f32 = weights.as_tensor().to_f32();
+                let weights_host = self.download(weights);
+                let weights_f32 = weights_host.to_f32();
                 let weights_f32_dev = self.upload(&weights_f32);
                 return self.matmul_transpose(input, &weights_f32_dev);
             }
@@ -847,19 +856,21 @@ impl ComputeBackend for CudaBackend {
         let a_buf = Self::get_buf(a);
         let bias_buf = Self::get_buf(bias);
 
-        // Copy a to output first, then add bias in-place
-        // Actually, our add_bias kernel does: out[row * cols + col] = a[row * cols + col] + bias[col]
-        // So we dispatch directly.
-        let mut p_a = a_buf.ptr;
+        // Copy input to output first, then add bias in-place on the output buffer.
+        // The PTX kernel takes (t, bias, rows, cols) and modifies t in-place.
+        let bytesize = n_total * std::mem::size_of::<f32>();
+        if let Err(e) = self.copy_device_to_device(out.ptr, a_buf.ptr, bytesize) {
+            tracing::warn!(error = %e, "CUDA: add_bias copy failed");
+        }
+
+        let mut p_t = out.ptr;
         let mut p_bias = bias_buf.ptr;
-        let mut p_out = out.ptr;
         let mut p_rows = rows as u32;
         let mut p_cols = cols as u32;
 
-        let mut params: [*mut c_void; 5] = [
-            &mut p_a as *mut _ as *mut c_void,
+        let mut params: [*mut c_void; 4] = [
+            &mut p_t as *mut _ as *mut c_void,
             &mut p_bias as *mut _ as *mut c_void,
-            &mut p_out as *mut _ as *mut c_void,
             &mut p_rows as *mut _ as *mut c_void,
             &mut p_cols as *mut _ as *mut c_void,
         ];
@@ -1037,16 +1048,17 @@ impl ComputeBackend for CudaBackend {
         let w_buf = Self::get_buf(weight);
 
         let mut p_in = t_buf.ptr;
-        let mut p_out = out.ptr;
         let mut p_w = w_buf.ptr;
+        let mut p_out = out.ptr;
         let mut p_rows = rows as u32;
         let mut p_cols = cols as u32;
         let mut p_eps = eps;
 
+        // Order must match PTX: param_in, param_w, param_out, param_rows, param_cols, param_eps
         let mut params: [*mut c_void; 6] = [
             &mut p_in as *mut _ as *mut c_void,
-            &mut p_out as *mut _ as *mut c_void,
             &mut p_w as *mut _ as *mut c_void,
+            &mut p_out as *mut _ as *mut c_void,
             &mut p_rows as *mut _ as *mut c_void,
             &mut p_cols as *mut _ as *mut c_void,
             &mut p_eps as *mut _ as *mut c_void,
@@ -1205,7 +1217,11 @@ impl ComputeBackend for CudaBackend {
             rope_dim,
             head_dim
         );
-        assert!(rope_dim % 2 == 0, "rope: rope_dim ({}) must be even", rope_dim);
+        assert!(
+            rope_dim % 2 == 0,
+            "rope: rope_dim ({}) must be even",
+            rope_dim
+        );
 
         trace!(
             q_shape = ?q.shape(),
@@ -1218,10 +1234,24 @@ impl ComputeBackend for CudaBackend {
         );
 
         let q_out = unsafe {
-            self.dispatch_rope(self.fn_rope_norm, q, pos_offset, freq_base, head_dim, rope_dim)
+            self.dispatch_rope(
+                self.fn_rope_norm,
+                q,
+                pos_offset,
+                freq_base,
+                head_dim,
+                rope_dim,
+            )
         };
         let k_out = unsafe {
-            self.dispatch_rope(self.fn_rope_norm, k, pos_offset, freq_base, head_dim, rope_dim)
+            self.dispatch_rope(
+                self.fn_rope_norm,
+                k,
+                pos_offset,
+                freq_base,
+                head_dim,
+                rope_dim,
+            )
         };
 
         (q_out, k_out)
@@ -1298,13 +1328,18 @@ impl ComputeBackend for CudaBackend {
 
         let t_buf = Self::get_buf(t);
 
-        let mut p_in = t_buf.ptr;
-        let mut p_out = out.ptr;
+        // Copy input to output first — the PTX kernel normalizes in-place
+        // (takes only data ptr + n, reads and writes to the same buffer).
+        let bytesize = n * std::mem::size_of::<f32>();
+        if let Err(e) = self.copy_device_to_device(out.ptr, t_buf.ptr, bytesize) {
+            tracing::warn!(error = %e, "CUDA: l2_normalize copy failed");
+        }
+
+        let mut p_data = out.ptr;
         let mut p_n = n as u32;
 
-        let mut params: [*mut c_void; 3] = [
-            &mut p_in as *mut _ as *mut c_void,
-            &mut p_out as *mut _ as *mut c_void,
+        let mut params: [*mut c_void; 2] = [
+            &mut p_data as *mut _ as *mut c_void,
             &mut p_n as *mut _ as *mut c_void,
         ];
 
@@ -1332,7 +1367,9 @@ impl ComputeBackend for CudaBackend {
             assert!(
                 (id as usize) < vocab_size,
                 "embedding_lookup: token_id {} at index {} is out of range (vocab_size = {})",
-                id, i, vocab_size
+                id,
+                i,
+                vocab_size
             );
         }
 
@@ -1385,11 +1422,7 @@ impl ComputeBackend for CudaBackend {
         ];
 
         // Grid: (ceil(hidden/256), num_tokens, 1) — kernel uses blockIdx.y as token index
-        let grid = (
-            Self::div_ceil(hidden_size as u32, 256),
-            n_tokens as u32,
-            1,
-        );
+        let grid = (Self::div_ceil(hidden_size as u32, 256), n_tokens as u32, 1);
         let block = (256, 1, 1);
         unsafe {
             self.launch(self.fn_embedding_lookup, grid, block, 0, &mut params);
@@ -1421,12 +1454,14 @@ impl ComputeBackend for CudaBackend {
             let mut p_b = b_buf.ptr;
             let mut p_out = out.ptr;
             let mut p_n = n as u32;
+            let mut p_b_len = n as u32;
 
-            let mut params: [*mut c_void; 4] = [
+            let mut params: [*mut c_void; 5] = [
                 &mut p_a as *mut _ as *mut c_void,
                 &mut p_b as *mut _ as *mut c_void,
                 &mut p_out as *mut _ as *mut c_void,
                 &mut p_n as *mut _ as *mut c_void,
+                &mut p_b_len as *mut _ as *mut c_void,
             ];
 
             let grid = (Self::div_ceil(n as u32, 256), 1, 1);
@@ -1583,28 +1618,131 @@ impl ComputeBackend for CudaBackend {
         (q_out, k_out)
     }
 
-    fn copy_rows_into(
-        &self,
-        _dest: &DeviceTensor,
-        _src: &DeviceTensor,
-        _dest_row_offset: usize,
-    ) {
-        todo!("CUDA copy_rows_into not yet implemented");
+    fn copy_rows_into(&self, dest: &DeviceTensor, src: &DeviceTensor, dest_row_offset: usize) {
+        debug_assert_eq!(
+            src.dtype(),
+            TensorDtype::F32,
+            "copy_rows_into: src must be F32"
+        );
+        debug_assert_eq!(
+            dest.dtype(),
+            TensorDtype::F32,
+            "copy_rows_into: dest must be F32"
+        );
+        let cols = dest.shape().last().copied().unwrap_or(0);
+        let n_rows = src.shape()[0];
+        let count = n_rows * cols; // number of f32 elements to copy
+
+        if count == 0 {
+            return;
+        }
+
+        let dest_buf = Self::get_buf(dest);
+        let src_buf = Self::get_buf(src);
+
+        let dest_byte_offset = dest_row_offset * cols * std::mem::size_of::<f32>();
+        let bytesize = count * std::mem::size_of::<f32>();
+
+        if let Err(e) =
+            self.copy_device_to_device(dest_buf.ptr + dest_byte_offset as u64, src_buf.ptr, bytesize)
+        {
+            tracing::warn!(error = %e, "CUDA: copy_rows_into failed");
+        }
     }
 
     fn grouped_attention_decode(
         &self,
-        _q: &DeviceTensor,
-        _k: &DeviceTensor,
-        _v: &DeviceTensor,
-        _total_len: usize,
-        _num_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-        _attn_scale: f32,
-        _softcap: f32,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        total_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        attn_scale: f32,
+        softcap: f32,
     ) -> DeviceTensor {
-        todo!("CUDA grouped_attention_decode not yet implemented");
+        assert!(
+            head_dim <= 256,
+            "grouped_attention_decode: head_dim {} exceeds max block size 256",
+            head_dim
+        );
+        let total_dim = num_heads * head_dim;
+
+        let out = match self.alloc_zeros_f32(total_dim) {
+            Ok(buf) => buf,
+            Err(e) => {
+                tracing::warn!(error = %e, "CUDA: grouped_attention_decode alloc failed");
+                panic!(
+                    "CUDA: failed to allocate grouped_attention_decode output: {}",
+                    e
+                );
+            }
+        };
+
+        let q_buf = Self::get_buf(q);
+        let k_buf = Self::get_buf(k);
+        let v_buf = Self::get_buf(v);
+
+        let mut p_q = q_buf.ptr;
+        let mut p_k = k_buf.ptr;
+        let mut p_v = v_buf.ptr;
+        let mut p_out = out.ptr;
+        let mut p_num_heads = num_heads as u32;
+        let mut p_num_kv_heads = num_kv_heads as u32;
+        let mut p_head_dim = head_dim as u32;
+        let mut p_total_len = total_len as u32;
+        let mut p_attn_scale = attn_scale;
+        let mut p_softcap = softcap;
+
+        let mut params: [*mut c_void; 10] = [
+            &mut p_q as *mut _ as *mut c_void,
+            &mut p_k as *mut _ as *mut c_void,
+            &mut p_v as *mut _ as *mut c_void,
+            &mut p_out as *mut _ as *mut c_void,
+            &mut p_num_heads as *mut _ as *mut c_void,
+            &mut p_num_kv_heads as *mut _ as *mut c_void,
+            &mut p_head_dim as *mut _ as *mut c_void,
+            &mut p_total_len as *mut _ as *mut c_void,
+            &mut p_attn_scale as *mut _ as *mut c_void,
+            &mut p_softcap as *mut _ as *mut c_void,
+        ];
+
+        // One block per head, 256 threads per block
+        let grid = (num_heads as u32, 1, 1);
+        let block = (256, 1, 1);
+        unsafe {
+            self.launch(self.fn_grouped_attn_decode, grid, block, 0, &mut params);
+        }
+
+        Self::wrap(out, vec![1, total_dim], TensorDtype::F32)
+    }
+
+    fn create_buffer_empty(
+        &self,
+        byte_size: usize,
+        shape: Vec<usize>,
+        dtype: TensorDtype,
+    ) -> DeviceTensor {
+        let ptr = match self.api.mem_alloc_async(byte_size, self.stream) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "CUDA: create_buffer_empty alloc failed");
+                panic!("CUDA: failed to allocate empty buffer: {}", e);
+            }
+        };
+        // Zero-fill the buffer
+        let n_words = (byte_size + 3) / 4;
+        if let Err(e) = self.api.memset_d32_async(ptr, 0, n_words, self.stream) {
+            tracing::warn!(error = %e, "CUDA: create_buffer_empty zero-fill failed");
+        }
+        let buf = CudaBuffer {
+            ptr,
+            len: byte_size,
+            api: Arc::clone(&self.api),
+            stream: self.stream,
+        };
+        DeviceTensor::from_gpu(shape, dtype, Box::new(buf))
     }
 }
 
@@ -1841,12 +1979,8 @@ mod tests {
         let w = Tensor::new(vec![6], w_data);
         let b = Tensor::new(vec![6], b_data);
 
-        let cpu_r = cpu.download(&cpu.layer_norm(
-            &cpu.upload(&t),
-            &cpu.upload(&w),
-            &cpu.upload(&b),
-            1e-5,
-        ));
+        let cpu_r =
+            cpu.download(&cpu.layer_norm(&cpu.upload(&t), &cpu.upload(&w), &cpu.upload(&b), 1e-5));
         let cuda_r = cuda.download(&cuda.layer_norm(
             &cuda.upload(&t),
             &cuda.upload(&w),
@@ -2188,8 +2322,10 @@ mod tests {
         let input_data: Vec<f32> = (0..32).map(|i| i as f32 * 0.01).collect();
         let input = Tensor::new(vec![1, 32], input_data);
 
-        let cpu_out = cpu.download(&cpu.quantized_matmul(&cpu.upload(&weights), &cpu.upload(&input)));
-        let cuda_out = cuda.download(&cuda.quantized_matmul(&cuda.upload(&weights), &cuda.upload(&input)));
+        let cpu_out =
+            cpu.download(&cpu.quantized_matmul(&cpu.upload(&weights), &cpu.upload(&input)));
+        let cuda_out =
+            cuda.download(&cuda.quantized_matmul(&cuda.upload(&weights), &cuda.upload(&input)));
 
         assert_eq!(cpu_out.shape(), &[1, 2]);
         assert_eq!(cuda_out.shape(), &[1, 2]);
@@ -2245,8 +2381,10 @@ mod tests {
         let weights = Tensor::from_quantized(vec![2, 32], TensorDtype::Q4_0, raw);
         let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
 
-        let cpu_out = cpu.download(&cpu.quantized_matmul(&cpu.upload(&weights), &cpu.upload(&input)));
-        let cuda_out = cuda.download(&cuda.quantized_matmul(&cuda.upload(&weights), &cuda.upload(&input)));
+        let cpu_out =
+            cpu.download(&cpu.quantized_matmul(&cpu.upload(&weights), &cpu.upload(&input)));
+        let cuda_out =
+            cuda.download(&cuda.quantized_matmul(&cuda.upload(&weights), &cuda.upload(&input)));
 
         assert_eq!(cpu_out.shape(), &[1, 2]);
         assert_eq!(cuda_out.shape(), &[1, 2]);
@@ -2367,7 +2505,120 @@ mod tests {
         let k_diff = max_abs_diff(cpu_k_d.as_f32(), cuda_k_d.as_f32());
         eprintln!("rope_neox partial Q max diff: {q_diff}");
         eprintln!("rope_neox partial K max diff: {k_diff}");
-        assert!(q_diff < 1e-3, "rope_neox partial Q: max abs diff = {q_diff}");
-        assert!(k_diff < 1e-3, "rope_neox partial K: max abs diff = {k_diff}");
+        assert!(
+            q_diff < 1e-3,
+            "rope_neox partial Q: max abs diff = {q_diff}"
+        );
+        assert!(
+            k_diff < 1e-3,
+            "rope_neox partial K: max abs diff = {k_diff}"
+        );
+    }
+
+    /// Test embedding_lookup with a large table matching miniLM scale
+    #[test]
+    fn test_embedding_lookup_large_vs_cpu() {
+        let cuda = match try_cuda() {
+            Some(b) => b,
+            None => {
+                eprintln!("CUDA not available, skipping");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+
+        let vocab = 30522;
+        let hidden = 384;
+        let table_data: Vec<f32> = (0..vocab * hidden)
+            .map(|i| ((i as f32) * 0.001).sin())
+            .collect();
+        let table = Tensor::new(vec![vocab, hidden], table_data);
+        let ids = vec![101u32, 7592, 2088, 102]; // [CLS] hello world [SEP] (typical miniLM tokens)
+
+        let cpu_out = cpu.download(&cpu.embedding_lookup(&cpu.upload(&table), &ids));
+        let cuda_out = cuda.download(&cuda.embedding_lookup(&cuda.upload(&table), &ids));
+
+        let diff = max_abs_diff(cpu_out.as_f32(), cuda_out.as_f32());
+        eprintln!("large embedding_lookup diff: {diff}");
+        eprintln!("CPU first 5: {:?}", &cpu_out.as_f32()[..5]);
+        eprintln!("CUDA first 5: {:?}", &cuda_out.as_f32()[..5]);
+        assert!(diff < 1e-5, "embedding_lookup large: diff = {diff}");
+    }
+
+    /// Test a mini BERT-like pipeline (embed + layer_norm + matmul + add_bias + gelu)
+    /// with miniLM-sized tensors (hidden=384) to catch bugs that only appear at scale.
+    #[test]
+    fn test_bert_pipeline_384_vs_cpu() {
+        let cuda = match try_cuda() {
+            Some(b) => b,
+            None => {
+                eprintln!("CUDA not available, skipping");
+                return;
+            }
+        };
+        let cpu = CpuBackend::new();
+
+        let hidden = 384;
+        let seq_len = 4;
+        let intermediate = 1536;
+
+        // Create deterministic test data
+        let make_data = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n).map(|i| ((i as f32 + seed) * 0.01).sin()).collect()
+        };
+
+        // Simulate: input -> layer_norm -> matmul_transpose -> add_bias -> gelu
+        let input_data = make_data(seq_len * hidden, 1.0);
+        let ln_w_data = make_data(hidden, 2.0);
+        let ln_b_data = make_data(hidden, 3.0);
+        let weight_data = make_data(intermediate * hidden, 4.0);
+        let bias_data = make_data(intermediate, 5.0);
+
+        let input = Tensor::new(vec![seq_len, hidden], input_data);
+        let ln_w = Tensor::new(vec![hidden], ln_w_data);
+        let ln_b = Tensor::new(vec![hidden], ln_b_data);
+        let weight = Tensor::new(vec![intermediate, hidden], weight_data);
+        let bias = Tensor::new(vec![intermediate], bias_data);
+
+        // CPU pipeline
+        let cpu_in = cpu.upload(&input);
+        let cpu_ln = cpu.layer_norm(&cpu_in, &cpu.upload(&ln_w), &cpu.upload(&ln_b), 1e-5);
+        let cpu_mm = cpu.matmul_transpose(&cpu_ln, &cpu.upload(&weight));
+        let cpu_ab = cpu.add_bias(&cpu_mm, &cpu.upload(&bias));
+        let cpu_ge = cpu.gelu(&cpu_ab);
+        let cpu_result = cpu.download(&cpu_ge);
+
+        // CUDA pipeline
+        let cuda_in = cuda.upload(&input);
+        let cuda_ln = cuda.layer_norm(&cuda_in, &cuda.upload(&ln_w), &cuda.upload(&ln_b), 1e-5);
+        let cuda_mm = cuda.matmul_transpose(&cuda_ln, &cuda.upload(&weight));
+        let cuda_ab = cuda.add_bias(&cuda_mm, &cuda.upload(&bias));
+        let cuda_ge = cuda.gelu(&cuda_ab);
+        let cuda_result = cuda.download(&cuda_ge);
+
+        // Compare at each stage
+        let ln_diff = max_abs_diff(
+            cpu.download(&cpu_ln).as_f32(),
+            cuda.download(&cuda_ln).as_f32(),
+        );
+        let mm_diff = max_abs_diff(
+            cpu.download(&cpu_mm).as_f32(),
+            cuda.download(&cuda_mm).as_f32(),
+        );
+        let ab_diff = max_abs_diff(
+            cpu.download(&cpu_ab).as_f32(),
+            cuda.download(&cuda_ab).as_f32(),
+        );
+        let ge_diff = max_abs_diff(cpu_result.as_f32(), cuda_result.as_f32());
+
+        eprintln!("384-dim layer_norm diff: {ln_diff}");
+        eprintln!("384-dim matmul_transpose diff: {mm_diff}");
+        eprintln!("384-dim add_bias diff: {ab_diff}");
+        eprintln!("384-dim gelu diff: {ge_diff}");
+
+        assert!(ln_diff < 1e-3, "layer_norm@384: diff = {ln_diff}");
+        assert!(mm_diff < 1e-2, "matmul_transpose@384: diff = {mm_diff}");
+        assert!(ab_diff < 1e-2, "add_bias@384: diff = {ab_diff}");
+        assert!(ge_diff < 1e-2, "gelu@384: diff = {ge_diff}");
     }
 }

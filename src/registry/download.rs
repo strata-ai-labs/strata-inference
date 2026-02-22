@@ -27,9 +27,8 @@ pub fn download_hf_file(
     }
 
     // Ensure directories exist
-    fs::create_dir_all(models_dir).map_err(|e| {
-        InferenceError::Registry(format!("Failed to create models dir: {}", e))
-    })?;
+    fs::create_dir_all(models_dir)
+        .map_err(|e| InferenceError::Registry(format!("Failed to create models dir: {}", e)))?;
 
     let downloading_dir = models_dir.join(".downloading");
     fs::create_dir_all(&downloading_dir).map_err(|e| {
@@ -85,7 +84,8 @@ pub fn download_hf_file(
              Please check your internet connection, or manually download and place the file at:\n  \
              {}\n\n\
              Download URL: {}",
-            hf_file, e,
+            hf_file,
+            e,
             dest.display(),
             url
         ))
@@ -99,9 +99,8 @@ pub fn download_hf_file(
         .unwrap_or(0);
 
     let mut reader = response.into_body().into_reader();
-    let mut file = fs::File::create(&temp_path).map_err(|e| {
-        InferenceError::Registry(format!("Failed to create temp file: {}", e))
-    })?;
+    let mut file = fs::File::create(&temp_path)
+        .map_err(|e| InferenceError::Registry(format!("Failed to create temp file: {}", e)))?;
 
     let result = stream_to_file(&mut reader, &mut file, progress, total_bytes);
 
@@ -145,22 +144,20 @@ fn stream_to_file(
     let mut buf = vec![0u8; 64 * 1024]; // 64KB buffer
 
     loop {
-        let n = reader.read(&mut buf).map_err(|e| {
-            InferenceError::Registry(format!("Download read error: {}", e))
-        })?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| InferenceError::Registry(format!("Download read error: {}", e)))?;
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n]).map_err(|e| {
-            InferenceError::Registry(format!("Failed to write temp file: {}", e))
-        })?;
+        file.write_all(&buf[..n])
+            .map_err(|e| InferenceError::Registry(format!("Failed to write temp file: {}", e)))?;
         downloaded += n as u64;
         progress(downloaded, total_bytes);
     }
 
-    file.flush().map_err(|e| {
-        InferenceError::Registry(format!("Failed to flush temp file: {}", e))
-    })?;
+    file.flush()
+        .map_err(|e| InferenceError::Registry(format!("Failed to flush temp file: {}", e)))?;
 
     Ok(downloaded)
 }
@@ -173,9 +170,8 @@ struct LockGuard {
 impl LockGuard {
     fn new(path: &Path) -> Result<Self, InferenceError> {
         let pid = std::process::id();
-        fs::write(path, format!("{}", pid)).map_err(|e| {
-            InferenceError::Registry(format!("Failed to write lock file: {}", e))
-        })?;
+        fs::write(path, format!("{}", pid))
+            .map_err(|e| InferenceError::Registry(format!("Failed to write lock file: {}", e)))?;
         Ok(Self {
             path: path.to_path_buf(),
         })

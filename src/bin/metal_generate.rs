@@ -11,7 +11,10 @@ use strata_inference::engine::sampler::SamplingConfig;
 use strata_inference::GenerationEngine;
 
 #[derive(Parser)]
-#[command(name = "strata-metal-generate", about = "Generate text via Metal graph engine")]
+#[command(
+    name = "strata-metal-generate",
+    about = "Generate text via Metal graph engine"
+)]
 struct Args {
     /// Model name or path to GGUF file (e.g., "tinyllama" or "./model.gguf")
     #[arg(short = 'm', long)]
@@ -57,7 +60,9 @@ fn main() {
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.profile {
-        unsafe { std::env::set_var("STRATA_PROFILE", "1"); }
+        unsafe {
+            std::env::set_var("STRATA_PROFILE", "1");
+        }
     }
 
     let model_path = cli::model::resolve_model(&args.model)?;
@@ -100,9 +105,18 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  generated tokens: {}", n);
     eprintln!("  stop reason: {}", output.stop_reason);
     eprintln!("  load: {:.1}ms", load_ms);
-    eprintln!("  prefill: {:.1}ms ({:.1} tok/s)", prefill_ms, output.prompt_tokens as f64 / (prefill_ms / 1000.0));
+    eprintln!(
+        "  prefill: {:.1}ms ({:.1} tok/s)",
+        prefill_ms,
+        output.prompt_tokens as f64 / (prefill_ms / 1000.0)
+    );
     if n > 0 {
-        eprintln!("  decode: {:.1}ms ({:.1} ms/tok, {:.1} tok/s)", decode_ms, decode_ms / n as f64, n as f64 / (decode_ms / 1000.0));
+        eprintln!(
+            "  decode: {:.1}ms ({:.1} ms/tok, {:.1} tok/s)",
+            decode_ms,
+            decode_ms / n as f64,
+            n as f64 / (decode_ms / 1000.0)
+        );
     }
     eprintln!("  total: {:.1}ms", total_ms);
 

@@ -7,10 +7,10 @@
 // - CPU-resident (Vec<f32>) — used with CpuBackend
 // - GPU-resident (DeviceTensor) — used with Metal/CUDA for zero-copy attention
 
+use super::config::ModelConfig;
 use crate::backend::{ComputeBackend, DeviceTensor};
 use crate::error::InferenceError;
 use crate::tensor::{Tensor, TensorDtype};
-use super::config::ModelConfig;
 
 /// Per-layer KV cache for autoregressive generation.
 ///
@@ -50,8 +50,12 @@ impl KvCache {
         let max_seq_len = config.max_seq_len;
         let capacity = max_seq_len * kv_dim;
 
-        let k_cache = (0..num_layers).map(|_| Vec::with_capacity(capacity)).collect();
-        let v_cache = (0..num_layers).map(|_| Vec::with_capacity(capacity)).collect();
+        let k_cache = (0..num_layers)
+            .map(|_| Vec::with_capacity(capacity))
+            .collect();
+        let v_cache = (0..num_layers)
+            .map(|_| Vec::with_capacity(capacity))
+            .collect();
 
         Self {
             k_cache,
@@ -76,8 +80,12 @@ impl KvCache {
         let max_seq_len = config.max_seq_len;
         let capacity = max_seq_len * kv_dim;
 
-        let k_cache: Vec<Vec<f32>> = (0..num_layers).map(|_| Vec::with_capacity(capacity)).collect();
-        let v_cache: Vec<Vec<f32>> = (0..num_layers).map(|_| Vec::with_capacity(capacity)).collect();
+        let k_cache: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| Vec::with_capacity(capacity))
+            .collect();
+        let v_cache: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| Vec::with_capacity(capacity))
+            .collect();
 
         // Pre-allocate GPU buffers (zero-filled)
         let zeros = vec![0.0f32; max_seq_len * kv_dim];
@@ -119,16 +127,24 @@ impl KvCache {
         let max_seq_len = config.max_seq_len;
         let capacity = max_seq_len * kv_dim;
 
-        let k_cache: Vec<Vec<f32>> = (0..num_layers).map(|_| Vec::with_capacity(capacity)).collect();
-        let v_cache: Vec<Vec<f32>> = (0..num_layers).map(|_| Vec::with_capacity(capacity)).collect();
+        let k_cache: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| Vec::with_capacity(capacity))
+            .collect();
+        let v_cache: Vec<Vec<f32>> = (0..num_layers)
+            .map(|_| Vec::with_capacity(capacity))
+            .collect();
 
         // Pre-allocate F16 GPU buffers: 2 bytes per element instead of 4
         let f16_bytes = max_seq_len * kv_dim * 2;
         let k_gpu: Vec<DeviceTensor> = (0..num_layers)
-            .map(|_| backend.create_buffer_empty(f16_bytes, vec![max_seq_len, kv_dim], TensorDtype::F16))
+            .map(|_| {
+                backend.create_buffer_empty(f16_bytes, vec![max_seq_len, kv_dim], TensorDtype::F16)
+            })
             .collect();
         let v_gpu: Vec<DeviceTensor> = (0..num_layers)
-            .map(|_| backend.create_buffer_empty(f16_bytes, vec![max_seq_len, kv_dim], TensorDtype::F16))
+            .map(|_| {
+                backend.create_buffer_empty(f16_bytes, vec![max_seq_len, kv_dim], TensorDtype::F16)
+            })
             .collect();
 
         Self {
@@ -169,7 +185,11 @@ impl KvCache {
         if k_new.len() != expected_len || v_new.len() != expected_len {
             return Err(InferenceError::Generation(format!(
                 "KV cache append: expected {} elements ({}*{}), got k={} v={}",
-                expected_len, n_tokens, self.kv_dim, k_new.len(), v_new.len()
+                expected_len,
+                n_tokens,
+                self.kv_dim,
+                k_new.len(),
+                v_new.len()
             )));
         }
         if self.pos + n_tokens > self.max_seq_len {
@@ -208,8 +228,14 @@ impl KvCache {
             )));
         }
 
-        let k_bufs = self.k_gpu.as_ref().expect("append_gpu requires GPU KV cache");
-        let v_bufs = self.v_gpu.as_ref().expect("append_gpu requires GPU KV cache");
+        let k_bufs = self
+            .k_gpu
+            .as_ref()
+            .expect("append_gpu requires GPU KV cache");
+        let v_bufs = self
+            .v_gpu
+            .as_ref()
+            .expect("append_gpu requires GPU KV cache");
 
         backend.copy_rows_into(&k_bufs[layer], k_new, self.pos);
         backend.copy_rows_into(&v_bufs[layer], v_new, self.pos);
@@ -222,12 +248,18 @@ impl KvCache {
     /// The returned tensor is `[max_seq_len, kv_dim]` — the caller must
     /// only read the first `self.len() + n_new` rows.
     pub fn get_k_gpu(&self, layer: usize) -> &DeviceTensor {
-        &self.k_gpu.as_ref().expect("get_k_gpu requires GPU KV cache")[layer]
+        &self
+            .k_gpu
+            .as_ref()
+            .expect("get_k_gpu requires GPU KV cache")[layer]
     }
 
     /// Get the GPU V cache buffer for a layer.
     pub fn get_v_gpu(&self, layer: usize) -> &DeviceTensor {
-        &self.v_gpu.as_ref().expect("get_v_gpu requires GPU KV cache")[layer]
+        &self
+            .v_gpu
+            .as_ref()
+            .expect("get_v_gpu requires GPU KV cache")[layer]
     }
 
     /// Read cached K values for a layer.
@@ -403,7 +435,9 @@ mod tests {
         let mut cache = KvCache::new(&config);
         let kv_dim = cache.kv_dim();
 
-        cache.append(0, &vec![1.0; kv_dim], &vec![2.0; kv_dim], 1).unwrap();
+        cache
+            .append(0, &vec![1.0; kv_dim], &vec![2.0; kv_dim], 1)
+            .unwrap();
         cache.advance(1);
         assert_eq!(cache.len(), 1);
 
@@ -445,7 +479,9 @@ mod tests {
         let kv_dim = cache.kv_dim();
 
         // Fill to capacity
-        cache.append(0, &vec![1.0; 2 * kv_dim], &vec![2.0; 2 * kv_dim], 2).unwrap();
+        cache
+            .append(0, &vec![1.0; 2 * kv_dim], &vec![2.0; 2 * kv_dim], 2)
+            .unwrap();
         cache.advance(2);
 
         // This should fail
@@ -483,7 +519,9 @@ mod tests {
         let kv_dim = cache.kv_dim();
 
         // Fill with some data
-        cache.append(0, &vec![1.0; 2 * kv_dim], &vec![2.0; 2 * kv_dim], 2).unwrap();
+        cache
+            .append(0, &vec![1.0; 2 * kv_dim], &vec![2.0; 2 * kv_dim], 2)
+            .unwrap();
         cache.advance(2);
         assert_eq!(cache.len(), 2);
 
@@ -492,7 +530,9 @@ mod tests {
         assert_eq!(cache.len(), 0);
 
         // Reuse — should work and contain only the new data
-        cache.append(0, &vec![3.0; kv_dim], &vec![4.0; kv_dim], 1).unwrap();
+        cache
+            .append(0, &vec![3.0; kv_dim], &vec![4.0; kv_dim], 1)
+            .unwrap();
         cache.advance(1);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get_k(0).len(), kv_dim);

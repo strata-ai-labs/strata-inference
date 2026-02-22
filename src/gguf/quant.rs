@@ -95,8 +95,15 @@ impl GgufTensorType {
             Self::Q8_0 | Self::Q8_1 => 32,
             // K-quant super-blocks use 256 elements
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
-            Self::IQ2XXS | Self::IQ2XS | Self::IQ3XXS | Self::IQ1S
-            | Self::IQ4NL | Self::IQ3S | Self::IQ2S | Self::IQ4XS | Self::IQ1M => 256,
+            Self::IQ2XXS
+            | Self::IQ2XS
+            | Self::IQ3XXS
+            | Self::IQ1S
+            | Self::IQ4NL
+            | Self::IQ3S
+            | Self::IQ2S
+            | Self::IQ4XS
+            | Self::IQ1M => 256,
         }
     }
 
@@ -114,18 +121,18 @@ impl GgufTensorType {
             Self::I32 => 4,
             Self::I64 => 8,
             Self::Q4_0 => std::mem::size_of::<BlockQ4_0>(), // 18
-            Self::Q4_1 => 20,   // 2*f16 + 16 bytes
-            Self::Q5_0 => 22,   // f16 + 4 + 16 bytes
-            Self::Q5_1 => 24,   // 2*f16 + 4 + 16 bytes
+            Self::Q4_1 => 20,                               // 2*f16 + 16 bytes
+            Self::Q5_0 => 22,                               // f16 + 4 + 16 bytes
+            Self::Q5_1 => 24,                               // 2*f16 + 4 + 16 bytes
             Self::Q8_0 => std::mem::size_of::<BlockQ8_0>(), // 34
-            Self::Q8_1 => 36,   // 2*f16 + 32 bytes
+            Self::Q8_1 => 36,                               // 2*f16 + 32 bytes
             // K-quant sizes (QK_K = 256)
-            Self::Q2K => 2 * 2 + 256 / 16 + 256 / 4,       // 84
-            Self::Q3K => 2 + 256 / 4 + 256 / 8 + 12,       // 110
-            Self::Q4K => 2 * 2 + 12 + 256 / 2,              // 144
-            Self::Q5K => 2 * 2 + 12 + 256 / 8 + 256 / 2,    // 176
-            Self::Q6K => 2 + 256 / 16 + 3 * 256 / 4,        // 210
-            Self::Q8K => 4 + 256 + 256 / 16 * 2,            // 292
+            Self::Q2K => 2 * 2 + 256 / 16 + 256 / 4, // 84
+            Self::Q3K => 2 + 256 / 4 + 256 / 8 + 12, // 110
+            Self::Q4K => 2 * 2 + 12 + 256 / 2,       // 144
+            Self::Q5K => 2 * 2 + 12 + 256 / 8 + 256 / 2, // 176
+            Self::Q6K => 2 + 256 / 16 + 3 * 256 / 4, // 210
+            Self::Q8K => 4 + 256 + 256 / 16 * 2,     // 292
             // IQ types — approximate; not fully implemented for inference yet
             Self::IQ2XXS => 2 + 256 / 8 * 2,
             Self::IQ2XS => 2 + 256 / 8 * 2 + 256 / 32,
@@ -487,7 +494,7 @@ pub fn dequantize_q5_0(blocks: &[BlockQ5_0]) -> Vec<f32> {
         let mut tmp = [0.0f32; QK5_0];
         for j in 0..QK5_0 / 2 {
             let xh_0 = ((qh >> (j as u32)) << 4) & 0x10;
-            let xh_1 = ((qh >> (j as u32 + 12))) & 0x10;
+            let xh_1 = (qh >> (j as u32 + 12)) & 0x10;
             let x0 = ((block.qs[j] & 0x0F) as u32 | xh_0) as i32 - 16;
             let x1 = ((block.qs[j] >> 4) as u32 | xh_1) as i32 - 16;
             tmp[j] = x0 as f32 * d;
@@ -510,7 +517,7 @@ pub fn dequantize_q5_1(blocks: &[BlockQ5_1]) -> Vec<f32> {
         let mut tmp = [0.0f32; QK5_1];
         for j in 0..QK5_1 / 2 {
             let xh_0 = ((qh >> (j as u32)) << 4) & 0x10;
-            let xh_1 = ((qh >> (j as u32 + 12))) & 0x10;
+            let xh_1 = (qh >> (j as u32 + 12)) & 0x10;
             let x0 = (block.qs[j] & 0x0F) as u32 | xh_0;
             let x1 = (block.qs[j] >> 4) as u32 | xh_1;
             tmp[j] = x0 as f32 * d + m;
@@ -622,10 +629,16 @@ pub fn dequantize_q6_k(blocks: &[BlockQ6K]) -> Vec<f32> {
             // 128 values per iteration
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = ((ql[ql_offset + l] & 0xF) | (((qh[qh_offset + l] >> 0) & 3) << 4)) as i32 - 32;
-                let q2 = ((ql[ql_offset + l + 32] & 0xF) | (((qh[qh_offset + l] >> 2) & 3) << 4)) as i32 - 32;
-                let q3 = ((ql[ql_offset + l] >> 4) | (((qh[qh_offset + l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 = ((ql[ql_offset + l + 32] >> 4) | (((qh[qh_offset + l] >> 6) & 3) << 4)) as i32 - 32;
+                let q1 =
+                    ((ql[ql_offset + l] & 0xF) | (((qh[qh_offset + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[ql_offset + l + 32] & 0xF) | (((qh[qh_offset + l] >> 2) & 3) << 4))
+                    as i32
+                    - 32;
+                let q3 =
+                    ((ql[ql_offset + l] >> 4) | (((qh[qh_offset + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[ql_offset + l + 32] >> 4) | (((qh[qh_offset + l] >> 6) & 3) << 4))
+                    as i32
+                    - 32;
 
                 buf[out_offset + l] = d * sc[sc_offset + is] as f32 * q1 as f32;
                 buf[out_offset + l + 32] = d * sc[sc_offset + is + 2] as f32 * q2 as f32;
@@ -652,7 +665,8 @@ pub fn bytes_as_q4_1_blocks(data: &[u8]) -> Result<&[BlockQ4_1], InferenceError>
     if data.len() % block_size != 0 {
         return Err(InferenceError::GgufParse(format!(
             "Q4_1 data length {} is not a multiple of block size {}",
-            data.len(), block_size
+            data.len(),
+            block_size
         )));
     }
     let n_blocks = data.len() / block_size;
@@ -666,7 +680,8 @@ pub fn bytes_as_q5_0_blocks(data: &[u8]) -> Result<&[BlockQ5_0], InferenceError>
     if data.len() % block_size != 0 {
         return Err(InferenceError::GgufParse(format!(
             "Q5_0 data length {} is not a multiple of block size {}",
-            data.len(), block_size
+            data.len(),
+            block_size
         )));
     }
     let n_blocks = data.len() / block_size;
@@ -680,7 +695,8 @@ pub fn bytes_as_q5_1_blocks(data: &[u8]) -> Result<&[BlockQ5_1], InferenceError>
     if data.len() % block_size != 0 {
         return Err(InferenceError::GgufParse(format!(
             "Q5_1 data length {} is not a multiple of block size {}",
-            data.len(), block_size
+            data.len(),
+            block_size
         )));
     }
     let n_blocks = data.len() / block_size;
@@ -694,7 +710,8 @@ pub fn bytes_as_q4_k_blocks(data: &[u8]) -> Result<&[BlockQ4K], InferenceError> 
     if data.len() % block_size != 0 {
         return Err(InferenceError::GgufParse(format!(
             "Q4_K data length {} is not a multiple of block size {}",
-            data.len(), block_size
+            data.len(),
+            block_size
         )));
     }
     let n_blocks = data.len() / block_size;
@@ -708,7 +725,8 @@ pub fn bytes_as_q5_k_blocks(data: &[u8]) -> Result<&[BlockQ5K], InferenceError> 
     if data.len() % block_size != 0 {
         return Err(InferenceError::GgufParse(format!(
             "Q5_K data length {} is not a multiple of block size {}",
-            data.len(), block_size
+            data.len(),
+            block_size
         )));
     }
     let n_blocks = data.len() / block_size;
@@ -722,7 +740,8 @@ pub fn bytes_as_q6_k_blocks(data: &[u8]) -> Result<&[BlockQ6K], InferenceError> 
     if data.len() % block_size != 0 {
         return Err(InferenceError::GgufParse(format!(
             "Q6_K data length {} is not a multiple of block size {}",
-            data.len(), block_size
+            data.len(),
+            block_size
         )));
     }
     let n_blocks = data.len() / block_size;
@@ -778,8 +797,7 @@ pub fn bytes_as_q4_0_blocks(data: &[u8]) -> Result<&[BlockQ4_0], InferenceError>
     }
     let n_blocks = data.len() / block_size;
     // SAFETY: Same rationale as bytes_as_q8_0_blocks.
-    let blocks =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const BlockQ4_0, n_blocks) };
+    let blocks = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const BlockQ4_0, n_blocks) };
     Ok(blocks)
 }
 
@@ -1120,25 +1138,37 @@ mod tests {
         assert_eq!(d_bits, 0x3400, "f16 bit pattern for 0.25 should be 0x3400");
 
         let mut qs = [0i8; 32];
-        qs[0] = 127;   // max positive
-        qs[1] = -128;  // min negative (note: i8 range is -128..=127)
-        qs[2] = 0;     // zero
-        qs[3] = 1;     // unit
-        qs[4] = -1;    // negative unit
+        qs[0] = 127; // max positive
+        qs[1] = -128; // min negative (note: i8 range is -128..=127)
+        qs[2] = 0; // zero
+        qs[3] = 1; // unit
+        qs[4] = -1; // negative unit
 
         let block = BlockQ8_0 { d: d_bits, qs };
         let result = dequantize_q8_0(&[block]);
 
         // 0.25 * 127 = 31.75
-        assert!((result[0] - 31.75).abs() < 1e-3, "max positive: got {}", result[0]);
+        assert!(
+            (result[0] - 31.75).abs() < 1e-3,
+            "max positive: got {}",
+            result[0]
+        );
         // 0.25 * -128 = -32.0
-        assert!((result[1] - (-32.0)).abs() < 1e-3, "min negative: got {}", result[1]);
+        assert!(
+            (result[1] - (-32.0)).abs() < 1e-3,
+            "min negative: got {}",
+            result[1]
+        );
         // 0.25 * 0 = 0.0
         assert_eq!(result[2], 0.0, "zero: got {}", result[2]);
         // 0.25 * 1 = 0.25
         assert!((result[3] - 0.25).abs() < 1e-3, "unit: got {}", result[3]);
         // 0.25 * -1 = -0.25
-        assert!((result[4] - (-0.25)).abs() < 1e-3, "neg unit: got {}", result[4]);
+        assert!(
+            (result[4] - (-0.25)).abs() < 1e-3,
+            "neg unit: got {}",
+            result[4]
+        );
     }
 
     #[test]
@@ -1149,7 +1179,10 @@ mod tests {
             qs: [127; 32],
         };
         let result = dequantize_q8_0(&[block]);
-        assert!(result.iter().all(|&v| v == 0.0), "zero scale should produce all zeros");
+        assert!(
+            result.iter().all(|&v| v == 0.0),
+            "zero scale should produce all zeros"
+        );
     }
 
     #[test]
@@ -1193,7 +1226,9 @@ mod tests {
             assert!(
                 (result[j] - expected).abs() < 1e-3,
                 "low nibble {}: expected {}, got {}",
-                j, expected, result[j]
+                j,
+                expected,
+                result[j]
             );
         }
         // High half (indices 16..32): same as low because both nibbles equal
@@ -1202,7 +1237,9 @@ mod tests {
             assert!(
                 (result[16 + j] - expected).abs() < 1e-3,
                 "high nibble {}: expected {}, got {}",
-                j, expected, result[16 + j]
+                j,
+                expected,
+                result[16 + j]
             );
         }
     }
@@ -1214,7 +1251,10 @@ mod tests {
             qs: [0xFF; 16], // all nibbles = 15
         };
         let result = dequantize_q4_0(&[block]);
-        assert!(result.iter().all(|&v| v == 0.0), "zero scale should produce all zeros");
+        assert!(
+            result.iter().all(|&v| v == 0.0),
+            "zero scale should produce all zeros"
+        );
     }
 
     #[test]
@@ -1234,7 +1274,11 @@ mod tests {
         // 0.1 (nearest f16 representable value)
         let bits = f32_to_f16(0.1);
         let recovered = f16_to_f32(bits);
-        assert!((recovered - 0.1).abs() < 0.001, "0.1 round-trip: {}", recovered);
+        assert!(
+            (recovered - 0.1).abs() < 0.001,
+            "0.1 round-trip: {}",
+            recovered
+        );
     }
 
     #[test]
@@ -1249,7 +1293,11 @@ mod tests {
     fn test_f16_max_value() {
         // f16 max = 0 11110 1111111111 = 0x7BFF = 65504.0
         let val = f16_to_f32(0x7BFF);
-        assert!((val - 65504.0).abs() < 1.0, "f16 max should be 65504.0, got {}", val);
+        assert!(
+            (val - 65504.0).abs() < 1.0,
+            "f16 max should be 65504.0, got {}",
+            val
+        );
     }
 
     #[test]
@@ -1257,7 +1305,11 @@ mod tests {
         // Values larger than f16 max (65504) should saturate to infinity.
         let bits = f32_to_f16(100000.0);
         let val = f16_to_f32(bits);
-        assert!(val.is_infinite(), "values > 65504 should become inf, got {}", val);
+        assert!(
+            val.is_infinite(),
+            "values > 65504 should become inf, got {}",
+            val
+        );
     }
 
     // -- GgufTensorType edge cases --
@@ -1280,8 +1332,8 @@ mod tests {
     fn test_tensor_type_all_valid_ids() {
         // All valid IDs should parse without error (comprehensive coverage).
         let valid_ids = [
-            0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+            26, 27, 28, 29, 30,
         ];
         for &id in &valid_ids {
             assert!(
@@ -1372,7 +1424,9 @@ mod tests {
             assert!(
                 (result_from_bytes[i] - result_direct[i]).abs() < 1e-6,
                 "mismatch at {}: {} vs {}",
-                i, result_from_bytes[i], result_direct[i]
+                i,
+                result_from_bytes[i],
+                result_direct[i]
             );
         }
     }
@@ -1442,7 +1496,7 @@ mod tests {
         scales[8] = 0b0101_0011; // & 0xF = 3, >> 4 = 5
         let (sc, m) = get_scale_min_k4(4, &scales);
         assert_eq!(sc, 3 | (3 << 4)); // 3 + 48 = 51
-        assert_eq!(m, 5 | (2 << 4));  // 5 + 32 = 37
+        assert_eq!(m, 5 | (2 << 4)); // 5 + 32 = 37
     }
 
     // ====================================================================
@@ -1509,7 +1563,11 @@ mod tests {
         let result = dequantize_q5_0(&[block]);
         // Element 0: nibble=0, high_bit from qh bit 0 => xh_0 = ((1 >> 0) << 4) & 0x10 = 0x10
         // val = (0 | 0x10) - 16 = 0
-        assert!((result[0] - 0.0).abs() < 1e-3, "expected 0.0, got {}", result[0]);
+        assert!(
+            (result[0] - 0.0).abs() < 1e-3,
+            "expected 0.0, got {}",
+            result[0]
+        );
     }
 
     // ====================================================================
@@ -1568,7 +1626,12 @@ mod tests {
         let result = dequantize_q4_k(&[block]);
         // First 32 elements use sub-block 0 (low nibbles): d*1*5 = 5.0
         for i in 0..32 {
-            assert!((result[i] - 5.0).abs() < 1e-3, "elem {}: expected 5.0, got {}", i, result[i]);
+            assert!(
+                (result[i] - 5.0).abs() < 1e-3,
+                "elem {}: expected 5.0, got {}",
+                i,
+                result[i]
+            );
         }
     }
 
@@ -1612,7 +1675,8 @@ mod tests {
         // q1 = (1 | (1 << 4)) - 32 = 17 - 32 = -15
         assert!(
             (result[0] - (-15.0)).abs() < 1e-3,
-            "expected -15.0, got {}", result[0]
+            "expected -15.0, got {}",
+            result[0]
         );
     }
 
@@ -1693,23 +1757,52 @@ mod tests {
     #[test]
     fn test_dequantize_output_lengths() {
         // Non-K types: 32 elements per block
-        let q4_1 = BlockQ4_1 { d: 0, m: 0, qs: [0; 16] };
+        let q4_1 = BlockQ4_1 {
+            d: 0,
+            m: 0,
+            qs: [0; 16],
+        };
         assert_eq!(dequantize_q4_1(&[q4_1, q4_1]).len(), 64);
 
-        let q5_0 = BlockQ5_0 { d: 0, qh: [0; 4], qs: [0; 16] };
+        let q5_0 = BlockQ5_0 {
+            d: 0,
+            qh: [0; 4],
+            qs: [0; 16],
+        };
         assert_eq!(dequantize_q5_0(&[q5_0]).len(), 32);
 
-        let q5_1 = BlockQ5_1 { d: 0, m: 0, qh: [0; 4], qs: [0; 16] };
+        let q5_1 = BlockQ5_1 {
+            d: 0,
+            m: 0,
+            qh: [0; 4],
+            qs: [0; 16],
+        };
         assert_eq!(dequantize_q5_1(&[q5_1]).len(), 32);
 
         // K-quant types: 256 elements per block
-        let q4_k = BlockQ4K { d: 0, dmin: 0, scales: [0; 12], qs: [0; 128] };
+        let q4_k = BlockQ4K {
+            d: 0,
+            dmin: 0,
+            scales: [0; 12],
+            qs: [0; 128],
+        };
         assert_eq!(dequantize_q4_k(&[q4_k]).len(), 256);
 
-        let q5_k = BlockQ5K { d: 0, dmin: 0, scales: [0; 12], qh: [0; 32], qs: [0; 128] };
+        let q5_k = BlockQ5K {
+            d: 0,
+            dmin: 0,
+            scales: [0; 12],
+            qh: [0; 32],
+            qs: [0; 128],
+        };
         assert_eq!(dequantize_q5_k(&[q5_k]).len(), 256);
 
-        let q6_k = BlockQ6K { ql: [0; 128], qh: [0; 64], scales: [0; 16], d: 0 };
+        let q6_k = BlockQ6K {
+            ql: [0; 128],
+            qh: [0; 64],
+            scales: [0; 16],
+            d: 0,
+        };
         assert_eq!(dequantize_q6_k(&[q6_k]).len(), 256);
     }
 
@@ -1741,9 +1834,17 @@ mod tests {
         // Element 5: low nibble of qs[5] = 5 => 5 * 0.5 + 1.0 = 3.5
         assert!((result[5] - 3.5).abs() < 1e-2, "elem 5: got {}", result[5]);
         // Element 16: high nibble of qs[0] = 15 => 15 * 0.5 + 1.0 = 8.5
-        assert!((result[16] - 8.5).abs() < 1e-2, "elem 16: got {}", result[16]);
+        assert!(
+            (result[16] - 8.5).abs() < 1e-2,
+            "elem 16: got {}",
+            result[16]
+        );
         // Element 31: high nibble of qs[15] = 0 => 0 * 0.5 + 1.0 = 1.0
-        assert!((result[31] - 1.0).abs() < 1e-2, "elem 31: got {}", result[31]);
+        assert!(
+            (result[31] - 1.0).abs() < 1e-2,
+            "elem 31: got {}",
+            result[31]
+        );
     }
 
     #[test]
@@ -1760,7 +1861,12 @@ mod tests {
         assert_eq!(result.len(), 32);
         // All elements: (0 | 16) - 16 = 0 for both halves
         for i in 0..32 {
-            assert!((result[i] - 0.0).abs() < 1e-3, "elem {}: expected 0.0, got {}", i, result[i]);
+            assert!(
+                (result[i] - 0.0).abs() < 1e-3,
+                "elem {}: expected 0.0, got {}",
+                i,
+                result[i]
+            );
         }
     }
 
@@ -1781,9 +1887,17 @@ mod tests {
         };
         let result = dequantize_q5_0(&[block]);
         // Element 0: xh_0 = 16 (bit 0 set), x0 = (1|16)-16 = 1, y = 2.0
-        assert!((result[0] - 2.0).abs() < 1e-2, "elem 0: expected 2.0, got {}", result[0]);
+        assert!(
+            (result[0] - 2.0).abs() < 1e-2,
+            "elem 0: expected 2.0, got {}",
+            result[0]
+        );
         // Element 16: xh_1 = 0 (bit 12 not set), x1 = (3|0)-16 = -13, y = -26.0
-        assert!((result[16] - (-26.0)).abs() < 1e-2, "elem 16: expected -26.0, got {}", result[16]);
+        assert!(
+            (result[16] - (-26.0)).abs() < 1e-2,
+            "elem 16: expected -26.0, got {}",
+            result[16]
+        );
     }
 
     #[test]
@@ -1806,9 +1920,17 @@ mod tests {
         };
         let result = dequantize_q5_1(&[block]);
         // Element 0: x0 = (0|16) = 16, y = 16*0.5 + 2.0 = 10.0
-        assert!((result[0] - 10.0).abs() < 1e-2, "elem 0: expected 10.0, got {}", result[0]);
+        assert!(
+            (result[0] - 10.0).abs() < 1e-2,
+            "elem 0: expected 10.0, got {}",
+            result[0]
+        );
         // Element 16: x1 = (15|16) = 31, y = 31*0.5 + 2.0 = 17.5
-        assert!((result[16] - 17.5).abs() < 1e-2, "elem 16: expected 17.5, got {}", result[16]);
+        assert!(
+            (result[16] - 17.5).abs() < 1e-2,
+            "elem 16: expected 17.5, got {}",
+            result[16]
+        );
     }
 
     #[test]
@@ -1825,7 +1947,7 @@ mod tests {
         };
         // Set low-index scales (0-3): scale=5, min=2
         for i in 0..4 {
-            block.scales[i] = 5;     // scale for sub-block i
+            block.scales[i] = 5; // scale for sub-block i
             block.scales[i + 4] = 2; // min for sub-block i
         }
         // For high indices (4-7), we need the packed format:
@@ -1846,13 +1968,23 @@ mod tests {
         // Sub-block 0 (elements 0-31, low nibbles of qs[0..32]):
         // y = d * scale * (q & 0xF) - dmin * min = 1.0 * 5 * 3 - 0.5 * 2 = 15.0 - 1.0 = 14.0
         for i in 0..32 {
-            assert!((result[i] - 14.0).abs() < 1e-2, "sub-block 0, elem {}: expected 14.0, got {}", i, result[i]);
+            assert!(
+                (result[i] - 14.0).abs() < 1e-2,
+                "sub-block 0, elem {}: expected 14.0, got {}",
+                i,
+                result[i]
+            );
         }
 
         // Sub-block 4 (elements 128-159):
         // sc4=3, m4=1, y = 1.0 * 3 * 3 - 0.5 * 1 = 9.0 - 0.5 = 8.5
         for i in 128..160 {
-            assert!((result[i] - 8.5).abs() < 1e-2, "sub-block 4, elem {}: expected 8.5, got {}", i, result[i]);
+            assert!(
+                (result[i] - 8.5).abs() < 1e-2,
+                "sub-block 4, elem {}: expected 8.5, got {}",
+                i,
+                result[i]
+            );
         }
     }
 
@@ -1877,10 +2009,10 @@ mod tests {
         // We want sc=1: scales[8] & 0xF = 1, scales[0] bits 6-7 = 0 (already true since scales[0]=1)
         // min=0: (scales[8] >> 4) | ((scales[4] >> 6) << 4) = 0, so scales[8] >> 4 = 0
         // scales[8] = 1 (low 4 bits = 1, high 4 bits = 0)
-        block.scales[8] = 1;   // sub-block 4: sc=1, m=0
-        block.scales[9] = 1;   // sub-block 5: sc=1, m=0
-        block.scales[10] = 1;  // sub-block 6: sc=1, m=0
-        block.scales[11] = 1;  // sub-block 7: sc=1, m=0
+        block.scales[8] = 1; // sub-block 4: sc=1, m=0
+        block.scales[9] = 1; // sub-block 5: sc=1, m=0
+        block.scales[10] = 1; // sub-block 6: sc=1, m=0
+        block.scales[11] = 1; // sub-block 7: sc=1, m=0
 
         // Set qh[0] = 0xFF: bits 0-7 all set
         // Iteration 0: u1=1, u2=2 => qh[0]&1=1 (high=16), qh[0]&2=1 (high=16)
@@ -1893,18 +2025,34 @@ mod tests {
         assert_eq!(result.len(), 256);
 
         // Element 0 (iteration 0, l=0): high=16, q=0+16=16, y=1.0*1*16=16.0
-        assert!((result[0] - 16.0).abs() < 1e-2, "elem 0: expected 16.0, got {}", result[0]);
+        assert!(
+            (result[0] - 16.0).abs() < 1e-2,
+            "elem 0: expected 16.0, got {}",
+            result[0]
+        );
 
         // Element 32 (iteration 0, second inner loop, l=0): high=16, y=16.0
-        assert!((result[32] - 16.0).abs() < 1e-2, "elem 32: expected 16.0, got {}", result[32]);
+        assert!(
+            (result[32] - 16.0).abs() < 1e-2,
+            "elem 32: expected 16.0, got {}",
+            result[32]
+        );
 
         // Element 64 (iteration 1, l=0): u1=4, qh[0]&4!=0 => high=16, y=16.0
-        assert!((result[64] - 16.0).abs() < 1e-2, "elem 64: expected 16.0, got {}", result[64]);
+        assert!(
+            (result[64] - 16.0).abs() < 1e-2,
+            "elem 64: expected 16.0, got {}",
+            result[64]
+        );
 
         // Element 192 (iteration 3, l=0): u1=64, qh[0]&64!=0 => high=16
         // This is the iteration that used to overflow (u1 <<= 2 on u8=64)
         // With wrapping_shl, it completes without panic. Sub-block 6 has sc=1.
-        assert!((result[192] - 16.0).abs() < 1e-2, "elem 192 (overflow iter): expected 16.0, got {}", result[192]);
+        assert!(
+            (result[192] - 16.0).abs() < 1e-2,
+            "elem 192 (overflow iter): expected 16.0, got {}",
+            result[192]
+        );
     }
 
     #[test]
@@ -1925,7 +2073,12 @@ mod tests {
         // q = (5 & 0xF) + 0 = 5 (no high bit)
         // y = 1.0 * 2 * 5 - 0.5 * 1 = 10.0 - 0.5 = 9.5
         for i in 0..32 {
-            assert!((result[i] - 9.5).abs() < 1e-2, "elem {}: expected 9.5, got {}", i, result[i]);
+            assert!(
+                (result[i] - 9.5).abs() < 1e-2,
+                "elem {}: expected 9.5, got {}",
+                i,
+                result[i]
+            );
         }
     }
 
@@ -1949,18 +2102,26 @@ mod tests {
         // Sub-block 0 (first 16 elements): scale=1
         // q = (ql & 0xF) | ((qh & 3) << 4) = 1 | 0 = 1, q-32 = -31
         // y = 0.5 * 1 * (-31) = -15.5
-        assert!((result[0] - (-15.5)).abs() < 1e-2, "elem 0: expected -15.5, got {}", result[0]);
+        assert!(
+            (result[0] - (-15.5)).abs() < 1e-2,
+            "elem 0: expected -15.5, got {}",
+            result[0]
+        );
 
         // Sub-block 1 (elements 16-31): scale=2
         // Same ql pattern, q=1, y = 0.5 * 2 * (-31) = -31.0
-        assert!((result[16] - (-31.0)).abs() < 1e-2, "elem 16: expected -31.0, got {}", result[16]);
+        assert!(
+            (result[16] - (-31.0)).abs() < 1e-2,
+            "elem 16: expected -31.0, got {}",
+            result[16]
+        );
     }
 
     #[test]
     fn test_dequantize_q6_k_with_qh_bits() {
         // Verify that qh bits correctly contribute to the 6-bit value
         let mut block = BlockQ6K {
-            ql: [0; 128],   // all nibbles = 0
+            ql: [0; 128], // all nibbles = 0
             qh: [0; 64],
             scales: [0; 16],
             d: f32_to_f16(1.0),
@@ -1969,10 +2130,14 @@ mod tests {
         // qh[0] bits 0,1 correspond to element 0's upper 2 bits
         // For the first 32 elements: qh_val = ((qh[j] >> 0) & 3) << 4
         block.qh[0] = 0x03; // bits 0,1 = 11 for element 0 => qh_val = 3<<4 = 48
-        // q = (0 | 48) - 32 = 16
-        // y = 1.0 * 1 * 16 = 16.0
+                            // q = (0 | 48) - 32 = 16
+                            // y = 1.0 * 1 * 16 = 16.0
 
         let result = dequantize_q6_k(&[block]);
-        assert!((result[0] - 16.0).abs() < 1e-2, "elem 0: expected 16.0, got {}", result[0]);
+        assert!(
+            (result[0] - 16.0).abs() < 1e-2,
+            "elem 0: expected 16.0, got {}",
+            result[0]
+        );
     }
 }

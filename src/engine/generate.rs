@@ -24,25 +24,26 @@ use crate::model::weights::ModelWeights;
 use crate::tensor::Tensor;
 use crate::tokenizer::{create_tokenizer_from_gguf, Tokenizer};
 
-use super::sampler::{SamplingConfig, XorShiftRng, sample_token};
+use super::sampler::{sample_token, SamplingConfig, XorShiftRng};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use super::graph::{BufferRef, DecodeGraph, PrefillGraph, compute_barriers, patch_ops, weight_walk_order_with_factors};
+use super::exec_metal::{
+    encode_decode_token, encode_decode_token_profiled, encode_prefill, encode_prefill_profiled,
+    format_kernel_breakdown, DynamicParams, MetalBufferPool, MetalResources, PrefillParams,
+};
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use super::graph::PsoRef;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use super::graph::{
+    compute_barriers, patch_ops, weight_walk_order_with_factors, BufferRef, DecodeGraph,
+    PrefillGraph,
+};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::backend::metal::ffi::*;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::backend::metal::{MetalBackend, MetalBuffer};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::tensor::TensorDtype;
-#[cfg(all(feature = "metal", target_os = "macos"))]
-use super::exec_metal::{
-    DynamicParams, MetalBufferPool, MetalResources, PrefillParams,
-    encode_decode_token, encode_prefill,
-    encode_decode_token_profiled, encode_prefill_profiled,
-    format_kernel_breakdown,
-};
-#[cfg(all(feature = "metal", target_os = "macos"))]
-use super::graph::PsoRef;
 
 /// Why generation stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,8 +221,15 @@ impl GenerationEngine {
             "metal" => Err(InferenceError::Backend(
                 "Metal backend not available (compile with --features metal on macOS)".to_string(),
             )),
+            #[cfg(feature = "cuda")]
+            "cuda" => Self::from_gguf_cuda_with_ctx(path, ctx_size),
+            #[cfg(not(feature = "cuda"))]
+            "cuda" => Err(InferenceError::Backend(
+                "CUDA backend not available (compile with --features cuda)".to_string(),
+            )),
             other => Err(InferenceError::Backend(format!(
-                "Unknown backend '{}'. Options: auto, cpu, metal", other
+                "Unknown backend '{}'. Options: auto, cpu, metal, cuda",
+                other
             ))),
         }
     }
@@ -232,7 +240,10 @@ impl GenerationEngine {
     }
 
     /// Build a CPU-backed generation engine with optional context length override.
-    fn from_gguf_cpu_with_ctx(path: &Path, ctx_override: Option<usize>) -> Result<Self, InferenceError> {
+    fn from_gguf_cpu_with_ctx(
+        path: &Path,
+        ctx_override: Option<usize>,
+    ) -> Result<Self, InferenceError> {
         info!(path = %path.display(), "Loading generation engine (CPU) from GGUF");
 
         let gguf = GgufFile::open(path)?;
@@ -250,8 +261,7 @@ impl GenerationEngine {
             ));
         }
 
-        let backend: Arc<dyn ComputeBackend> =
-            Arc::new(crate::backend::cpu::CpuBackend::new());
+        let backend: Arc<dyn ComputeBackend> = Arc::new(crate::backend::cpu::CpuBackend::new());
         let weights = ModelWeights::from_gguf(&gguf, &config, backend.as_ref())?;
         let tokenizer = create_tokenizer_from_gguf(&gguf)?;
 
@@ -275,10 +285,68 @@ impl GenerationEngine {
         })
     }
 
+    /// Build a CUDA-backed generation engine with optional context length override.
+    #[cfg(feature = "cuda")]
+    fn from_gguf_cuda_with_ctx(
+        path: &Path,
+        ctx_override: Option<usize>,
+    ) -> Result<Self, InferenceError> {
+        info!(path = %path.display(), "Loading generation engine (CUDA) from GGUF");
+
+        let gguf = GgufFile::open(path)?;
+        let mut config = ModelConfig::from_gguf(&gguf)?;
+
+        let default_ctx = 4096;
+        if let Some(ctx) = ctx_override {
+            if ctx < config.max_seq_len {
+                config.max_seq_len = ctx;
+            }
+        } else if config.max_seq_len > default_ctx {
+            info!(
+                original = config.max_seq_len,
+                capped = default_ctx,
+                "Capping max_seq_len to default context size"
+            );
+            config.max_seq_len = default_ctx;
+        }
+
+        if !config.causal {
+            return Err(InferenceError::Generation(
+                "generation requires a causal model (not bidirectional)".to_string(),
+            ));
+        }
+
+        let backend: Arc<dyn ComputeBackend> =
+            Arc::new(crate::backend::cuda::CudaBackend::try_new()?);
+        let weights = ModelWeights::from_gguf(&gguf, &config, backend.as_ref())?;
+        let tokenizer = create_tokenizer_from_gguf(&gguf)?;
+
+        info!(
+            arch = %config.arch_name,
+            hidden_size = config.hidden_size,
+            vocab_size = config.vocab_size,
+            max_seq_len = config.max_seq_len,
+            "CUDA generation engine loaded"
+        );
+
+        Ok(Self {
+            config,
+            weights,
+            tokenizer,
+            executor: Executor::Cpu(CpuExecutor { backend }),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            decode_graph: None,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            kv_f16: false,
+        })
+    }
 
     /// Build a Metal graph-based generation engine with an optional context length override.
     #[cfg(all(feature = "metal", target_os = "macos"))]
-    fn from_gguf_metal_with_ctx(path: &Path, ctx_override: Option<usize>) -> Result<Self, InferenceError> {
+    fn from_gguf_metal_with_ctx(
+        path: &Path,
+        ctx_override: Option<usize>,
+    ) -> Result<Self, InferenceError> {
         info!(path = %path.display(), "Loading generation engine (Metal) from GGUF");
 
         let gguf = GgufFile::open(path)?;
@@ -325,7 +393,7 @@ impl GenerationEngine {
             let mut precomputed = Vec::with_capacity(half_rope);
             for i in 0..half_rope {
                 precomputed.push(
-                    config.rope_freq_base.powf(inv_ndims * (2 * i) as f32) / factor_values[i]
+                    config.rope_freq_base.powf(inv_ndims * (2 * i) as f32) / factor_values[i],
                 );
             }
             let cpu_tensor = Tensor::new(vec![half_rope], precomputed);
@@ -340,7 +408,7 @@ impl GenerationEngine {
             let mut precomputed = Vec::with_capacity(half_rope);
             for i in 0..half_rope {
                 precomputed.push(
-                    config.rope_freq_base.powf(inv_ndims * (2 * i) as f32) / factor_values[i]
+                    config.rope_freq_base.powf(inv_ndims * (2 * i) as f32) / factor_values[i],
                 );
             }
             let cpu_tensor = Tensor::new(vec![half_rope], precomputed);
@@ -363,8 +431,8 @@ impl GenerationEngine {
         // LONG factors loses too much precision in F16, causing output divergence.
         // Use F32 KV cache when LONG factors are selected.
         let has_rope_factors = config.rope_scaling_original_ctx > 0;
-        let use_long_factors = has_rope_factors
-            && config.max_seq_len > config.rope_scaling_original_ctx;
+        let use_long_factors =
+            has_rope_factors && config.max_seq_len > config.rope_scaling_original_ctx;
         let kv_f16 = !use_long_factors;
         let mut decode_graph = DecodeGraph::build(&config, &weights, kv_f16);
         info!(
@@ -385,7 +453,9 @@ impl GenerationEngine {
             let queue = msg_send_id(device, sels.new_command_queue);
             if queue == NIL {
                 msg_send_void(device, sels.release);
-                return Err(InferenceError::Backend("Failed to create command queue".into()));
+                return Err(InferenceError::Backend(
+                    "Failed to create command queue".into(),
+                ));
             }
             (device, queue)
         };
@@ -393,17 +463,13 @@ impl GenerationEngine {
         let metal_res = unsafe { MetalResources::new(device, command_queue)? };
 
         // Pre-allocate buffer pool
-        let buffer_pool = unsafe {
-            MetalBufferPool::new(device, &metal_res.sels, &decode_graph.slot_sizes)
-        };
+        let buffer_pool =
+            unsafe { MetalBufferPool::new(device, &metal_res.sels, &decode_graph.slot_sizes) };
 
         // Extract raw buffer Ids from model weights.
         // Factor selection was computed above for kv_f16 decision; reuse for walk order.
         let walked = weight_walk_order_with_factors(&weights, use_long_factors);
-        let mut weight_buf_ids: Vec<Id> = walked
-            .iter()
-            .map(|dt| extract_buffer_id(dt))
-            .collect();
+        let mut weight_buf_ids: Vec<Id> = walked.iter().map(|dt| extract_buffer_id(dt)).collect();
 
         // Pre-convert non-F32 embedding tables to F32
         let mut f32_emb_tensors: Vec<DeviceTensor> = Vec::new();
@@ -419,7 +485,11 @@ impl GenerationEngine {
             let new_idx = weight_buf_ids.len() as u16;
             weight_buf_ids.push(f32_buf);
             f32_emb_tensors.push(f32_dt);
-            patch_ops(&mut decode_graph.ops, BufferRef::Weight(0), BufferRef::Weight(new_idx));
+            patch_ops(
+                &mut decode_graph.ops,
+                BufferRef::Weight(0),
+                BufferRef::Weight(new_idx),
+            );
             f32_token_emb_idx = Some(new_idx);
             info!(
                 original_dtype = ?weights.token_embedding.dtype(),
@@ -437,7 +507,11 @@ impl GenerationEngine {
                 let new_idx = weight_buf_ids.len() as u16;
                 weight_buf_ids.push(f32_buf);
                 f32_emb_tensors.push(f32_dt);
-                patch_ops(&mut decode_graph.ops, BufferRef::Weight(1), BufferRef::Weight(new_idx));
+                patch_ops(
+                    &mut decode_graph.ops,
+                    BufferRef::Weight(1),
+                    BufferRef::Weight(new_idx),
+                );
                 f32_pos_emb_idx = Some(new_idx);
                 info!(
                     original_dtype = ?pos_emb.dtype(),
@@ -632,7 +706,9 @@ impl GenerationEngine {
             let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
             eprintln!(
                 "[profile] prefill: {:.1}ms ({} tokens) | {}",
-                prefill_ms, prompt_tokens, backend.profile_summary(),
+                prefill_ms,
+                prompt_tokens,
+                backend.profile_summary(),
             );
         }
 
@@ -683,7 +759,11 @@ impl GenerationEngine {
                 let total_ms = tok_start.elapsed().as_secs_f64() * 1000.0;
                 eprintln!(
                     "[profile] tok {}: {:.1}ms (fwd={:.1}ms logits={:.1}ms sample={:.1}ms) | {}",
-                    step + 1, total_ms, fwd_ms, logits_ms, sample_ms,
+                    step + 1,
+                    total_ms,
+                    fwd_ms,
+                    logits_ms,
+                    sample_ms,
                     backend.profile_summary(),
                 );
             }
@@ -741,11 +821,13 @@ impl GenerationEngine {
 
         // Build prefill graph for this prompt's token count
         let kv_f16 = self.kv_f16;
-        let mut prefill_graph = PrefillGraph::build(
-            &self.config, &self.weights, prompt_ids.len(), kv_f16,
-        );
+        let mut prefill_graph =
+            PrefillGraph::build(&self.config, &self.weights, prompt_ids.len(), kv_f16);
         if profiling {
-            eprintln!("[profile-detail] graph build: {:.1}ms", prefill_start.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[profile-detail] graph build: {:.1}ms",
+                prefill_start.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         // Borrow executor fields
@@ -756,16 +838,27 @@ impl GenerationEngine {
 
         // Apply F32 embedding patches (same indices as decode graph)
         if let Some(idx) = metal.f32_token_emb_idx {
-            patch_ops(&mut prefill_graph.ops, BufferRef::Weight(0), BufferRef::Weight(idx));
+            patch_ops(
+                &mut prefill_graph.ops,
+                BufferRef::Weight(0),
+                BufferRef::Weight(idx),
+            );
         }
         if let Some(idx) = metal.f32_pos_emb_idx {
-            patch_ops(&mut prefill_graph.ops, BufferRef::Weight(1), BufferRef::Weight(idx));
+            patch_ops(
+                &mut prefill_graph.ops,
+                BufferRef::Weight(1),
+                BufferRef::Weight(idx),
+            );
         }
 
         // Recompute barriers after patching
         prefill_graph.barriers = compute_barriers(&prefill_graph.ops);
         if profiling {
-            eprintln!("[profile-detail] patch+barrier: {:.1}ms", prefill_start.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[profile-detail] patch+barrier: {:.1}ms",
+                prefill_start.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         // Allocate temporary prefill buffer pool
@@ -815,7 +908,10 @@ impl GenerationEngine {
         };
         let kv_buf_ids = Self::extract_kv_buf_ids_metal(&self.config, &cache);
         if profiling {
-            eprintln!("[profile-detail] alloc (pool+tokens+kv): {:.1}ms", prefill_start.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[profile-detail] alloc (pool+tokens+kv): {:.1}ms",
+                prefill_start.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         // Encode and execute
@@ -843,7 +939,9 @@ impl GenerationEngine {
             let (breakdown, _total_gpu) = format_kernel_breakdown(&timings);
             eprintln!(
                 "[profile] prefill GPU kernel breakdown ({} tok, {} ops, {:.1}ms wall):",
-                prompt_tokens, prefill_graph.ops.len(), gpu_ms,
+                prompt_tokens,
+                prefill_graph.ops.len(),
+                gpu_ms,
             );
             eprint!("{}", breakdown);
             logits
@@ -910,7 +1008,11 @@ impl GenerationEngine {
                 break;
             }
 
-            let tok_start = if profiling { Some(Instant::now()) } else { None };
+            let tok_start = if profiling {
+                Some(Instant::now())
+            } else {
+                None
+            };
 
             // LongRoPE factors were selected once before prefill based on max_seq_len
             // (matching llama.cpp's n_ctx-based selection), so no per-token swap needed.
@@ -926,7 +1028,9 @@ impl GenerationEngine {
                 kv_dim: metal.kv_dim,
             };
 
-            let decode_graph = self.decode_graph.as_ref()
+            let decode_graph = self
+                .decode_graph
+                .as_ref()
                 .expect("Metal executor requires decode_graph");
 
             let logits = if profiling {
@@ -966,10 +1070,7 @@ impl GenerationEngine {
 
             if let Some(start) = tok_start {
                 let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-                eprintln!(
-                    "[profile] tok {}: {:.1}ms",
-                    step + 1, total_ms,
-                );
+                eprintln!("[profile] tok {}: {:.1}ms", step + 1, total_ms,);
             }
         }
 
@@ -978,7 +1079,8 @@ impl GenerationEngine {
             let (breakdown, _total_gpu) = format_kernel_breakdown(&decode_timings_accum);
             eprintln!(
                 "[profile] decode GPU kernel breakdown ({} tok, {} ops total):",
-                decode_tokens_profiled, decode_timings_accum.len(),
+                decode_tokens_profiled,
+                decode_timings_accum.len(),
             );
             eprint!("{}", breakdown);
         }
@@ -1001,7 +1103,10 @@ impl GenerationEngine {
         let hidden_size = self.config.hidden_size;
         let n_rows = hidden.shape()[0];
 
-        let proj_weight = self.weights.output_projection.as_ref()
+        let proj_weight = self
+            .weights
+            .output_projection
+            .as_ref()
             .unwrap_or(&self.weights.token_embedding);
 
         if n_rows == 1 {
@@ -1013,9 +1118,7 @@ impl GenerationEngine {
             let hidden_data = hidden_host.as_f32();
             let start = row * hidden_size;
             let row_data = &hidden_data[start..start + hidden_size];
-            let row_tensor = backend.upload(
-                &Tensor::new(vec![1, hidden_size], row_data.to_vec()),
-            );
+            let row_tensor = backend.upload(&Tensor::new(vec![1, hidden_size], row_data.to_vec()));
             let logits_tensor = linear_forward(&row_tensor, proj_weight, None, backend);
             let logits_host = backend.download(&logits_tensor);
             logits_host.as_f32().to_vec()
@@ -1100,14 +1203,14 @@ mod tests {
         fn new() -> Self {
             Self {
                 vocab: vec![
-                    "<pad>".to_string(),  // 0
-                    "<bos>".to_string(),  // 1
-                    "<eos>".to_string(),  // 2
-                    "hello".to_string(),  // 3
-                    "world".to_string(),  // 4
-                    "foo".to_string(),    // 5
-                    "bar".to_string(),    // 6
-                    "baz".to_string(),    // 7
+                    "<pad>".to_string(), // 0
+                    "<bos>".to_string(), // 1
+                    "<eos>".to_string(), // 2
+                    "hello".to_string(), // 3
+                    "world".to_string(), // 4
+                    "foo".to_string(),   // 5
+                    "bar".to_string(),   // 6
+                    "baz".to_string(),   // 7
                 ],
                 eos_id: 2,
             }
@@ -1180,13 +1283,24 @@ mod tests {
         }
 
         fn decode(&self, ids: &[u32]) -> String {
-            ids.iter().map(|id| format!("t{}", id)).collect::<Vec<_>>().join(" ")
+            ids.iter()
+                .map(|id| format!("t{}", id))
+                .collect::<Vec<_>>()
+                .join(" ")
         }
 
-        fn vocab_size(&self) -> usize { 8 }
-        fn bos_token_id(&self) -> Option<u32> { Some(1) }
-        fn eos_token_id(&self) -> Option<u32> { None }
-        fn pad_token_id(&self) -> Option<u32> { Some(0) }
+        fn vocab_size(&self) -> usize {
+            8
+        }
+        fn bos_token_id(&self) -> Option<u32> {
+            Some(1)
+        }
+        fn eos_token_id(&self) -> Option<u32> {
+            None
+        }
+        fn pad_token_id(&self) -> Option<u32> {
+            Some(0)
+        }
     }
 
     fn dt(tensor: Tensor) -> DeviceTensor {
@@ -1324,7 +1438,10 @@ mod tests {
 
         let result1 = engine.generate("hello", &gen_cfg).unwrap();
         let result2 = engine.generate("hello", &gen_cfg).unwrap();
-        assert_eq!(result1, result2, "Greedy generation should be deterministic");
+        assert_eq!(
+            result1, result2,
+            "Greedy generation should be deterministic"
+        );
     }
 
     #[test]
@@ -1431,10 +1548,17 @@ mod tests {
         let result = engine.generate("hello", &gen_cfg);
         assert!(result.is_err(), "generate() should reject non-causal model");
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("causal"), "Error should mention causal: {}", err_msg);
+        assert!(
+            err_msg.contains("causal"),
+            "Error should mention causal: {}",
+            err_msg
+        );
 
         let stream_result = engine.generate_stream("hello", &gen_cfg, |_| true);
-        assert!(stream_result.is_err(), "generate_stream() should reject non-causal model");
+        assert!(
+            stream_result.is_err(),
+            "generate_stream() should reject non-causal model"
+        );
     }
 
     #[test]
@@ -1457,7 +1581,11 @@ mod tests {
         let result = engine.generate("hello world foo", &gen_cfg);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("exceeds max_seq_len"), "Error: {}", err_msg);
+        assert!(
+            err_msg.contains("exceeds max_seq_len"),
+            "Error: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -1500,7 +1628,11 @@ mod tests {
         };
 
         let result = engine.generate("hello", &gen_cfg).unwrap();
-        assert!(result.is_empty(), "max_tokens=0 should produce empty output, got: {:?}", result);
+        assert!(
+            result.is_empty(),
+            "max_tokens=0 should produce empty output, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1520,7 +1652,9 @@ mod tests {
         };
 
         let text_result = engine1.generate("hello", &gen_cfg).unwrap();
-        let stream_ids = engine2.generate_stream("hello", &gen_cfg, |_| true).unwrap();
+        let stream_ids = engine2
+            .generate_stream("hello", &gen_cfg, |_| true)
+            .unwrap();
 
         let mock_tok = MockTokenizer::new();
         let stream_text = mock_tok.decode(&stream_ids);
@@ -1577,7 +1711,9 @@ mod tests {
             },
         };
 
-        let output = engine.generate_stream_full("hello", &gen_cfg, |_| false).unwrap();
+        let output = engine
+            .generate_stream_full("hello", &gen_cfg, |_| false)
+            .unwrap();
         assert_eq!(output.stop_reason, StopReason::Cancelled);
         assert_eq!(output.token_ids.len(), 1);
     }
@@ -1609,20 +1745,39 @@ mod tests {
         let config = gen_config(4);
         let mut engine = build_gen_engine(config);
 
-        let probe = engine.generate_full("hello", &GenerationConfig {
-            max_tokens: 1,
-            stop_tokens: vec![],
-            sampling: SamplingConfig { temperature: 0.0, ..Default::default() },
-        }).unwrap();
+        let probe = engine
+            .generate_full(
+                "hello",
+                &GenerationConfig {
+                    max_tokens: 1,
+                    stop_tokens: vec![],
+                    sampling: SamplingConfig {
+                        temperature: 0.0,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
 
-        assert!(!probe.token_ids.is_empty(), "Need at least one token to test stop");
+        assert!(
+            !probe.token_ids.is_empty(),
+            "Need at least one token to test stop"
+        );
         let first_token = probe.token_ids[0];
 
-        let output = engine.generate_full("hello", &GenerationConfig {
-            max_tokens: 100,
-            stop_tokens: vec![first_token],
-            sampling: SamplingConfig { temperature: 0.0, ..Default::default() },
-        }).unwrap();
+        let output = engine
+            .generate_full(
+                "hello",
+                &GenerationConfig {
+                    max_tokens: 100,
+                    stop_tokens: vec![first_token],
+                    sampling: SamplingConfig {
+                        temperature: 0.0,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
 
         assert_eq!(output.stop_reason, StopReason::StopToken);
         assert!(output.token_ids.is_empty());
@@ -1725,8 +1880,12 @@ mod tests {
             ..Default::default()
         };
 
-        let stream_ids = engine1.generate_stream("hello", &gen_cfg, |_| true).unwrap();
-        let full_output = engine2.generate_stream_full("hello", &gen_cfg, |_| true).unwrap();
+        let stream_ids = engine1
+            .generate_stream("hello", &gen_cfg, |_| true)
+            .unwrap();
+        let full_output = engine2
+            .generate_stream_full("hello", &gen_cfg, |_| true)
+            .unwrap();
         assert_eq!(stream_ids, full_output.token_ids);
     }
 
@@ -1744,7 +1903,7 @@ mod tests {
 
     #[test]
     fn test_from_gguf_with_backend_unknown_returns_error() {
-        let result = GenerationEngine::from_gguf_with_backend("/nonexistent.gguf", "cuda");
+        let result = GenerationEngine::from_gguf_with_backend("/nonexistent.gguf", "tpu");
         match result {
             Err(e) => {
                 let err = format!("{}", e);
@@ -1761,7 +1920,11 @@ mod tests {
         match result {
             Err(e) => {
                 let err = format!("{}", e);
-                assert!(err.contains("Metal backend not available"), "Error: {}", err);
+                assert!(
+                    err.contains("Metal backend not available"),
+                    "Error: {}",
+                    err
+                );
             }
             Ok(_) => panic!("Expected error for Metal on non-Metal build"),
         }

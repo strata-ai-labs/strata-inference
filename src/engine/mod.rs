@@ -4,12 +4,12 @@
 //! - [`GenerationEngine`]: prompt → text via autoregressive decoding (M6)
 
 pub mod embed;
-pub mod generate;
-pub mod sampler;
-#[allow(dead_code)]
-pub(crate) mod graph;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub(crate) mod exec_metal;
+pub mod generate;
+#[allow(dead_code)]
+pub(crate) mod graph;
+pub mod sampler;
 
 pub use embed::EmbeddingEngine;
 pub use generate::GenerationEngine;

@@ -204,9 +204,7 @@ impl MetalBackend {
             // 1. Get the default Metal device.
             let device = MTLCreateSystemDefaultDevice();
             if device == NIL {
-                return Err(InferenceError::Backend(
-                    "No Metal device available".into(),
-                ));
+                return Err(InferenceError::Backend("No Metal device available".into()));
             }
             // Retain the device so our Drop can release it.
             msg_send_void(device, sel_registerName(b"retain\0".as_ptr() as _));
@@ -285,8 +283,7 @@ impl MetalBackend {
             let mut psos = [NIL; 35];
             for (i, name) in kernel_names.iter().enumerate() {
                 let ns_name = ns_string(name);
-                let func =
-                    msg_send_id_id(library, sels.new_function_with_name, ns_name);
+                let func = msg_send_id_id(library, sels.new_function_with_name, ns_name);
                 if func == NIL {
                     // Cleanup already-created PSOs.
                     for p in &psos[..i] {
@@ -304,12 +301,8 @@ impl MetalBackend {
                 }
 
                 let mut pso_error: Id = NIL;
-                let pso = msg_send_id_id_err(
-                    device,
-                    sels.new_compute_pipeline,
-                    func,
-                    &mut pso_error,
-                );
+                let pso =
+                    msg_send_id_id_err(device, sels.new_compute_pipeline, func, &mut pso_error);
                 msg_send_void(func, sels.release);
 
                 if pso == NIL {
@@ -429,10 +422,7 @@ impl MetalBackend {
             len,
             MTL_RESOURCE_STORAGE_MODE_SHARED,
         );
-        MetalBuffer {
-            buffer: buf,
-            len,
-        }
+        MetalBuffer { buffer: buf, len }
     }
 
     /// Read back the contents of a Metal buffer as a `Vec<f32>`.
@@ -527,13 +517,7 @@ impl MetalBackend {
 
     /// Bind small constant data (e.g. a single u32 or f32) at `index`.
     unsafe fn set_bytes(&self, enc: Id, data: &[u8], index: usize) {
-        msg_send_set_bytes(
-            enc,
-            self.sels.set_bytes,
-            data.as_ptr(),
-            data.len(),
-            index,
-        );
+        msg_send_set_bytes(enc, self.sels.set_bytes, data.as_ptr(), data.len(), index);
     }
 
     /// Bind a `u32` parameter at `index`.
@@ -557,27 +541,28 @@ impl MetalBackend {
         msg_send_dispatch(
             enc,
             self.sels.dispatch_threadgroups,
-            groups, 1, 1, // threadgroups
-            threads, 1, 1, // threads per threadgroup
+            groups,
+            1,
+            1, // threadgroups
+            threads,
+            1,
+            1, // threads per threadgroup
         );
     }
 
     /// Dispatch a 2D grid: ceil(width/tx) x ceil(height/ty) threadgroups.
-    unsafe fn dispatch_2d(
-        &self,
-        enc: Id,
-        width: usize,
-        height: usize,
-        tx: usize,
-        ty: usize,
-    ) {
+    unsafe fn dispatch_2d(&self, enc: Id, width: usize, height: usize, tx: usize, ty: usize) {
         let gx = (width + tx - 1) / tx;
         let gy = (height + ty - 1) / ty;
         msg_send_dispatch(
             enc,
             self.sels.dispatch_threadgroups,
-            gx, gy, 1, // threadgroups
-            tx, ty, 1, // threads per threadgroup
+            gx,
+            gy,
+            1, // threadgroups
+            tx,
+            ty,
+            1, // threads per threadgroup
         );
     }
 
@@ -592,27 +577,21 @@ impl MetalBackend {
         ty: usize,
         tz: usize,
     ) {
-        msg_send_dispatch(
-            enc,
-            self.sels.dispatch_threadgroups,
-            gx, gy, gz,
-            tx, ty, tz,
-        );
+        msg_send_dispatch(enc, self.sels.dispatch_threadgroups, gx, gy, gz, tx, ty, tz);
     }
 
     /// Dispatch with one threadgroup per row, `threads_per_group` threads each.
     /// Used by reduction kernels (layer_norm, softmax_rows, rms_norm).
-    unsafe fn dispatch_rows(
-        &self,
-        enc: Id,
-        num_rows: usize,
-        threads_per_group: usize,
-    ) {
+    unsafe fn dispatch_rows(&self, enc: Id, num_rows: usize, threads_per_group: usize) {
         msg_send_dispatch(
             enc,
             self.sels.dispatch_threadgroups,
-            num_rows, 1, 1,          // threadgroups
-            threads_per_group, 1, 1, // threads per threadgroup
+            num_rows,
+            1,
+            1, // threadgroups
+            threads_per_group,
+            1,
+            1, // threads per threadgroup
         );
     }
 
@@ -731,10 +710,7 @@ impl ComputeBackend for MetalBackend {
                 // Upload raw f16 bits as bytes
                 trace!(shape = ?shape, dtype = ?dtype, "Metal upload F16");
                 let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        data.as_ptr() as *const u8,
-                        data.len() * 2,
-                    )
+                    std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
                 };
                 unsafe { self.create_buffer(bytes) }
             }
@@ -771,25 +747,26 @@ impl ComputeBackend for MetalBackend {
             }
             TensorDtype::F16 => {
                 let n_elements: usize = shape.iter().product();
-                let ptr =
-                    unsafe { msg_send_ptr(mb.buffer, self.sels.contents) } as *const u16;
-                let data =
-                    unsafe { std::slice::from_raw_parts(ptr, n_elements) }.to_vec();
+                let ptr = unsafe { msg_send_ptr(mb.buffer, self.sels.contents) } as *const u16;
+                let data = unsafe { std::slice::from_raw_parts(ptr, n_elements) }.to_vec();
                 trace!(shape = ?shape, "Metal download F16");
                 Tensor::from_f16(shape, data)
             }
-            TensorDtype::Q8_0 | TensorDtype::Q4_0
-            | TensorDtype::Q4_1 | TensorDtype::Q5_0 | TensorDtype::Q5_1
-            | TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => {
+            TensorDtype::Q8_0
+            | TensorDtype::Q4_0
+            | TensorDtype::Q4_1
+            | TensorDtype::Q5_0
+            | TensorDtype::Q5_1
+            | TensorDtype::Q4_K
+            | TensorDtype::Q5_K
+            | TensorDtype::Q6_K => {
                 let n_elements: usize = shape.iter().product();
                 let block_size = dtype.block_size();
                 let block_byte_size = dtype.block_byte_size();
                 let n_blocks = (n_elements + block_size - 1) / block_size;
                 let total_bytes = n_blocks * block_byte_size;
-                let ptr =
-                    unsafe { msg_send_ptr(mb.buffer, self.sels.contents) } as *const u8;
-                let data =
-                    unsafe { std::slice::from_raw_parts(ptr, total_bytes) }.to_vec();
+                let ptr = unsafe { msg_send_ptr(mb.buffer, self.sels.contents) } as *const u8;
+                let data = unsafe { std::slice::from_raw_parts(ptr, total_bytes) }.to_vec();
                 trace!(shape = ?shape, dtype = ?dtype, "Metal download quantized");
                 Tensor::from_quantized(shape, dtype, data)
             }
@@ -799,7 +776,11 @@ impl ComputeBackend for MetalBackend {
     fn matmul(&self, a: &DeviceTensor, b: &DeviceTensor) -> DeviceTensor {
         let (m, k) = Self::shape_2d(a);
         let (k2, n) = Self::shape_2d(b);
-        assert_eq!(k, k2, "matmul dimension mismatch: a cols {} != b rows {}", k, k2);
+        assert_eq!(
+            k, k2,
+            "matmul dimension mismatch: a cols {} != b rows {}",
+            k, k2
+        );
 
         let out_count = m * n;
         let out_bytes = out_count * std::mem::size_of::<f32>();
@@ -818,12 +799,7 @@ impl ComputeBackend for MetalBackend {
             // simdgroup_matrix: 32x32 tiles, 128 threads (4 simdgroups)
             let gx = (n + 31) / 32;
             let gy = (m + 31) / 32;
-            msg_send_dispatch(
-                enc,
-                self.sels.dispatch_threadgroups,
-                gx, gy, 1,
-                128, 1, 1,
-            );
+            msg_send_dispatch(enc, self.sels.dispatch_threadgroups, gx, gy, 1, 128, 1, 1);
 
             Self::wrap(out_buf, vec![m, n], TensorDtype::F32)
         }
@@ -855,12 +831,7 @@ impl ComputeBackend for MetalBackend {
             // simdgroup_matrix: 32x32 tiles, 128 threads (4 simdgroups)
             let gx = (n + 31) / 32;
             let gy = (m + 31) / 32;
-            msg_send_dispatch(
-                enc,
-                self.sels.dispatch_threadgroups,
-                gx, gy, 1,
-                128, 1, 1,
-            );
+            msg_send_dispatch(enc, self.sels.dispatch_threadgroups, gx, gy, 1, 128, 1, 1);
 
             Self::wrap(out_buf, vec![m, n], TensorDtype::F32)
         }
@@ -872,7 +843,11 @@ impl ComputeBackend for MetalBackend {
         let weight_shape = weights.shape();
         let dtype = weights.dtype();
 
-        let m = if input_shape.len() == 1 { 1 } else { input_shape[0] };
+        let m = if input_shape.len() == 1 {
+            1
+        } else {
+            input_shape[0]
+        };
         let k = *input_shape.last().unwrap();
         let n = weight_shape[0];
 
@@ -884,7 +859,14 @@ impl ComputeBackend for MetalBackend {
 
         // For types without native GPU kernels, fall back to
         // dequantizing on CPU and using regular F32 matmul_transpose.
-        if !matches!(dtype, TensorDtype::Q8_0 | TensorDtype::Q4_0 | TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K) {
+        if !matches!(
+            dtype,
+            TensorDtype::Q8_0
+                | TensorDtype::Q4_0
+                | TensorDtype::Q4_K
+                | TensorDtype::Q5_K
+                | TensorDtype::Q6_K
+        ) {
             tracing::debug!(
                 ?dtype,
                 "Metal quantized_matmul: no native kernel for {:?}, using dequant fallback",
@@ -917,8 +899,14 @@ impl ComputeBackend for MetalBackend {
                         self.set_u32(enc, k as u32, 4);
                         let threadgroups = (n + 7) / 8;
                         msg_send_dispatch(
-                            enc, self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1, 128, 1, 1,
+                            enc,
+                            self.sels.dispatch_threadgroups,
+                            threadgroups,
+                            1,
+                            1,
+                            128,
+                            1,
+                            1,
                         );
                     }
                     TensorDtype::Q4_0 => {
@@ -930,8 +918,14 @@ impl ComputeBackend for MetalBackend {
                         self.set_u32(enc, k as u32, 4);
                         let threadgroups = (n + 7) / 8;
                         msg_send_dispatch(
-                            enc, self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1, 64, 1, 1,
+                            enc,
+                            self.sels.dispatch_threadgroups,
+                            threadgroups,
+                            1,
+                            1,
+                            64,
+                            1,
+                            1,
                         );
                     }
                     TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => {
@@ -949,8 +943,14 @@ impl ComputeBackend for MetalBackend {
                         self.set_u32(enc, k as u32, 4);
                         let threadgroups = (n + 3) / 4;
                         msg_send_dispatch(
-                            enc, self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1, 64, 1, 1,
+                            enc,
+                            self.sels.dispatch_threadgroups,
+                            threadgroups,
+                            1,
+                            1,
+                            64,
+                            1,
+                            1,
                         );
                     }
                     _ => unreachable!("handled by fallback above"),
@@ -978,13 +978,9 @@ impl ComputeBackend for MetalBackend {
                 self.set_u32(enc, m as u32, 3);
                 self.set_u32(enc, k as u32, 4);
                 self.set_u32(enc, n as u32, 5);
-                let gx = (n + 31) / 32;  // ceil(N / BBN)
-                let gy = (m + 63) / 64;  // ceil(M / BBM)
-                msg_send_dispatch(
-                    enc, self.sels.dispatch_threadgroups,
-                    gx, gy, 1,
-                    128, 1, 1,
-                );
+                let gx = (n + 31) / 32; // ceil(N / BBN)
+                let gy = (m + 63) / 64; // ceil(M / BBM)
+                msg_send_dispatch(enc, self.sels.dispatch_threadgroups, gx, gy, 1, 128, 1, 1);
                 return Self::wrap(out_buf, vec![m, n], TensorDtype::F32);
             }
 
@@ -1009,15 +1005,24 @@ impl ComputeBackend for MetalBackend {
                         self.set_buffer(enc, weight_buf_id, 0);
                         self.set_buffer(enc, input_row_buf.buffer, 1);
                         msg_send_set_buffer(
-                            enc, self.sels.set_buffer, out_buf.buffer,
-                            row_out_offset * std::mem::size_of::<f32>(), 2,
+                            enc,
+                            self.sels.set_buffer,
+                            out_buf.buffer,
+                            row_out_offset * std::mem::size_of::<f32>(),
+                            2,
                         );
                         self.set_u32(enc, n as u32, 3);
                         self.set_u32(enc, k as u32, 4);
                         let threadgroups = (n + 7) / 8;
                         msg_send_dispatch(
-                            enc, self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1, 128, 1, 1,
+                            enc,
+                            self.sels.dispatch_threadgroups,
+                            threadgroups,
+                            1,
+                            1,
+                            128,
+                            1,
+                            1,
                         );
                     }
                     TensorDtype::Q4_0 => {
@@ -1025,15 +1030,24 @@ impl ComputeBackend for MetalBackend {
                         self.set_buffer(enc, weight_buf_id, 0);
                         self.set_buffer(enc, input_row_buf.buffer, 1);
                         msg_send_set_buffer(
-                            enc, self.sels.set_buffer, out_buf.buffer,
-                            row_out_offset * std::mem::size_of::<f32>(), 2,
+                            enc,
+                            self.sels.set_buffer,
+                            out_buf.buffer,
+                            row_out_offset * std::mem::size_of::<f32>(),
+                            2,
                         );
                         self.set_u32(enc, n as u32, 3);
                         self.set_u32(enc, k as u32, 4);
                         let threadgroups = (n + 7) / 8;
                         msg_send_dispatch(
-                            enc, self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1, 64, 1, 1,
+                            enc,
+                            self.sels.dispatch_threadgroups,
+                            threadgroups,
+                            1,
+                            1,
+                            64,
+                            1,
+                            1,
                         );
                     }
                     TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => {
@@ -1047,15 +1061,24 @@ impl ComputeBackend for MetalBackend {
                         self.set_buffer(enc, weight_buf_id, 0);
                         self.set_buffer(enc, input_row_buf.buffer, 1);
                         msg_send_set_buffer(
-                            enc, self.sels.set_buffer, out_buf.buffer,
-                            row_out_offset * std::mem::size_of::<f32>(), 2,
+                            enc,
+                            self.sels.set_buffer,
+                            out_buf.buffer,
+                            row_out_offset * std::mem::size_of::<f32>(),
+                            2,
                         );
                         self.set_u32(enc, n as u32, 3);
                         self.set_u32(enc, k as u32, 4);
                         let threadgroups = (n + 3) / 4;
                         msg_send_dispatch(
-                            enc, self.sels.dispatch_threadgroups,
-                            threadgroups, 1, 1, 64, 1, 1,
+                            enc,
+                            self.sels.dispatch_threadgroups,
+                            threadgroups,
+                            1,
+                            1,
+                            64,
+                            1,
+                            1,
                         );
                     }
                     _ => unreachable!("handled by fallback above"),
@@ -1292,10 +1315,26 @@ impl ComputeBackend for MetalBackend {
         head_dim: usize,
         rope_dim: usize,
     ) -> (DeviceTensor, DeviceTensor) {
-        let q_out =
-            unsafe { self.dispatch_rope(self.pso_rope_norm, q, pos_offset, freq_base, head_dim, rope_dim) };
-        let k_out =
-            unsafe { self.dispatch_rope(self.pso_rope_norm, k, pos_offset, freq_base, head_dim, rope_dim) };
+        let q_out = unsafe {
+            self.dispatch_rope(
+                self.pso_rope_norm,
+                q,
+                pos_offset,
+                freq_base,
+                head_dim,
+                rope_dim,
+            )
+        };
+        let k_out = unsafe {
+            self.dispatch_rope(
+                self.pso_rope_norm,
+                k,
+                pos_offset,
+                freq_base,
+                head_dim,
+                rope_dim,
+            )
+        };
         (q_out, k_out)
     }
 
@@ -1304,7 +1343,10 @@ impl ComputeBackend for MetalBackend {
         let out_bytes = cols * std::mem::size_of::<f32>();
 
         // Convert f32 mask to u32 (1.0 → 1u32, 0.0 → 0u32) for the kernel
-        let mask_u32: Vec<u32> = mask.iter().map(|&v| if v > 0.5 { 1u32 } else { 0u32 }).collect();
+        let mask_u32: Vec<u32> = mask
+            .iter()
+            .map(|&v| if v > 0.5 { 1u32 } else { 0u32 })
+            .collect();
 
         unsafe {
             let mask_buf = self.create_buffer_u32(&mask_u32);
@@ -1371,7 +1413,9 @@ impl ComputeBackend for MetalBackend {
             assert!(
                 (id as usize) < vocab_size,
                 "embedding_lookup: token_id {} at index {} is out of range (vocab_size = {})",
-                id, i, vocab_size
+                id,
+                i,
+                vocab_size
             );
         }
 
@@ -1463,21 +1507,40 @@ impl ComputeBackend for MetalBackend {
         head_dim: usize,
         rope_dim: usize,
     ) -> (DeviceTensor, DeviceTensor) {
-        let q_out =
-            unsafe { self.dispatch_rope(self.pso_rope_neox, q, pos_offset, freq_base, head_dim, rope_dim) };
-        let k_out =
-            unsafe { self.dispatch_rope(self.pso_rope_neox, k, pos_offset, freq_base, head_dim, rope_dim) };
+        let q_out = unsafe {
+            self.dispatch_rope(
+                self.pso_rope_neox,
+                q,
+                pos_offset,
+                freq_base,
+                head_dim,
+                rope_dim,
+            )
+        };
+        let k_out = unsafe {
+            self.dispatch_rope(
+                self.pso_rope_neox,
+                k,
+                pos_offset,
+                freq_base,
+                head_dim,
+                rope_dim,
+            )
+        };
         (q_out, k_out)
     }
 
-    fn copy_rows_into(
-        &self,
-        dest: &DeviceTensor,
-        src: &DeviceTensor,
-        dest_row_offset: usize,
-    ) {
-        debug_assert_eq!(src.dtype(), TensorDtype::F32, "copy_rows_into: src must be F32");
-        debug_assert_eq!(dest.dtype(), TensorDtype::F32, "copy_rows_into: dest must be F32");
+    fn copy_rows_into(&self, dest: &DeviceTensor, src: &DeviceTensor, dest_row_offset: usize) {
+        debug_assert_eq!(
+            src.dtype(),
+            TensorDtype::F32,
+            "copy_rows_into: src must be F32"
+        );
+        debug_assert_eq!(
+            dest.dtype(),
+            TensorDtype::F32,
+            "copy_rows_into: dest must be F32"
+        );
         let cols = dest.shape().last().copied().unwrap_or(0);
         let n_rows = src.shape()[0];
         let count = n_rows * cols; // number of f32 elements to copy
@@ -1539,8 +1602,12 @@ impl ComputeBackend for MetalBackend {
             msg_send_dispatch(
                 enc,
                 self.sels.dispatch_threadgroups,
-                num_heads, 1, 1,
-                256, 1, 1,
+                num_heads,
+                1,
+                1,
+                256,
+                1,
+                1,
             );
 
             Self::wrap(out_buf, vec![1, total_dim], TensorDtype::F32)
@@ -1591,8 +1658,12 @@ impl ComputeBackend for MetalBackend {
             msg_send_dispatch(
                 enc,
                 self.sels.dispatch_threadgroups,
-                num_heads * n_tokens, 1, 1,
-                256, 1, 1,
+                num_heads * n_tokens,
+                1,
+                1,
+                256,
+                1,
+                1,
             );
 
             Self::wrap(out_buf, vec![n_tokens, total_dim], TensorDtype::F32)
@@ -1969,16 +2040,12 @@ mod tests {
 
         // A: 2x3, B: 4x3 (transposed) -> C: 2x4
         let a_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b_data = vec![
-            1.0, 0.0, 0.0,
-            0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0,
-            1.0, 1.0, 1.0,
-        ];
+        let b_data = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
         let a = Tensor::new(vec![2, 3], a_data);
         let b = Tensor::new(vec![4, 3], b_data);
 
-        let out_cpu = cpu_be.download(&cpu_be.matmul_transpose(&cpu_be.upload(&a), &cpu_be.upload(&b)));
+        let out_cpu =
+            cpu_be.download(&cpu_be.matmul_transpose(&cpu_be.upload(&a), &cpu_be.upload(&b)));
         let out_gpu = metal.download(&metal.matmul_transpose(&metal.upload(&a), &metal.upload(&b)));
 
         assert_vecs_close(out_gpu.as_f32(), out_cpu.as_f32(), 1e-3, "matmul_transpose");
@@ -2015,11 +2082,21 @@ mod tests {
         let gpu_d = out_gpu.as_f32();
         for i in 0..16 {
             if cpu_d[i].is_finite() && gpu_d[i].is_finite() {
-                assert!((cpu_d[i] - gpu_d[i]).abs() < 1e-6,
-                    "causal_mask mismatch at {}: {} vs {}", i, cpu_d[i], gpu_d[i]);
+                assert!(
+                    (cpu_d[i] - gpu_d[i]).abs() < 1e-6,
+                    "causal_mask mismatch at {}: {} vs {}",
+                    i,
+                    cpu_d[i],
+                    gpu_d[i]
+                );
             } else {
-                assert!(cpu_d[i] == gpu_d[i] || (cpu_d[i].is_infinite() && gpu_d[i].is_infinite()),
-                    "causal_mask mismatch at {}: {} vs {}", i, cpu_d[i], gpu_d[i]);
+                assert!(
+                    cpu_d[i] == gpu_d[i] || (cpu_d[i].is_infinite() && gpu_d[i].is_infinite()),
+                    "causal_mask mismatch at {}: {} vs {}",
+                    i,
+                    cpu_d[i],
+                    gpu_d[i]
+                );
             }
         }
     }
@@ -2058,8 +2135,10 @@ mod tests {
         let q = Tensor::new(vec![2, 8], q_data);
         let k = Tensor::new(vec![2, 8], k_data);
 
-        let (cpu_q, cpu_k) = cpu_be.rope_neox(&cpu_be.upload(&q), &cpu_be.upload(&k), 3, 10000.0, 4, 4);
-        let (gpu_q, gpu_k) = metal.rope_neox(&metal.upload(&q), &metal.upload(&k), 3, 10000.0, 4, 4);
+        let (cpu_q, cpu_k) =
+            cpu_be.rope_neox(&cpu_be.upload(&q), &cpu_be.upload(&k), 3, 10000.0, 4, 4);
+        let (gpu_q, gpu_k) =
+            metal.rope_neox(&metal.upload(&q), &metal.upload(&k), 3, 10000.0, 4, 4);
 
         let cpu_q_d = cpu_be.download(&cpu_q);
         let gpu_q_d = metal.download(&gpu_q);
@@ -2121,12 +2200,19 @@ mod tests {
         let weights = Tensor::from_quantized(vec![2, 32], TensorDtype::Q4_0, raw);
         let input = Tensor::new(vec![1, 32], vec![1.0f32; 32]);
 
-        let out_cpu = cpu_be.download(&cpu_be.quantized_matmul(&cpu_be.upload(&weights), &cpu_be.upload(&input)));
-        let out_gpu = metal.download(&metal.quantized_matmul(&metal.upload(&weights), &metal.upload(&input)));
+        let out_cpu = cpu_be
+            .download(&cpu_be.quantized_matmul(&cpu_be.upload(&weights), &cpu_be.upload(&input)));
+        let out_gpu =
+            metal.download(&metal.quantized_matmul(&metal.upload(&weights), &metal.upload(&input)));
 
         assert_eq!(out_cpu.shape(), &[1, 2]);
         assert_eq!(out_gpu.shape(), &[1, 2]);
-        assert_vecs_close(out_gpu.as_f32(), out_cpu.as_f32(), 1.0, "quantized_matmul_q4_0");
+        assert_vecs_close(
+            out_gpu.as_f32(),
+            out_cpu.as_f32(),
+            1.0,
+            "quantized_matmul_q4_0",
+        );
     }
 
     #[test]
@@ -2162,7 +2248,12 @@ mod tests {
         let result_f32 = result.to_f32();
 
         assert_eq!(cpu_f32.shape(), result_f32.shape());
-        assert_vecs_close(result_f32.as_f32(), cpu_f32.as_f32(), 1e-6, "roundtrip_q8_0");
+        assert_vecs_close(
+            result_f32.as_f32(),
+            cpu_f32.as_f32(),
+            1e-6,
+            "roundtrip_q8_0",
+        );
     }
 
     #[test]
@@ -2220,7 +2311,7 @@ mod tests {
 
     #[test]
     fn test_quantized_matmul_q4_k_vs_cpu() {
-        use crate::gguf::quant::{BlockQ4K, f32_to_f16};
+        use crate::gguf::quant::{f32_to_f16, BlockQ4K};
 
         let metal = backend();
         let cpu_be = cpu();
@@ -2237,17 +2328,17 @@ mod tests {
             block.qs[i] = if i % 2 == 0 { 0x3A } else { 0x7C };
         }
         // Set all 8 sub-block scales and mins (first 4 direct, last 4 packed)
-        block.scales[0] = 5;   // scale for sub-block 0
-        block.scales[1] = 10;  // scale for sub-block 1
-        block.scales[2] = 15;  // scale for sub-block 2
-        block.scales[3] = 20;  // scale for sub-block 3
-        block.scales[4] = 3;   // min for sub-block 0
-        block.scales[5] = 7;   // min for sub-block 1
-        block.scales[6] = 2;   // min for sub-block 2
-        block.scales[7] = 9;   // min for sub-block 3
-        // Packed scales for sub-blocks 4-7 (indices 8-11)
-        block.scales[8] = 0x42;  // scale4=2, min4=4 (low/high nibbles)
-        block.scales[9] = 0x53;  // scale5=3, min5=5
+        block.scales[0] = 5; // scale for sub-block 0
+        block.scales[1] = 10; // scale for sub-block 1
+        block.scales[2] = 15; // scale for sub-block 2
+        block.scales[3] = 20; // scale for sub-block 3
+        block.scales[4] = 3; // min for sub-block 0
+        block.scales[5] = 7; // min for sub-block 1
+        block.scales[6] = 2; // min for sub-block 2
+        block.scales[7] = 9; // min for sub-block 3
+                             // Packed scales for sub-blocks 4-7 (indices 8-11)
+        block.scales[8] = 0x42; // scale4=2, min4=4 (low/high nibbles)
+        block.scales[9] = 0x53; // scale5=3, min5=5
         block.scales[10] = 0x86; // scale6=6, min6=8
         block.scales[11] = 0xA7; // scale7=7, min7=10
 
@@ -2260,10 +2351,12 @@ mod tests {
 
         let weights = Tensor::from_quantized(vec![1, 256], TensorDtype::Q4_K, raw);
         // Diverse input: positive and negative, varied magnitudes
-        let input_data: Vec<f32> = (0..256).map(|i| {
-            let x = i as f32 * 0.02 - 2.56;  // range [-2.56, +2.54]
-            x
-        }).collect();
+        let input_data: Vec<f32> = (0..256)
+            .map(|i| {
+                let x = i as f32 * 0.02 - 2.56; // range [-2.56, +2.54]
+                x
+            })
+            .collect();
         let input = Tensor::new(vec![1, 256], input_data);
 
         let w_cpu = cpu_be.upload(&weights);
@@ -2286,7 +2379,7 @@ mod tests {
 
     #[test]
     fn test_quantized_matmul_q5_k_vs_cpu() {
-        use crate::gguf::quant::{BlockQ5K, f32_to_f16};
+        use crate::gguf::quant::{f32_to_f16, BlockQ5K};
 
         let metal = backend();
         let cpu_be = cpu();
@@ -2295,7 +2388,8 @@ mod tests {
         let mut qs = [0u8; 128];
         for i in 0..128 {
             // Vary: low nibbles 0x0..0xF, high nibbles different
-            qs[i] = ((i as u8).wrapping_mul(3) & 0xF) | (((i as u8).wrapping_mul(7).wrapping_add(5) & 0xF) << 4);
+            qs[i] = ((i as u8).wrapping_mul(3) & 0xF)
+                | (((i as u8).wrapping_mul(7).wrapping_add(5) & 0xF) << 4);
         }
         let mut qh = [0u8; 32];
         // Set alternating high-bit patterns: 0xAA = bits 1,3,5,7 set
@@ -2319,10 +2413,12 @@ mod tests {
         assert_eq!(raw.len(), 176);
 
         let weights = Tensor::from_quantized(vec![1, 256], TensorDtype::Q5_K, raw);
-        let input_data: Vec<f32> = (0..256).map(|i| {
-            let x = (i as f32) * 0.03 - 3.84;  // range [-3.84, +3.81]
-            x
-        }).collect();
+        let input_data: Vec<f32> = (0..256)
+            .map(|i| {
+                let x = (i as f32) * 0.03 - 3.84; // range [-3.84, +3.81]
+                x
+            })
+            .collect();
         let input = Tensor::new(vec![1, 256], input_data);
 
         let w_cpu = cpu_be.upload(&weights);
@@ -2345,7 +2441,7 @@ mod tests {
 
     #[test]
     fn test_quantized_matmul_q4_k_multi_row_vs_cpu() {
-        use crate::gguf::quant::{BlockQ4K, f32_to_f16};
+        use crate::gguf::quant::{f32_to_f16, BlockQ4K};
 
         let metal = backend();
         let cpu_be = cpu();
@@ -2360,7 +2456,8 @@ mod tests {
                 qs: [0; 128],
             };
             for i in 0..128 {
-                block.qs[i] = ((i as u8).wrapping_add(row_idx * 37)) | (((i as u8).wrapping_add(row_idx * 13)) << 4);
+                block.qs[i] = ((i as u8).wrapping_add(row_idx * 37))
+                    | (((i as u8).wrapping_add(row_idx * 13)) << 4);
             }
             for s in 0..8 {
                 block.scales[s] = (s as u8 + 1) * (row_idx + 1);
@@ -2395,7 +2492,7 @@ mod tests {
 
     #[test]
     fn test_quantized_matmul_q5_k_multi_row_vs_cpu() {
-        use crate::gguf::quant::{BlockQ5K, f32_to_f16};
+        use crate::gguf::quant::{f32_to_f16, BlockQ5K};
 
         let metal = backend();
         let cpu_be = cpu();
@@ -2458,7 +2555,8 @@ mod tests {
         let mut ql = [0u8; 128];
         for i in 0..128 {
             // Asymmetric nibbles: low varies, high varies differently
-            ql[i] = ((i as u8).wrapping_mul(5).wrapping_add(3) & 0xF) | (((i as u8).wrapping_mul(11).wrapping_add(7) & 0xF) << 4);
+            ql[i] = ((i as u8).wrapping_mul(5).wrapping_add(3) & 0xF)
+                | (((i as u8).wrapping_mul(11).wrapping_add(7) & 0xF) << 4);
         }
         let mut qh = [0u8; 64];
         for i in 0..64 {
@@ -2510,13 +2608,29 @@ mod tests {
         for row_idx in 0..5u8 {
             let mut ql = [0u8; 128];
             let mut qh = [0u8; 64];
-            for i in 0..128 { ql[i] = (i as u8).wrapping_add(row_idx * 53); }
-            for i in 0..64 { qh[i] = (i as u8).wrapping_mul(0x2B).wrapping_add(row_idx * 19); }
+            for i in 0..128 {
+                ql[i] = (i as u8).wrapping_add(row_idx * 53);
+            }
+            for i in 0..64 {
+                qh[i] = (i as u8).wrapping_mul(0x2B).wrapping_add(row_idx * 19);
+            }
             let scales: [i8; 16] = [
-                (row_idx as i8 + 1), -(row_idx as i8 + 2), (row_idx as i8 + 3), -(row_idx as i8 + 1),
-                (row_idx as i8 + 4), -(row_idx as i8 + 3), (row_idx as i8 + 2), -(row_idx as i8 + 4),
-                (row_idx as i8 + 5), -(row_idx as i8 + 1), (row_idx as i8 + 6), -(row_idx as i8 + 2),
-                (row_idx as i8 + 7), -(row_idx as i8 + 5), (row_idx as i8 + 3), -(row_idx as i8 + 6),
+                (row_idx as i8 + 1),
+                -(row_idx as i8 + 2),
+                (row_idx as i8 + 3),
+                -(row_idx as i8 + 1),
+                (row_idx as i8 + 4),
+                -(row_idx as i8 + 3),
+                (row_idx as i8 + 2),
+                -(row_idx as i8 + 4),
+                (row_idx as i8 + 5),
+                -(row_idx as i8 + 1),
+                (row_idx as i8 + 6),
+                -(row_idx as i8 + 2),
+                (row_idx as i8 + 7),
+                -(row_idx as i8 + 5),
+                (row_idx as i8 + 3),
+                -(row_idx as i8 + 6),
             ];
             raw.extend_from_slice(&ql);
             raw.extend_from_slice(&qh);
@@ -2560,16 +2674,28 @@ mod tests {
         let q = Tensor::new(vec![1, 16], q_data);
         let k = Tensor::new(vec![1, 16], k_data);
 
-        let (cpu_q, cpu_k) = cpu_be.rope_neox(&cpu_be.upload(&q), &cpu_be.upload(&k), 1, 10000.0, 8, 4);
-        let (gpu_q, gpu_k) = metal.rope_neox(&metal.upload(&q), &metal.upload(&k), 1, 10000.0, 8, 4);
+        let (cpu_q, cpu_k) =
+            cpu_be.rope_neox(&cpu_be.upload(&q), &cpu_be.upload(&k), 1, 10000.0, 8, 4);
+        let (gpu_q, gpu_k) =
+            metal.rope_neox(&metal.upload(&q), &metal.upload(&k), 1, 10000.0, 8, 4);
 
         let cpu_q_d = cpu_be.download(&cpu_q);
         let gpu_q_d = metal.download(&gpu_q);
         let cpu_k_d = cpu_be.download(&cpu_k);
         let gpu_k_d = metal.download(&gpu_k);
 
-        assert_vecs_close(gpu_q_d.as_f32(), cpu_q_d.as_f32(), 1e-3, "rope_neox partial Q");
-        assert_vecs_close(gpu_k_d.as_f32(), cpu_k_d.as_f32(), 1e-3, "rope_neox partial K");
+        assert_vecs_close(
+            gpu_q_d.as_f32(),
+            cpu_q_d.as_f32(),
+            1e-3,
+            "rope_neox partial Q",
+        );
+        assert_vecs_close(
+            gpu_k_d.as_f32(),
+            cpu_k_d.as_f32(),
+            1e-3,
+            "rope_neox partial K",
+        );
     }
 
     #[test]
@@ -2642,14 +2768,26 @@ mod tests {
         let v_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], v_data));
 
         let result = metal.batched_causal_attention(
-            &q_gpu, &k_gpu, &v_gpu,
-            n_tokens, total_len, pos_offset,
-            num_heads, num_kv_heads, head_dim,
-            attn_scale, 0.0,
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            n_tokens,
+            total_len,
+            pos_offset,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attn_scale,
+            0.0,
         );
 
         let result_data = metal.download(&result);
-        assert_vecs_close(result_data.as_f32(), &expected, 1e-4, "batched_causal_attention");
+        assert_vecs_close(
+            result_data.as_f32(),
+            &expected,
+            1e-4,
+            "batched_causal_attention",
+        );
     }
 
     #[test]
@@ -2717,14 +2855,26 @@ mod tests {
         let v_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], v_data));
 
         let result = metal.batched_causal_attention(
-            &q_gpu, &k_gpu, &v_gpu,
-            n_tokens, total_len, pos_offset,
-            num_heads, num_kv_heads, head_dim,
-            attn_scale, 0.0,
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            n_tokens,
+            total_len,
+            pos_offset,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attn_scale,
+            0.0,
         );
 
         let result_data = metal.download(&result);
-        assert_vecs_close(result_data.as_f32(), &expected, 1e-4, "batched_causal_attention_gqa");
+        assert_vecs_close(
+            result_data.as_f32(),
+            &expected,
+            1e-4,
+            "batched_causal_attention_gqa",
+        );
     }
 
     #[test]
@@ -2750,9 +2900,7 @@ mod tests {
         let k_data: Vec<f32> = (0..total_len * kv_dim)
             .map(|i| (i as f32) * 0.3 + 0.5)
             .collect();
-        let v_data: Vec<f32> = (0..total_len * kv_dim)
-            .map(|i| (i as f32) * 0.1)
-            .collect();
+        let v_data: Vec<f32> = (0..total_len * kv_dim).map(|i| (i as f32) * 0.1).collect();
 
         // CPU reference with softcap
         let mut expected = vec![0.0f32; n_tokens * total_dim];
@@ -2796,15 +2944,24 @@ mod tests {
         let v_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], v_data));
 
         let result = metal.batched_causal_attention(
-            &q_gpu, &k_gpu, &v_gpu,
-            n_tokens, total_len, pos_offset,
-            num_heads, num_kv_heads, head_dim,
-            attn_scale, softcap,
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            n_tokens,
+            total_len,
+            pos_offset,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attn_scale,
+            softcap,
         );
 
         let result_data = metal.download(&result);
         assert_vecs_close(
-            result_data.as_f32(), &expected, 1e-4,
+            result_data.as_f32(),
+            &expected,
+            1e-4,
             "batched_causal_attention_softcap",
         );
     }
@@ -2876,15 +3033,24 @@ mod tests {
         let v_gpu = metal.upload(&Tensor::new(vec![total_len, kv_dim], v_data));
 
         let result = metal.batched_causal_attention(
-            &q_gpu, &k_gpu, &v_gpu,
-            n_tokens, total_len, pos_offset,
-            num_heads, num_kv_heads, head_dim,
-            attn_scale, 0.0,
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            n_tokens,
+            total_len,
+            pos_offset,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attn_scale,
+            0.0,
         );
 
         let result_data = metal.download(&result);
         assert_vecs_close(
-            result_data.as_f32(), &expected, 1e-4,
+            result_data.as_f32(),
+            &expected,
+            1e-4,
             "batched_causal_attention_pos_offset",
         );
     }
@@ -2918,8 +3084,12 @@ mod tests {
             ffi::msg_send_dispatch(
                 enc,
                 metal.sels.dispatch_threadgroups,
-                groups, 1, 1,
-                threads, 1, 1,
+                groups,
+                1,
+                1,
+                threads,
+                1,
+                1,
             );
             metal.flush();
         }
@@ -2935,7 +3105,10 @@ mod tests {
             assert!(
                 (f32_back - expected).abs() < 0.01,
                 "copy_f32_to_f16 mismatch at {}: got {} expected {} (diff {})",
-                i, f32_back, expected, (f32_back - expected).abs()
+                i,
+                f32_back,
+                expected,
+                (f32_back - expected).abs()
             );
         }
     }
@@ -2970,8 +3143,12 @@ mod tests {
             ffi::msg_send_dispatch(
                 enc,
                 metal.sels.dispatch_threadgroups,
-                groups, 1, 1,
-                threads, 1, 1,
+                groups,
+                1,
+                1,
+                threads,
+                1,
+                1,
             );
             metal.flush();
         }
@@ -2988,7 +3165,9 @@ mod tests {
             assert!(
                 (f32_back - expected).abs() < 0.01,
                 "copy_f32_to_f16 offset mismatch at {}: got {} expected {}",
-                i, f32_back, expected
+                i,
+                f32_back,
+                expected
             );
         }
     }
@@ -3007,9 +3186,7 @@ mod tests {
         let kv_dim = num_kv_heads * head_dim;
 
         // Q: [1, total_dim]
-        let q_data: Vec<f32> = (0..total_dim)
-            .map(|i| (i as f32) * 0.2 - 0.4)
-            .collect();
+        let q_data: Vec<f32> = (0..total_dim).map(|i| (i as f32) * 0.2 - 0.4).collect();
         // K, V: [total_len, kv_dim] — will be converted to F16
         let k_data: Vec<f32> = (0..total_len * kv_dim)
             .map(|i| ((i % 9) as f32) * 0.1 - 0.3)
@@ -3058,15 +3235,11 @@ mod tests {
         let v_count = total_len * kv_dim;
         let k_f16 = unsafe {
             let mb = metal.create_buffer_empty(k_count * 2);
-            DeviceTensor::from_gpu(
-                vec![total_len, kv_dim], TensorDtype::F16, Box::new(mb),
-            )
+            DeviceTensor::from_gpu(vec![total_len, kv_dim], TensorDtype::F16, Box::new(mb))
         };
         let v_f16 = unsafe {
             let mb = metal.create_buffer_empty(v_count * 2);
-            DeviceTensor::from_gpu(
-                vec![total_len, kv_dim], TensorDtype::F16, Box::new(mb),
-            )
+            DeviceTensor::from_gpu(vec![total_len, kv_dim], TensorDtype::F16, Box::new(mb))
         };
 
         // Copy F32 → F16 for K
@@ -3079,8 +3252,14 @@ mod tests {
             let threads = 256usize;
             let groups = (k_count + threads - 1) / threads;
             ffi::msg_send_dispatch(
-                enc, metal.sels.dispatch_threadgroups,
-                groups, 1, 1, threads, 1, 1,
+                enc,
+                metal.sels.dispatch_threadgroups,
+                groups,
+                1,
+                1,
+                threads,
+                1,
+                1,
             );
         }
         // Copy F32 → F16 for V
@@ -3093,8 +3272,14 @@ mod tests {
             let threads = 256usize;
             let groups = (v_count + threads - 1) / threads;
             ffi::msg_send_dispatch(
-                enc, metal.sels.dispatch_threadgroups,
-                groups, 1, 1, threads, 1, 1,
+                enc,
+                metal.sels.dispatch_threadgroups,
+                groups,
+                1,
+                1,
+                threads,
+                1,
+                1,
             );
         }
 
@@ -3114,8 +3299,14 @@ mod tests {
             metal.set_f32(enc, attn_scale, 8);
             metal.set_f32(enc, 0.0f32, 9); // no softcap
             ffi::msg_send_dispatch(
-                enc, metal.sels.dispatch_threadgroups,
-                num_heads, 1, 1, 256, 1, 1,
+                enc,
+                metal.sels.dispatch_threadgroups,
+                num_heads,
+                1,
+                1,
+                256,
+                1,
+                1,
             );
 
             MetalBackend::wrap(out_buf, vec![1, total_dim], TensorDtype::F32)
@@ -3124,7 +3315,9 @@ mod tests {
         let result_data = metal.download(&result);
         // Slightly higher tolerance due to F16 quantization
         assert_vecs_close(
-            result_data.as_f32(), &expected, 0.02,
+            result_data.as_f32(),
+            &expected,
+            0.02,
             "grouped_attn_decode_f16",
         );
     }
@@ -3206,8 +3399,14 @@ mod tests {
             metal.set_u32(enc, k_count as u32, 2);
             metal.set_u32(enc, 0u32, 3);
             ffi::msg_send_dispatch(
-                enc, metal.sels.dispatch_threadgroups,
-                (k_count + 255) / 256, 1, 1, 256, 1, 1,
+                enc,
+                metal.sels.dispatch_threadgroups,
+                (k_count + 255) / 256,
+                1,
+                1,
+                256,
+                1,
+                1,
             );
         }
         unsafe {
@@ -3217,8 +3416,14 @@ mod tests {
             metal.set_u32(enc, v_count as u32, 2);
             metal.set_u32(enc, 0u32, 3);
             ffi::msg_send_dispatch(
-                enc, metal.sels.dispatch_threadgroups,
-                (v_count + 255) / 256, 1, 1, 256, 1, 1,
+                enc,
+                metal.sels.dispatch_threadgroups,
+                (v_count + 255) / 256,
+                1,
+                1,
+                256,
+                1,
+                1,
             );
         }
 
@@ -3238,15 +3443,23 @@ mod tests {
             metal.set_f32(enc, attn_scale, 8);
             metal.set_f32(enc, 0.0f32, 9);
             ffi::msg_send_dispatch(
-                enc, metal.sels.dispatch_threadgroups,
-                num_heads, 1, 1, 256, 1, 1,
+                enc,
+                metal.sels.dispatch_threadgroups,
+                num_heads,
+                1,
+                1,
+                256,
+                1,
+                1,
             );
             MetalBackend::wrap(out_buf, vec![1, total_dim], TensorDtype::F32)
         };
 
         let result_data = metal.download(&result);
         assert_vecs_close(
-            result_data.as_f32(), &expected, 0.02,
+            result_data.as_f32(),
+            &expected,
+            0.02,
             "grouped_attn_decode_f16_gqa",
         );
     }

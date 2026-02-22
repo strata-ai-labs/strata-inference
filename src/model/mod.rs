@@ -5,11 +5,11 @@
 //! - [`weights::ModelWeights`] — weight tensors loaded from GGUF onto a compute device
 //! - [`layer`] — transformer layer forward pass with architecture dispatch
 
-pub mod config;
-pub mod weights;
-pub mod layer;
 pub mod cache;
+pub mod config;
+pub mod layer;
+pub mod weights;
 
-pub use config::{ModelConfig, ModelArch, NormType, Activation, PositionType, PoolingType};
-pub use weights::{ModelWeights, LayerWeights};
 pub use cache::KvCache;
+pub use config::{Activation, ModelArch, ModelConfig, NormType, PoolingType, PositionType};
+pub use weights::{LayerWeights, ModelWeights};

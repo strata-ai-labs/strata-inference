@@ -4,9 +4,10 @@
 //! The PTX is loaded at runtime via cuModuleLoadData.
 
 /// Null-terminated PTX source containing all kernels.
-pub const PTX_MODULE: &str = concat!(r#"
+pub const PTX_MODULE: &str = concat!(
+    r#"
 .version 7.0
-.target sm_50
+.target sm_53
 .address_size 64
 
 // =========================================================================
@@ -158,7 +159,7 @@ GEMM_DONE:
 // -------------------------------------------------------------------------
 // gemm_transpose: C = A * B^T  (tiled 16x16, B is (N,K) read transposed)
 //
-// Parameters: same as gemm — A (M,K), B (N,K), C (M,N), M, K, N
+// Parameters: same as gemm -- A (M,K), B (N,K), C (M,N), M, K, N
 // Grid:  (ceil(N/16), ceil(M/16), 1)
 // Block: (16, 16, 1)
 // -------------------------------------------------------------------------
@@ -498,7 +499,7 @@ SCALE_DONE:
 //   weight ptr (.u64), bias ptr (.u64),
 //   rows (.u32), cols (.u32), eps (.f32)
 //
-// Grid:  (rows, 1, 1) — one block per row
+// Grid:  (rows, 1, 1) -- one block per row
 // Block: (256, 1, 1)
 //
 // Algorithm per row:
@@ -560,8 +561,8 @@ LN_SUM_DONE:
     st.shared.f32 [%r7], %f1;
     bar.sync 0;
 
-    // Tree reduction
-    mov.u32 %r9, 128;
+    // Tree reduction (start at ntid.x/2, not hardcoded 128)
+    shr.u32 %r9, %r4, 1;
 LN_RED1:
     setp.ge.u32 %p0, %r3, %r9;
     @%p0 bra LN_RED1_SKIP;
@@ -610,7 +611,7 @@ LN_VAR_DONE:
     st.shared.f32 [%r7], %f7;
     bar.sync 0;
 
-    mov.u32 %r9, 128;
+    shr.u32 %r9, %r4, 1;
 LN_RED2:
     setp.ge.u32 %p0, %r3, %r9;
     @%p0 bra LN_RED2_SKIP;
@@ -722,8 +723,8 @@ SM_MAX_DONE:
     st.shared.f32 [%r7], %f0;
     bar.sync 0;
 
-    // Tree reduction for max
-    mov.u32 %r9, 128;
+    // Tree reduction for max (start at ntid.x/2)
+    shr.u32 %r9, %r4, 1;
 SM_RED_MAX:
     setp.ge.u32 %p0, %r3, %r9;
     @%p0 bra SM_RED_MAX_SKIP;
@@ -774,8 +775,8 @@ SM_EXP_DONE:
     st.shared.f32 [%r7], %f5;
     bar.sync 0;
 
-    // Tree reduction for sum
-    mov.u32 %r9, 128;
+    // Tree reduction for sum (start at ntid.x/2)
+    shr.u32 %r9, %r4, 1;
 SM_RED_SUM:
     setp.ge.u32 %p0, %r3, %r9;
     @%p0 bra SM_RED_SUM_SKIP;
@@ -963,7 +964,7 @@ MP_FINAL_DONE:
 //   param_N       : .u32  number of weight rows (output cols)
 //   param_K       : .u32  number of columns (must be multiple of 32)
 //
-// Grid:  (N, M, 1) — one block per (output_row, input_row)
+// Grid:  (N, M, 1) -- one block per (output_row, input_row)
 // Block: (256, 1, 1)
 // -------------------------------------------------------------------------
 .visible .entry quantized_matmul_q8_0(
@@ -1020,11 +1021,8 @@ QMQ8_BLOCK_LOOP:
     add.u64 %rd8, %rd4, %rd7;     // &block
 
     // Load f16 scale (2 bytes at offset 0)
-    ld.global.b16 %r12, [%rd8];
-    // Convert f16 bits in %r12 to f32
-    // f16 -> f32 via cvt: move bits to a .b16 register first
-    mov.b32 %r13, %r12;
-    cvt.f32.f16 %f1, %r13;        // scale as f32
+    ld.global.b16 %h0, [%rd8];
+    cvt.f32.f16 %f1, %h0;         // scale as f32
 
     // Input base for this block: &input[m*K + block_idx*32]
     shl.b32 %r14, %r10, 5;        // block_idx * 32
@@ -1133,6 +1131,7 @@ QMQ8_DONE:
     .reg .u64 %rd<22>;
     .reg .u32 %r<34>;
     .reg .f32 %f<14>;
+    .reg .f16 %h0;
     .reg .pred %p<4>;
     .shared .align 4 .f32 sdata[256];
 
@@ -1174,9 +1173,8 @@ QMQ4_BLOCK_LOOP:
     add.u64 %rd8, %rd4, %rd7;
 
     // Load f16 scale
-    ld.global.b16 %r12, [%rd8];
-    mov.b32 %r13, %r12;
-    cvt.f32.f16 %f1, %r13;
+    ld.global.b16 %h0, [%rd8];
+    cvt.f32.f16 %f1, %h0;
 
     // Input base for this block
     shl.b32 %r14, %r10, 5;
@@ -1284,7 +1282,7 @@ QMQ4_DONE:
 //   input ptr (.u64), weight ptr (.u64), output ptr (.u64),
 //   rows (.u32), cols (.u32), eps (.f32)
 //
-// Grid:  (rows, 1, 1) — one block per row
+// Grid:  (rows, 1, 1) -- one block per row
 // Block: (256, 1, 1)
 // -------------------------------------------------------------------------
 .visible .entry rms_norm(
@@ -1339,8 +1337,8 @@ RMS_SQ_DONE:
     st.shared.f32 [%r7], %f1;
     bar.sync 0;
 
-    // Tree reduction
-    mov.u32 %r9, 128;
+    // Tree reduction (start at ntid.x/2)
+    shr.u32 %r9, %r4, 1;
 RMS_RED:
     setp.ge.u32 %p0, %r3, %r9;
     @%p0 bra RMS_RED_SKIP;
@@ -1591,20 +1589,20 @@ GEGLU_DONE:
 // where theta = (pos_offset + seq_idx) * base^(-2i/head_dim)
 //
 // Parameters:
-//   input ptr (.u64)    — input tensor [seq_len, n_heads * head_dim]
-//   output ptr (.u64)   — output tensor (same shape)
-//   pos_offset (.u32)   — starting position offset
-//   freq_base (.f32)    — RoPE base frequency (e.g. 10000.0)
-//   head_dim (.u32)     — dimension per head
-//   rope_dim (.u32)     — number of rotated dims per head (must be even)
-//   n_heads (.u32)      — number of attention heads
-//   seq_len (.u32)      — sequence length
+//   input ptr (.u64)    -- input tensor [seq_len, n_heads * head_dim]
+//   output ptr (.u64)   -- output tensor (same shape)
+//   pos_offset (.u32)   -- starting position offset
+//   freq_base (.f32)    -- RoPE base frequency (e.g. 10000.0)
+//   head_dim (.u32)     -- dimension per head
+//   rope_dim (.u32)     -- number of rotated dims per head (must be even)
+//   n_heads (.u32)      -- number of attention heads
+//   seq_len (.u32)      -- sequence length
 //
 // Grid:  (ceil(rope_dim/2 / 16), ceil(n_heads / 16), seq_len)
 // Block: (16, 16, 1)
-//   threadIdx.x + blockIdx.x*16 → pair_idx (0..rope_dim/2)
-//   threadIdx.y + blockIdx.y*16 → head_idx (0..n_heads)
-//   blockIdx.z → seq_idx (0..seq_len)
+//   threadIdx.x + blockIdx.x*16 -> pair_idx (0..rope_dim/2)
+//   threadIdx.y + blockIdx.y*16 -> head_idx (0..n_heads)
+//   blockIdx.z -> seq_idx (0..seq_len)
 // -------------------------------------------------------------------------
 .visible .entry rope_norm(
     .param .u64 param_input,
@@ -1655,16 +1653,16 @@ GEGLU_DONE:
     setp.ge.u32 %p1, %r8, %r3;
     @%p1 bra ROPE_N_DONE;
 
-    // Compute theta = (pos_offset + seq_idx) * freq_base^(-2*pair_idx / head_dim)
+    // Compute theta = (pos_offset + seq_idx) * freq_base^(-2*pair_idx / rope_dim)
     add.u32 %r13, %r0, %r11;      // pos = pos_offset + seq_idx
     shl.b32 %r14, %r5, 1;         // 2 * pair_idx
     cvt.rn.f32.u32 %f1, %r14;     // (float)(2*pair_idx)
-    cvt.rn.f32.u32 %f2, %r1;      // (float)head_dim
-    div.approx.f32 %f3, %f1, %f2; // 2*pair_idx / head_dim
-    neg.f32 %f3, %f3;             // -2*pair_idx / head_dim
+    cvt.rn.f32.u32 %f2, %r2;      // (float)rope_dim
+    div.approx.f32 %f3, %f1, %f2; // 2*pair_idx / rope_dim
+    neg.f32 %f3, %f3;             // -2*pair_idx / rope_dim
     lg2.approx.f32 %f4, %f0;      // log2(freq_base)
-    mul.rn.f32 %f3, %f3, %f4;     // -2*pair_idx/head_dim * log2(freq_base)
-    ex2.approx.f32 %f5, %f3;      // freq_base^(-2*pair_idx/head_dim)
+    mul.rn.f32 %f3, %f3, %f4;     // -2*pair_idx/rope_dim * log2(freq_base)
+    ex2.approx.f32 %f5, %f3;      // freq_base^(-2*pair_idx/rope_dim)
     cvt.rn.f32.u32 %f6, %r13;     // (float)pos
     mul.rn.f32 %f7, %f6, %f5;     // theta = pos * freq
 
@@ -1767,11 +1765,11 @@ ROPE_N_DONE:
     setp.ge.u32 %p1, %r8, %r3;
     @%p1 bra ROPE_X_DONE;
 
-    // Compute theta = (pos_offset + seq_idx) * freq_base^(-2*i / head_dim)
+    // Compute theta = (pos_offset + seq_idx) * freq_base^(-2*i / rope_dim)
     add.u32 %r13, %r0, %r11;      // pos = pos_offset + seq_idx
     shl.b32 %r14, %r5, 1;         // 2 * pair_idx
     cvt.rn.f32.u32 %f1, %r14;
-    cvt.rn.f32.u32 %f2, %r1;
+    cvt.rn.f32.u32 %f2, %r2;      // rope_dim (not head_dim)
     div.approx.f32 %f3, %f1, %f2;
     neg.f32 %f3, %f3;
     lg2.approx.f32 %f4, %f0;
@@ -1993,7 +1991,7 @@ TANH_DONE:
 //   out[i] = x[i] / sqrt(sum(x[j]^2))
 //
 // Parameters: data ptr (.u64), n (.u32)
-// Grid:  (1, 1, 1) — single block
+// Grid:  (1, 1, 1) -- single block
 // Block: (256, 1, 1)
 // -------------------------------------------------------------------------
 .visible .entry l2_normalize(
@@ -2033,8 +2031,8 @@ L2_SQ_DONE:
     st.shared.f32 [%r4], %f0;
     bar.sync 0;
 
-    // Tree reduction
-    mov.u32 %r6, 128;
+    // Tree reduction (start at ntid.x/2)
+    shr.u32 %r6, %r2, 1;
 L2_RED:
     setp.ge.u32 %p0, %r1, %r6;
     @%p0 bra L2_RED_SKIP;
@@ -2086,9 +2084,9 @@ L2_NORM_DONE:
 //   output[i * hidden + j] = table[ids[i] * hidden + j]
 //
 // Parameters:
-//   table ptr (.u64)   — embedding table (vocab_size x hidden)
-//   ids ptr (.u64)     — token IDs (u32 array, length num_tokens)
-//   output ptr (.u64)  — output (num_tokens x hidden)
+//   table ptr (.u64)   -- embedding table (vocab_size x hidden)
+//   ids ptr (.u64)     -- token IDs (u32 array, length num_tokens)
+//   output ptr (.u64)  -- output (num_tokens x hidden)
 //   num_tokens (.u32)
 //   hidden (.u32)
 //
@@ -2152,7 +2150,322 @@ EMBD_DONE:
     ret;
 }
 
-"#, "\0");
+// -------------------------------------------------------------------------
+// grouped_attn_decode: fused grouped-query attention for single-token decode
+//
+// Implements online-softmax: pass 1 finds global max, pass 2 does tiled
+// exp(score-max) + weighted V accumulation in shared memory.
+//
+// Supports GQA via kv_head = h * num_kv_heads / num_heads mapping.
+// Supports softcap via softcap * tanh(score / softcap).
+//
+// Parameters:
+//   Q          (.u64)  [1, num_heads * head_dim]
+//   K          (.u64)  [max_len, num_kv_heads * head_dim]
+//   V          (.u64)  [max_len, num_kv_heads * head_dim]
+//   output     (.u64)  [1, num_heads * head_dim]
+//   num_heads  (.u32)
+//   num_kv_heads (.u32)
+//   head_dim   (.u32)
+//   total_len  (.u32)
+//   attn_scale (.f32)
+//   softcap    (.f32)
+//
+// Grid:  (num_heads, 1, 1) -- one block per Q head
+// Block: (256, 1, 1)
+// -------------------------------------------------------------------------
+.visible .entry grouped_attn_decode(
+    .param .u64 param_Q,
+    .param .u64 param_K,
+    .param .u64 param_V,
+    .param .u64 param_output,
+    .param .u32 param_num_heads,
+    .param .u32 param_num_kv_heads,
+    .param .u32 param_head_dim,
+    .param .u32 param_total_len,
+    .param .f32 param_attn_scale,
+    .param .f32 param_softcap
+)
+{
+    .reg .u64 %rd<16>;
+    .reg .u32 %r<30>;
+    .reg .f32 %f<24>;
+    .reg .pred %p<8>;
+    .shared .align 4 .f32 sdata[256];
+
+    ld.param.u64 %rd0, [param_Q];
+    ld.param.u64 %rd1, [param_K];
+    ld.param.u64 %rd2, [param_V];
+    ld.param.u64 %rd3, [param_output];
+    ld.param.u32 %r0, [param_num_heads];
+    ld.param.u32 %r1, [param_num_kv_heads];
+    ld.param.u32 %r2, [param_head_dim];
+    ld.param.u32 %r3, [param_total_len];
+    ld.param.f32 %f0, [param_attn_scale];
+    ld.param.f32 %f1, [param_softcap];
+
+    // h = blockIdx.x
+    mov.u32 %r4, %ctaid.x;
+    setp.ge.u32 %p0, %r4, %r0;
+    @%p0 bra GAD_EXIT;
+
+    // lid = threadIdx.x, tpg = blockDim.x
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %ntid.x;
+
+    // kv_dim = num_kv_heads * head_dim
+    mul.lo.u32 %r7, %r1, %r2;
+
+    // kv_head = h * num_kv_heads / num_heads (integer)
+    mul.lo.u32 %r8, %r4, %r1;
+    cvt.rn.f32.u32 %f2, %r8;
+    cvt.rn.f32.u32 %f3, %r0;
+    div.approx.f32 %f2, %f2, %f3;
+    cvt.rzi.u32.f32 %r8, %f2;
+
+    // kv_off = kv_head * head_dim
+    mul.lo.u32 %r9, %r8, %r2;
+
+    // q_head = Q + h * head_dim (byte offset)
+    mul.lo.u32 %r10, %r4, %r2;
+    mul.wide.u32 %rd4, %r10, 4;
+    add.u64 %rd4, %rd0, %rd4;
+
+    // Constants
+    mov.f32 %f4, 0f00000000;          // 0.0
+    mov.f32 %f5, 0f3FB8AA3B;          // log2(e)
+    mov.f32 %f6, 0f40000000;          // 2.0
+    mov.f32 %f7, 0f3F800000;          // 1.0
+
+    // ---- Pass 1: find global max of attention scores ----
+    mov.f32 %f8, 0fFF800000;          // local_max = -inf
+    mov.u32 %r11, %r5;                // j = lid
+GAD_MAX_LOOP:
+    setp.ge.u32 %p0, %r11, %r3;
+    @%p0 bra GAD_MAX_REDUCE;
+
+    // dot = sum(q_head[d] * K[j * kv_dim + kv_off + d])
+    mov.f32 %f9, 0f00000000;
+    mul.lo.u32 %r12, %r11, %r7;
+    add.u32 %r12, %r12, %r9;
+    mul.wide.u32 %rd5, %r12, 4;
+    add.u64 %rd5, %rd1, %rd5;
+    mov.u32 %r13, 0;
+GAD_DOT1:
+    setp.ge.u32 %p1, %r13, %r2;
+    @%p1 bra GAD_DOT1_END;
+    mul.wide.u32 %rd6, %r13, 4;
+    add.u64 %rd7, %rd4, %rd6;
+    ld.global.f32 %f10, [%rd7];
+    add.u64 %rd8, %rd5, %rd6;
+    ld.global.f32 %f11, [%rd8];
+    fma.rn.f32 %f9, %f10, %f11, %f9;
+    add.u32 %r13, %r13, 1;
+    bra GAD_DOT1;
+GAD_DOT1_END:
+
+    // s = dot * attn_scale
+    mul.rn.f32 %f9, %f9, %f0;
+
+    // softcap: if softcap > 0, s = softcap * tanh(s / softcap)
+    setp.le.f32 %p2, %f1, %f4;
+    @%p2 bra GAD_NOSC1;
+    div.approx.f32 %f12, %f9, %f1;
+    // tanh(x) = 1 - 2/(exp(2x)+1)
+    mul.rn.f32 %f12, %f12, %f6;
+    mul.rn.f32 %f12, %f12, %f5;
+    ex2.approx.f32 %f12, %f12;
+    add.rn.f32 %f12, %f12, %f7;
+    div.approx.f32 %f12, %f6, %f12;
+    sub.rn.f32 %f12, %f7, %f12;
+    mul.rn.f32 %f9, %f1, %f12;
+GAD_NOSC1:
+
+    max.f32 %f8, %f8, %f9;
+    add.u32 %r11, %r11, %r6;
+    bra GAD_MAX_LOOP;
+GAD_MAX_REDUCE:
+
+    // Reduce max across threadgroup via shared memory
+    mov.u32 %r14, sdata;
+    shl.b32 %r15, %r5, 2;
+    add.u32 %r14, %r14, %r15;
+    st.shared.f32 [%r14], %f8;
+    bar.sync 0;
+
+    mov.u32 %r16, 128;
+GAD_RMAX:
+    setp.ge.u32 %p0, %r5, %r16;
+    @%p0 bra GAD_RMAX_SKIP;
+    add.u32 %r17, %r5, %r16;
+    mov.u32 %r18, sdata;
+    shl.b32 %r19, %r17, 2;
+    add.u32 %r18, %r18, %r19;
+    ld.shared.f32 %f10, [%r18];
+    mov.u32 %r18, sdata;
+    shl.b32 %r19, %r5, 2;
+    add.u32 %r18, %r18, %r19;
+    ld.shared.f32 %f11, [%r18];
+    max.f32 %f11, %f11, %f10;
+    st.shared.f32 [%r18], %f11;
+GAD_RMAX_SKIP:
+    bar.sync 0;
+    shr.u32 %r16, %r16, 1;
+    setp.ge.u32 %p0, %r16, 1;
+    @%p0 bra GAD_RMAX;
+
+    mov.u32 %r18, sdata;
+    ld.shared.f32 %f13, [%r18];       // gmax
+    bar.sync 0;
+
+    // ---- Pass 2: tiled score + V accumulation ----
+    mov.f32 %f14, 0f00000000;         // v_acc (per thread, for dim lid)
+    mov.f32 %f15, 0f00000000;         // local_sum_exp
+
+    mov.u32 %r20, 0;                  // tile = 0
+GAD_TILE:
+    setp.ge.u32 %p0, %r20, %r3;
+    @%p0 bra GAD_TILE_END;
+
+    // Step A: each thread computes w = exp(score - gmax) for position tile + lid
+    add.u32 %r11, %r20, %r5;          // j = tile + lid
+    mov.f32 %f16, 0f00000000;         // w = 0
+    setp.ge.u32 %p3, %r11, %r3;
+    @%p3 bra GAD_STORE_W;
+
+    // dot product Q . K[j]
+    mov.f32 %f9, 0f00000000;
+    mul.lo.u32 %r12, %r11, %r7;
+    add.u32 %r12, %r12, %r9;
+    mul.wide.u32 %rd5, %r12, 4;
+    add.u64 %rd5, %rd1, %rd5;
+    mov.u32 %r13, 0;
+GAD_DOT2:
+    setp.ge.u32 %p1, %r13, %r2;
+    @%p1 bra GAD_DOT2_END;
+    mul.wide.u32 %rd6, %r13, 4;
+    add.u64 %rd7, %rd4, %rd6;
+    ld.global.f32 %f10, [%rd7];
+    add.u64 %rd8, %rd5, %rd6;
+    ld.global.f32 %f11, [%rd8];
+    fma.rn.f32 %f9, %f10, %f11, %f9;
+    add.u32 %r13, %r13, 1;
+    bra GAD_DOT2;
+GAD_DOT2_END:
+
+    mul.rn.f32 %f9, %f9, %f0;
+
+    // softcap
+    setp.le.f32 %p2, %f1, %f4;
+    @%p2 bra GAD_NOSC2;
+    div.approx.f32 %f12, %f9, %f1;
+    mul.rn.f32 %f12, %f12, %f6;
+    mul.rn.f32 %f12, %f12, %f5;
+    ex2.approx.f32 %f12, %f12;
+    add.rn.f32 %f12, %f12, %f7;
+    div.approx.f32 %f12, %f6, %f12;
+    sub.rn.f32 %f12, %f7, %f12;
+    mul.rn.f32 %f9, %f1, %f12;
+GAD_NOSC2:
+
+    // w = exp(s - gmax) = exp2((s - gmax) * log2e)
+    sub.rn.f32 %f16, %f9, %f13;
+    mul.rn.f32 %f16, %f16, %f5;
+    ex2.approx.f32 %f16, %f16;
+
+GAD_STORE_W:
+    add.rn.f32 %f15, %f15, %f16;
+    mov.u32 %r14, sdata;
+    shl.b32 %r15, %r5, 2;
+    add.u32 %r14, %r14, %r15;
+    st.shared.f32 [%r14], %f16;
+    bar.sync 0;
+
+    // Step B: threads parallel over head_dim, accumulate weight * V
+    setp.ge.u32 %p4, %r5, %r2;
+    @%p4 bra GAD_VACC_SKIP;
+
+    // active = min(tpg, total_len - tile)
+    sub.u32 %r21, %r3, %r20;
+    min.u32 %r21, %r6, %r21;
+    mov.u32 %r22, 0;
+GAD_VACC:
+    setp.ge.u32 %p5, %r22, %r21;
+    @%p5 bra GAD_VACC_SKIP;
+    // w = shared[t]
+    mov.u32 %r14, sdata;
+    shl.b32 %r15, %r22, 2;
+    add.u32 %r14, %r14, %r15;
+    ld.shared.f32 %f17, [%r14];
+    // V[(tile+t) * kv_dim + kv_off + lid]
+    add.u32 %r23, %r20, %r22;
+    mul.lo.u32 %r24, %r23, %r7;
+    add.u32 %r24, %r24, %r9;
+    add.u32 %r24, %r24, %r5;
+    mul.wide.u32 %rd9, %r24, 4;
+    add.u64 %rd10, %rd2, %rd9;
+    ld.global.f32 %f18, [%rd10];
+    fma.rn.f32 %f14, %f17, %f18, %f14;
+    add.u32 %r22, %r22, 1;
+    bra GAD_VACC;
+GAD_VACC_SKIP:
+    bar.sync 0;
+
+    add.u32 %r20, %r20, %r6;
+    bra GAD_TILE;
+GAD_TILE_END:
+
+    // ---- Reduce sum_exp across threadgroup ----
+    mov.u32 %r14, sdata;
+    shl.b32 %r15, %r5, 2;
+    add.u32 %r14, %r14, %r15;
+    st.shared.f32 [%r14], %f15;
+    bar.sync 0;
+
+    mov.u32 %r16, 128;
+GAD_RSUM:
+    setp.ge.u32 %p0, %r5, %r16;
+    @%p0 bra GAD_RSUM_SKIP;
+    add.u32 %r17, %r5, %r16;
+    mov.u32 %r18, sdata;
+    shl.b32 %r19, %r17, 2;
+    add.u32 %r18, %r18, %r19;
+    ld.shared.f32 %f10, [%r18];
+    mov.u32 %r18, sdata;
+    shl.b32 %r19, %r5, 2;
+    add.u32 %r18, %r18, %r19;
+    ld.shared.f32 %f11, [%r18];
+    add.rn.f32 %f11, %f11, %f10;
+    st.shared.f32 [%r18], %f11;
+GAD_RSUM_SKIP:
+    bar.sync 0;
+    shr.u32 %r16, %r16, 1;
+    setp.ge.u32 %p0, %r16, 1;
+    @%p0 bra GAD_RSUM;
+
+    mov.u32 %r18, sdata;
+    ld.shared.f32 %f19, [%r18];       // total sum_exp
+
+    // Write normalized output: out[h*head_dim + lid] = v_acc / sum_exp
+    setp.ge.u32 %p6, %r5, %r2;
+    @%p6 bra GAD_EXIT;
+    setp.le.f32 %p7, %f19, %f4;
+    @%p7 bra GAD_EXIT;
+    div.approx.f32 %f20, %f7, %f19;   // inv_sum = 1.0 / sum_exp
+    mul.rn.f32 %f14, %f14, %f20;
+
+    mul.lo.u32 %r25, %r4, %r2;
+    add.u32 %r25, %r25, %r5;
+    mul.wide.u32 %rd11, %r25, 4;
+    add.u64 %rd12, %rd3, %rd11;
+    st.global.f32 [%rd12], %f14;
+GAD_EXIT:
+    ret;
+}
+
+"#,
+    "\0"
+);
 
 #[cfg(test)]
 mod tests {
@@ -2166,7 +2479,7 @@ mod tests {
     #[test]
     fn ptx_module_has_header() {
         assert!(PTX_MODULE.contains(".version 7.0"));
-        assert!(PTX_MODULE.contains(".target sm_50"));
+        assert!(PTX_MODULE.contains(".target sm_53"));
         assert!(PTX_MODULE.contains(".address_size 64"));
     }
 
@@ -2209,22 +2522,19 @@ mod tests {
             "tanh_kernel",
             "l2_normalize",
             "embedding_lookup",
+            "grouped_attn_decode",
         ];
         for name in &new_kernels {
             let entry = format!(".visible .entry {}(", name);
-            assert!(
-                PTX_MODULE.contains(&entry),
-                "Missing new kernel: {}",
-                name
-            );
+            assert!(PTX_MODULE.contains(&entry), "Missing new kernel: {}", name);
         }
     }
 
     #[test]
     fn ptx_module_total_kernel_count() {
         let count = PTX_MODULE.matches(".visible .entry ").count();
-        // 9 ported + 13 new = 22 kernels
-        assert_eq!(count, 22, "Expected 22 kernels, found {}", count);
+        // 9 ported + 14 new = 23 kernels
+        assert_eq!(count, 23, "Expected 23 kernels, found {}", count);
     }
 
     #[test]

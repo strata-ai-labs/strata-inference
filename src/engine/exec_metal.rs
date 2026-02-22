@@ -5,7 +5,9 @@
 
 use crate::backend::metal::ffi::*;
 
-use super::graph::{BufferRef, BufferSlot, DecodeGraph, DispatchDims, ParamValue, PrefillGraph, PsoRef};
+use super::graph::{
+    BufferRef, BufferSlot, DecodeGraph, DispatchDims, ParamValue, PrefillGraph, PsoRef,
+};
 
 // ---------------------------------------------------------------------------
 // Buffer pool — pre-allocated Metal buffers for zero-allocation decode
@@ -39,7 +41,11 @@ impl MetalBufferPool {
                     size,
                     MTL_RESOURCE_STORAGE_MODE_SHARED,
                 );
-                assert!(!buf.is_null(), "Metal buffer allocation failed for size {}", size);
+                assert!(
+                    !buf.is_null(),
+                    "Metal buffer allocation failed for size {}",
+                    size
+                );
                 (buf, size)
             })
             .collect();
@@ -137,65 +143,66 @@ impl MetalResources {
         if library == NIL {
             let desc = obj_description(error);
             return Err(crate::error::InferenceError::Backend(format!(
-                "Metal MSL compile error: {}", desc
+                "Metal MSL compile error: {}",
+                desc
             )));
         }
 
         // Create PSOs in PsoRef order
         let kernel_names = [
-            "layer_norm",              // LayerNorm = 0
-            "rms_norm",                // RmsNorm = 1
-            "quantized_matmul_q8_0",   // QuantizedMatmulQ8_0 = 2
-            "quantized_matmul_q4_0",   // QuantizedMatmulQ4_0 = 3
-            "quantized_matmul_q4_k",   // QuantizedMatmulQ4K = 4
-            "quantized_matmul_q5_k",   // QuantizedMatmulQ5K = 5
-            "quantized_matmul_q6_k",   // QuantizedMatmulQ6K = 6
-            "gemm_transpose",          // MatmulTranspose = 7
-            "add_tensor",              // AddTensor = 8
-            "add_bias",                // AddBias = 9
-            "gelu",                    // Gelu = 10
-            "silu",                    // Silu = 11
-            "swiglu",                  // SwiGlu = 12
-            "geglu",                   // GeGlu = 13
-            "rope_norm",               // RopeNorm = 14
-            "rope_neox",               // RopeNeox = 15
-            "embedding_lookup",        // EmbeddingLookup = 16
-            "grouped_attn_decode",     // GroupedAttnDecode = 17
-            "copy_buffer",             // CopyBuffer = 18
-            "scale_kernel",            // ScaleKernel = 19
+            "layer_norm",            // LayerNorm = 0
+            "rms_norm",              // RmsNorm = 1
+            "quantized_matmul_q8_0", // QuantizedMatmulQ8_0 = 2
+            "quantized_matmul_q4_0", // QuantizedMatmulQ4_0 = 3
+            "quantized_matmul_q4_k", // QuantizedMatmulQ4K = 4
+            "quantized_matmul_q5_k", // QuantizedMatmulQ5K = 5
+            "quantized_matmul_q6_k", // QuantizedMatmulQ6K = 6
+            "gemm_transpose",        // MatmulTranspose = 7
+            "add_tensor",            // AddTensor = 8
+            "add_bias",              // AddBias = 9
+            "gelu",                  // Gelu = 10
+            "silu",                  // Silu = 11
+            "swiglu",                // SwiGlu = 12
+            "geglu",                 // GeGlu = 13
+            "rope_norm",             // RopeNorm = 14
+            "rope_neox",             // RopeNeox = 15
+            "embedding_lookup",      // EmbeddingLookup = 16
+            "grouped_attn_decode",   // GroupedAttnDecode = 17
+            "copy_buffer",           // CopyBuffer = 18
+            "scale_kernel",          // ScaleKernel = 19
             // Phase 1: F16 KV cache + online softmax
-            "copy_f32_to_f16",               // CopyF32ToF16 = 20
-            "grouped_attn_decode_f16",       // GroupedAttnDecodeF16 = 21
+            "copy_f32_to_f16",         // CopyF32ToF16 = 20
+            "grouped_attn_decode_f16", // GroupedAttnDecodeF16 = 21
             // Phase 2: Fused matmul+bias
-            "quantized_matmul_bias_q8_0",    // QuantizedMatmulBiasQ8_0 = 22
-            "quantized_matmul_bias_q4_0",    // QuantizedMatmulBiasQ4_0 = 23
-            "quantized_matmul_bias_q4_k",    // QuantizedMatmulBiasQ4K = 24
-            "quantized_matmul_bias_q5_k",    // QuantizedMatmulBiasQ5K = 25
-            "quantized_matmul_bias_q6_k",    // QuantizedMatmulBiasQ6K = 26
-            "gemm_transpose_bias",           // MatmulTransposeBias = 27
-            "batched_causal_attention",      // BatchedCausalAttention = 28
-            "batched_causal_attention_f16",  // BatchedCausalAttentionF16 = 29
+            "quantized_matmul_bias_q8_0", // QuantizedMatmulBiasQ8_0 = 22
+            "quantized_matmul_bias_q4_0", // QuantizedMatmulBiasQ4_0 = 23
+            "quantized_matmul_bias_q4_k", // QuantizedMatmulBiasQ4K = 24
+            "quantized_matmul_bias_q5_k", // QuantizedMatmulBiasQ5K = 25
+            "quantized_matmul_bias_q6_k", // QuantizedMatmulBiasQ6K = 26
+            "gemm_transpose_bias",        // MatmulTransposeBias = 27
+            "batched_causal_attention",   // BatchedCausalAttention = 28
+            "batched_causal_attention_f16", // BatchedCausalAttentionF16 = 29
             // Phase 4: Batched quantized matmul for prefill
-            "batched_matmul_q8_0",           // BatchedMatmulQ8_0 = 30
-            "batched_matmul_bias_q8_0",      // BatchedMatmulBiasQ8_0 = 31
-            "batched_matmul_q4_0",           // BatchedMatmulQ4_0 = 32
-            "batched_matmul_bias_q4_0",      // BatchedMatmulBiasQ4_0 = 33
-            "batched_matmul_q4_k",           // BatchedMatmulQ4K = 34
-            "batched_matmul_bias_q4_k",      // BatchedMatmulBiasQ4K = 35
-            "batched_matmul_q5_k",           // BatchedMatmulQ5K = 36
-            "batched_matmul_bias_q5_k",      // BatchedMatmulBiasQ5K = 37
-            "batched_matmul_q6_k",           // BatchedMatmulQ6K = 38
-            "batched_matmul_bias_q6_k",      // BatchedMatmulBiasQ6K = 39
+            "batched_matmul_q8_0",      // BatchedMatmulQ8_0 = 30
+            "batched_matmul_bias_q8_0", // BatchedMatmulBiasQ8_0 = 31
+            "batched_matmul_q4_0",      // BatchedMatmulQ4_0 = 32
+            "batched_matmul_bias_q4_0", // BatchedMatmulBiasQ4_0 = 33
+            "batched_matmul_q4_k",      // BatchedMatmulQ4K = 34
+            "batched_matmul_bias_q4_k", // BatchedMatmulBiasQ4K = 35
+            "batched_matmul_q5_k",      // BatchedMatmulQ5K = 36
+            "batched_matmul_bias_q5_k", // BatchedMatmulBiasQ5K = 37
+            "batched_matmul_q6_k",      // BatchedMatmulQ6K = 38
+            "batched_matmul_bias_q6_k", // BatchedMatmulBiasQ6K = 39
             // Phase 5: RoPE with per-dimension frequency factors (LongRoPE)
-            "rope_neox_factors",             // RopeNeoxFactors = 40
+            "rope_neox_factors", // RopeNeoxFactors = 40
             // Phase 6: Multi-workgroup vec decode attention
-            "attn_decode_vec_f16",           // AttnDecodeVecF16 = 41
-            "attn_decode_vec_reduce_f16",    // AttnDecodeVecReduceF16 = 42
+            "attn_decode_vec_f16",        // AttnDecodeVecF16 = 41
+            "attn_decode_vec_reduce_f16", // AttnDecodeVecReduceF16 = 42
             // Phase 7: Q5_0 quantized matmul
-            "quantized_matmul_q5_0",         // QuantizedMatmulQ5_0 = 43
-            "quantized_matmul_bias_q5_0",    // QuantizedMatmulBiasQ5_0 = 44
-            "batched_matmul_q5_0",           // BatchedMatmulQ5_0 = 45
-            "batched_matmul_bias_q5_0",      // BatchedMatmulBiasQ5_0 = 46
+            "quantized_matmul_q5_0",      // QuantizedMatmulQ5_0 = 43
+            "quantized_matmul_bias_q5_0", // QuantizedMatmulBiasQ5_0 = 44
+            "batched_matmul_q5_0",        // BatchedMatmulQ5_0 = 45
+            "batched_matmul_bias_q5_0",   // BatchedMatmulBiasQ5_0 = 46
         ];
 
         let mut psos = Vec::with_capacity(kernel_names.len());
@@ -205,7 +212,8 @@ impl MetalResources {
             if func == NIL {
                 msg_send_void(library, sels.release);
                 return Err(crate::error::InferenceError::Backend(format!(
-                    "Metal kernel function '{}' not found", name
+                    "Metal kernel function '{}' not found",
+                    name
                 )));
             }
             let mut pso_error: Id = NIL;
@@ -219,7 +227,8 @@ impl MetalResources {
                 }
                 msg_send_void(library, sels.release);
                 return Err(crate::error::InferenceError::Backend(format!(
-                    "Metal PSO creation failed for '{}': {}", name, desc
+                    "Metal PSO creation failed for '{}': {}",
+                    name, desc
                 )));
             }
             psos.push(pso);
@@ -227,7 +236,12 @@ impl MetalResources {
 
         msg_send_void(library, sels.release);
 
-        Ok(Self { device, command_queue, sels, psos })
+        Ok(Self {
+            device,
+            command_queue,
+            sels,
+            psos,
+        })
     }
 }
 
@@ -268,7 +282,11 @@ pub(crate) unsafe fn encode_decode_token(
 
     // 2. Create concurrent compute command encoder — allows independent
     //    dispatches to overlap on GPU. Barriers ensure ordering where needed.
-    let enc = msg_send_id_nsuint(cmd, res.sels.compute_command_encoder_with_dispatch_type, MTL_DISPATCH_TYPE_CONCURRENT);
+    let enc = msg_send_id_nsuint(
+        cmd,
+        res.sels.compute_command_encoder_with_dispatch_type,
+        MTL_DISPATCH_TYPE_CONCURRENT,
+    );
     debug_assert!(!enc.is_null(), "compute_command_encoder returned nil");
 
     // 3. Pre-compute dynamic values
@@ -310,7 +328,13 @@ pub(crate) unsafe fn encode_decode_token(
         // Bind buffers
         for &(ref buf_ref, binding, offset) in &op.bindings {
             let buf_id = resolve_buffer(buf_ref, pool, weight_bufs, kv_bufs);
-            msg_send_set_buffer(enc, res.sels.set_buffer, buf_id, offset as usize, binding as usize);
+            msg_send_set_buffer(
+                enc,
+                res.sels.set_buffer,
+                buf_id,
+                offset as usize,
+                binding as usize,
+            );
         }
 
         // Bind params
@@ -318,35 +342,79 @@ pub(crate) unsafe fn encode_decode_token(
             match param {
                 ParamValue::U32(v) => {
                     let bytes = v.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::F32(v) => {
                     let bytes = v.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::TokenId => {
                     // Bind the token_id buffer (single u32) as a buffer
-                    msg_send_set_buffer(enc, res.sels.set_buffer, token_id_buf, 0, binding as usize);
+                    msg_send_set_buffer(
+                        enc,
+                        res.sels.set_buffer,
+                        token_id_buf,
+                        0,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PositionIdBuffer => {
                     // Bind the position_id buffer (single u32) as a buffer
-                    msg_send_set_buffer(enc, res.sels.set_buffer, position_id_buf, 0, binding as usize);
+                    msg_send_set_buffer(
+                        enc,
+                        res.sels.set_buffer,
+                        position_id_buf,
+                        0,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PositionId => {
                     let bytes = pos.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::TotalLen => {
                     let bytes = total_len.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::CacheRowOffset => {
                     let bytes = cache_row_offset.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 // Prefill-only variants — should not appear in decode graphs
-                ParamValue::PrefillTokenIds | ParamValue::PrefillPositionIds
-                | ParamValue::PrefillNTokens | ParamValue::PrefillTotalLen
+                ParamValue::PrefillTokenIds
+                | ParamValue::PrefillPositionIds
+                | ParamValue::PrefillNTokens
+                | ParamValue::PrefillTotalLen
                 | ParamValue::PrefillPosOffset => {
                     debug_assert!(false, "prefill-only ParamValue in decode graph");
                 }
@@ -387,8 +455,8 @@ pub(crate) unsafe fn encode_prefill(
     weight_bufs: &[Id],
     kv_bufs: &[Id],
     params: &PrefillParams,
-    token_ids_buf: Id,     // M u32s
-    position_ids_buf: Id,  // M u32s
+    token_ids_buf: Id,    // M u32s
+    position_ids_buf: Id, // M u32s
 ) -> Vec<f32> {
     // 1. Create command buffer
     let cmd = msg_send_id(res.command_queue, res.sels.command_buffer);
@@ -396,7 +464,11 @@ pub(crate) unsafe fn encode_prefill(
 
     // 2. Create concurrent compute command encoder — allows independent
     //    dispatches to overlap on GPU. Barriers ensure ordering where needed.
-    let enc = msg_send_id_nsuint(cmd, res.sels.compute_command_encoder_with_dispatch_type, MTL_DISPATCH_TYPE_CONCURRENT);
+    let enc = msg_send_id_nsuint(
+        cmd,
+        res.sels.compute_command_encoder_with_dispatch_type,
+        MTL_DISPATCH_TYPE_CONCURRENT,
+    );
     debug_assert!(!enc.is_null(), "compute_command_encoder returned nil");
 
     // 3. Pre-compute dynamic values
@@ -430,7 +502,13 @@ pub(crate) unsafe fn encode_prefill(
         // Bind buffers (with byte offset)
         for &(ref buf_ref, binding, offset) in &op.bindings {
             let buf_id = resolve_buffer(buf_ref, pool, weight_bufs, kv_bufs);
-            msg_send_set_buffer(enc, res.sels.set_buffer, buf_id, offset as usize, binding as usize);
+            msg_send_set_buffer(
+                enc,
+                res.sels.set_buffer,
+                buf_id,
+                offset as usize,
+                binding as usize,
+            );
         }
 
         // Bind params
@@ -438,33 +516,77 @@ pub(crate) unsafe fn encode_prefill(
             match param {
                 ParamValue::U32(v) => {
                     let bytes = v.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::F32(v) => {
                     let bytes = v.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PrefillTokenIds => {
-                    msg_send_set_buffer(enc, res.sels.set_buffer, token_ids_buf, 0, binding as usize);
+                    msg_send_set_buffer(
+                        enc,
+                        res.sels.set_buffer,
+                        token_ids_buf,
+                        0,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PrefillPositionIds => {
-                    msg_send_set_buffer(enc, res.sels.set_buffer, position_ids_buf, 0, binding as usize);
+                    msg_send_set_buffer(
+                        enc,
+                        res.sels.set_buffer,
+                        position_ids_buf,
+                        0,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PrefillNTokens => {
                     let bytes = n_tokens.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PrefillTotalLen => {
                     let bytes = total_len.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PrefillPosOffset => {
                     let bytes = pos_offset.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 // Decode-only variants — should not appear in prefill graphs
-                ParamValue::TokenId | ParamValue::PositionId
-                | ParamValue::PositionIdBuffer | ParamValue::TotalLen
+                ParamValue::TokenId
+                | ParamValue::PositionId
+                | ParamValue::PositionIdBuffer
+                | ParamValue::TotalLen
                 | ParamValue::CacheRowOffset => {
                     debug_assert!(false, "decode-only ParamValue in prefill graph");
                 }
@@ -543,7 +665,13 @@ pub(crate) unsafe fn encode_prefill_profiled(
         // Bind buffers
         for &(ref buf_ref, binding, offset) in &op.bindings {
             let buf_id = resolve_buffer(buf_ref, pool, weight_bufs, kv_bufs);
-            msg_send_set_buffer(enc, res.sels.set_buffer, buf_id, offset as usize, binding as usize);
+            msg_send_set_buffer(
+                enc,
+                res.sels.set_buffer,
+                buf_id,
+                offset as usize,
+                binding as usize,
+            );
         }
 
         // Bind params
@@ -551,32 +679,76 @@ pub(crate) unsafe fn encode_prefill_profiled(
             match param {
                 ParamValue::U32(v) => {
                     let bytes = v.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::F32(v) => {
                     let bytes = v.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PrefillTokenIds => {
-                    msg_send_set_buffer(enc, res.sels.set_buffer, token_ids_buf, 0, binding as usize);
+                    msg_send_set_buffer(
+                        enc,
+                        res.sels.set_buffer,
+                        token_ids_buf,
+                        0,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PrefillPositionIds => {
-                    msg_send_set_buffer(enc, res.sels.set_buffer, position_ids_buf, 0, binding as usize);
+                    msg_send_set_buffer(
+                        enc,
+                        res.sels.set_buffer,
+                        position_ids_buf,
+                        0,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PrefillNTokens => {
                     let bytes = n_tokens.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PrefillTotalLen => {
                     let bytes = total_len.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PrefillPosOffset => {
                     let bytes = pos_offset.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
-                ParamValue::TokenId | ParamValue::PositionId
-                | ParamValue::PositionIdBuffer | ParamValue::TotalLen
+                ParamValue::TokenId
+                | ParamValue::PositionId
+                | ParamValue::PositionIdBuffer
+                | ParamValue::TotalLen
                 | ParamValue::CacheRowOffset => {
                     debug_assert!(false, "decode-only ParamValue in prefill graph");
                 }
@@ -594,7 +766,6 @@ pub(crate) unsafe fn encode_prefill_profiled(
         let gpu_start = msg_send_f64(cmd, res.sels.gpu_start_time);
         let gpu_end = msg_send_f64(cmd, res.sels.gpu_end_time);
         timings.push((op.pso, gpu_end - gpu_start));
-
     }
 
     // Read logits from pool
@@ -657,39 +828,89 @@ pub(crate) unsafe fn encode_decode_token_profiled(
 
         for &(ref buf_ref, binding, offset) in &op.bindings {
             let buf_id = resolve_buffer(buf_ref, pool, weight_bufs, kv_bufs);
-            msg_send_set_buffer(enc, res.sels.set_buffer, buf_id, offset as usize, binding as usize);
+            msg_send_set_buffer(
+                enc,
+                res.sels.set_buffer,
+                buf_id,
+                offset as usize,
+                binding as usize,
+            );
         }
 
         for &(ref param, binding) in &op.params {
             match param {
                 ParamValue::U32(v) => {
                     let bytes = v.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::F32(v) => {
                     let bytes = v.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::TokenId => {
-                    msg_send_set_buffer(enc, res.sels.set_buffer, token_id_buf, 0, binding as usize);
+                    msg_send_set_buffer(
+                        enc,
+                        res.sels.set_buffer,
+                        token_id_buf,
+                        0,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PositionIdBuffer => {
-                    msg_send_set_buffer(enc, res.sels.set_buffer, position_id_buf, 0, binding as usize);
+                    msg_send_set_buffer(
+                        enc,
+                        res.sels.set_buffer,
+                        position_id_buf,
+                        0,
+                        binding as usize,
+                    );
                 }
                 ParamValue::PositionId => {
                     let bytes = pos.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::TotalLen => {
                     let bytes = total_len.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
                 ParamValue::CacheRowOffset => {
                     let bytes = cache_row_offset.to_ne_bytes();
-                    msg_send_set_bytes(enc, res.sels.set_bytes, bytes.as_ptr(), 4, binding as usize);
+                    msg_send_set_bytes(
+                        enc,
+                        res.sels.set_bytes,
+                        bytes.as_ptr(),
+                        4,
+                        binding as usize,
+                    );
                 }
-                ParamValue::PrefillTokenIds | ParamValue::PrefillPositionIds
-                | ParamValue::PrefillNTokens | ParamValue::PrefillTotalLen
+                ParamValue::PrefillTokenIds
+                | ParamValue::PrefillPositionIds
+                | ParamValue::PrefillNTokens
+                | ParamValue::PrefillTotalLen
                 | ParamValue::PrefillPosOffset => {
                     debug_assert!(false, "prefill-only ParamValue in decode graph");
                 }
@@ -738,10 +959,23 @@ pub(crate) fn format_kernel_breakdown(timings: &[(PsoRef, f64)]) -> (String, f64
     let mut out = String::new();
     for (name, (count, secs)) in &sorted {
         let ms = secs * 1000.0;
-        let pct = if total_gpu > 0.0 { secs / total_gpu * 100.0 } else { 0.0 };
-        let _ = writeln!(out, "    {:<36} {:>3} calls  {:>8.2}ms  {:>5.1}%", name, count, ms, pct);
+        let pct = if total_gpu > 0.0 {
+            secs / total_gpu * 100.0
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            out,
+            "    {:<36} {:>3} calls  {:>8.2}ms  {:>5.1}%",
+            name, count, ms, pct
+        );
     }
-    let _ = writeln!(out, "    {:<36}            {:>8.2}ms", "Total GPU", total_gpu * 1000.0);
+    let _ = writeln!(
+        out,
+        "    {:<36}            {:>8.2}ms",
+        "Total GPU",
+        total_gpu * 1000.0
+    );
 
     (out, total_gpu)
 }
@@ -753,37 +987,79 @@ unsafe fn dispatch_op(enc: Id, sels: &Selectors, dims: &DispatchDims) {
         DispatchDims::D1 { count, threads } => {
             let groups = (count + threads - 1) / threads;
             msg_send_dispatch(
-                enc, sels.dispatch_threadgroups,
-                groups as usize, 1, 1,
-                threads as usize, 1, 1,
+                enc,
+                sels.dispatch_threadgroups,
+                groups as usize,
+                1,
+                1,
+                threads as usize,
+                1,
+                1,
             );
         }
         DispatchDims::D2 { gx, gy, tx, ty } => {
             msg_send_dispatch(
-                enc, sels.dispatch_threadgroups,
-                gx as usize, gy as usize, 1,
-                tx as usize, ty as usize, 1,
+                enc,
+                sels.dispatch_threadgroups,
+                gx as usize,
+                gy as usize,
+                1,
+                tx as usize,
+                ty as usize,
+                1,
             );
         }
-        DispatchDims::D3 { gx, gy, gz, tx, ty, tz } => {
+        DispatchDims::D3 {
+            gx,
+            gy,
+            gz,
+            tx,
+            ty,
+            tz,
+        } => {
             msg_send_dispatch(
-                enc, sels.dispatch_threadgroups,
-                gx as usize, gy as usize, gz as usize,
-                tx as usize, ty as usize, tz as usize,
+                enc,
+                sels.dispatch_threadgroups,
+                gx as usize,
+                gy as usize,
+                gz as usize,
+                tx as usize,
+                ty as usize,
+                tz as usize,
             );
         }
-        DispatchDims::Rows { num_rows, threads_per_group } => {
+        DispatchDims::Rows {
+            num_rows,
+            threads_per_group,
+        } => {
             msg_send_dispatch(
-                enc, sels.dispatch_threadgroups,
-                num_rows as usize, 1, 1,
-                threads_per_group as usize, 1, 1,
+                enc,
+                sels.dispatch_threadgroups,
+                num_rows as usize,
+                1,
+                1,
+                threads_per_group as usize,
+                1,
+                1,
             );
         }
-        DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } => {
+        DispatchDims::Fixed {
+            gx,
+            gy,
+            gz,
+            tx,
+            ty,
+            tz,
+        } => {
             msg_send_dispatch(
-                enc, sels.dispatch_threadgroups,
-                gx as usize, gy as usize, gz as usize,
-                tx as usize, ty as usize, tz as usize,
+                enc,
+                sels.dispatch_threadgroups,
+                gx as usize,
+                gy as usize,
+                gz as usize,
+                tx as usize,
+                ty as usize,
+                tz as usize,
             );
         }
     }

@@ -151,18 +151,10 @@ impl ModelConfig {
         let arch_name = arch_name.to_string();
 
         // ---- Required dimension keys ----
-        let hidden_size = gguf
-            .require_u32(&format!("{}.embedding_length", arch_name))?
-            as usize;
-        let num_layers = gguf
-            .require_u32(&format!("{}.block_count", arch_name))?
-            as usize;
-        let num_heads = gguf
-            .require_u32(&format!("{}.attention.head_count", arch_name))?
-            as usize;
-        let ffn_hidden = gguf
-            .require_u32(&format!("{}.feed_forward_length", arch_name))?
-            as usize;
+        let hidden_size = gguf.require_u32(&format!("{}.embedding_length", arch_name))? as usize;
+        let num_layers = gguf.require_u32(&format!("{}.block_count", arch_name))? as usize;
+        let num_heads = gguf.require_u32(&format!("{}.attention.head_count", arch_name))? as usize;
+        let ffn_hidden = gguf.require_u32(&format!("{}.feed_forward_length", arch_name))? as usize;
 
         // ---- Optional dimension keys (with defaults) ----
         let num_kv_heads = gguf
@@ -177,13 +169,8 @@ impl ModelConfig {
             .unwrap_or(default_head_dim);
 
         let norm_eps = gguf
-            .get_f32(&format!(
-                "{}.attention.layer_norm_rms_epsilon",
-                arch_name
-            ))
-            .or_else(|| {
-                gguf.get_f32(&format!("{}.attention.layer_norm_epsilon", arch_name))
-            })
+            .get_f32(&format!("{}.attention.layer_norm_rms_epsilon", arch_name))
+            .or_else(|| gguf.get_f32(&format!("{}.attention.layer_norm_epsilon", arch_name)))
             .unwrap_or(1e-6);
 
         let rope_freq_base = gguf
@@ -196,7 +183,10 @@ impl ModelConfig {
             .unwrap_or(head_dim);
 
         let rope_scaling_original_ctx = gguf
-            .get_u32(&format!("{}.rope.scaling.original_context_length", arch_name))
+            .get_u32(&format!(
+                "{}.rope.scaling.original_context_length",
+                arch_name
+            ))
             .map(|v| v as usize)
             .unwrap_or(0);
 
@@ -213,8 +203,7 @@ impl ModelConfig {
             .get_f32(&format!("{}.attn_logit_softcapping", arch_name))
             .unwrap_or(0.0);
 
-        let attn_scale = gguf
-            .get_f32(&format!("{}.attention.scale", arch_name));
+        let attn_scale = gguf.get_f32(&format!("{}.attention.scale", arch_name));
 
         // ---- Sliding window attention (ISWA) ----
         let swa_window = gguf
@@ -249,108 +238,117 @@ impl ModelConfig {
         };
 
         // ---- Architecture-specific defaults ----
-        let (norm_type, activation, position_type, has_ffn_gate, has_bias, embedding_scale, default_causal, pre_norm, rope_neox) =
-            match arch {
-                ModelArch::Gemma3 | ModelArch::Gemma2 => (
-                    NormType::RMSNorm,
-                    Activation::GeGLU,
-                    PositionType::RoPE,
-                    true,  // has_ffn_gate
-                    false, // has_bias
-                    (hidden_size as f32).sqrt(), // embedding_scale = sqrt(hidden_size)
-                    true,  // default causal (overridden by metadata if present)
-                    true,  // pre_norm (norm-before)
-                    true,  // rope_neox (Gemma uses NeoX-style RoPE)
-                ),
-                ModelArch::LLaMA => (
-                    NormType::RMSNorm,
-                    Activation::SwiGLU,
-                    PositionType::RoPE,
-                    true,  // has_ffn_gate
-                    false, // has_bias
-                    1.0,   // embedding_scale
-                    true,  // default causal
-                    true,  // pre_norm
-                    false, // rope_neox (LLaMA uses standard/normal RoPE)
-                ),
-                ModelArch::Qwen3 => (
-                    NormType::RMSNorm,
-                    Activation::SwiGLU,
-                    PositionType::RoPE,
-                    true,  // has_ffn_gate
-                    false, // has_bias
-                    1.0,   // embedding_scale
-                    true,  // default causal
-                    true,  // pre_norm
-                    true,  // rope_neox (Qwen3 uses NeoX-style RoPE)
-                ),
-                ModelArch::GemmaEmbedding => (
-                    NormType::RMSNorm,
-                    Activation::GeGLU,
-                    PositionType::RoPE,
-                    true,  // has_ffn_gate
-                    false, // has_bias
-                    (hidden_size as f32).sqrt(), // embedding_scale = sqrt(hidden_size)
-                    false, // default causal (bidirectional)
-                    true,  // pre_norm (norm-before)
-                    true,  // rope_neox (Gemma uses NeoX-style RoPE)
-                ),
-                ModelArch::Bert => (
-                    NormType::LayerNorm,
-                    Activation::GELU,
-                    PositionType::Learned,
-                    false, // has_ffn_gate
-                    true,  // has_bias
-                    1.0,   // embedding_scale
-                    false, // default causal
-                    false, // post_norm (norm-after)
-                    false, // rope_neox (BERT uses learned position, no RoPE)
-                ),
-                ModelArch::GPT2 => (
-                    NormType::LayerNorm,
-                    Activation::GELU,
-                    PositionType::Learned,
-                    false, // has_ffn_gate (no SwiGLU gate)
-                    true,  // has_bias (all projections + norms have bias)
-                    1.0,   // embedding_scale
-                    true,  // default causal (autoregressive)
-                    true,  // pre_norm (norm BEFORE sublayers)
-                    false, // rope_neox (no RoPE, uses learned positions)
-                ),
-                ModelArch::Mistral3 => (
-                    NormType::RMSNorm,
-                    Activation::SwiGLU,
-                    PositionType::RoPE,
-                    true,  // has_ffn_gate
-                    true,  // has_bias (optional, loaded via load_tensor_optional)
-                    1.0,   // embedding_scale
-                    true,  // default causal
-                    true,  // pre_norm
-                    false, // rope_neox (Mistral3 uses standard/NORM RoPE, like LLaMA)
-                ),
-                ModelArch::Phi2 => (
-                    NormType::LayerNorm,
-                    Activation::GELU,
-                    PositionType::RoPE,
-                    false, // has_ffn_gate (no SwiGLU gate)
-                    true,  // has_bias (all projections have bias)
-                    1.0,   // embedding_scale
-                    true,  // default causal
-                    true,  // pre_norm
-                    true,  // rope_neox (Phi2 uses NeoX-style RoPE)
-                ),
-                ModelArch::Phi3 => (
-                    NormType::RMSNorm,
-                    Activation::SwiGLU,
-                    PositionType::RoPE,
-                    true,  // has_ffn_gate
-                    false, // has_bias (Phi-3 uses RMSNorm, no biases)
-                    1.0,   // embedding_scale
-                    true,  // default causal
-                    true,  // pre_norm
-                    true,  // rope_neox (Phi3 uses NeoX-style RoPE)
-                ),
-            };
+        let (
+            norm_type,
+            activation,
+            position_type,
+            has_ffn_gate,
+            has_bias,
+            embedding_scale,
+            default_causal,
+            pre_norm,
+            rope_neox,
+        ) = match arch {
+            ModelArch::Gemma3 | ModelArch::Gemma2 => (
+                NormType::RMSNorm,
+                Activation::GeGLU,
+                PositionType::RoPE,
+                true,                        // has_ffn_gate
+                false,                       // has_bias
+                (hidden_size as f32).sqrt(), // embedding_scale = sqrt(hidden_size)
+                true,                        // default causal (overridden by metadata if present)
+                true,                        // pre_norm (norm-before)
+                true,                        // rope_neox (Gemma uses NeoX-style RoPE)
+            ),
+            ModelArch::LLaMA => (
+                NormType::RMSNorm,
+                Activation::SwiGLU,
+                PositionType::RoPE,
+                true,  // has_ffn_gate
+                false, // has_bias
+                1.0,   // embedding_scale
+                true,  // default causal
+                true,  // pre_norm
+                false, // rope_neox (LLaMA uses standard/normal RoPE)
+            ),
+            ModelArch::Qwen3 => (
+                NormType::RMSNorm,
+                Activation::SwiGLU,
+                PositionType::RoPE,
+                true,  // has_ffn_gate
+                false, // has_bias
+                1.0,   // embedding_scale
+                true,  // default causal
+                true,  // pre_norm
+                true,  // rope_neox (Qwen3 uses NeoX-style RoPE)
+            ),
+            ModelArch::GemmaEmbedding => (
+                NormType::RMSNorm,
+                Activation::GeGLU,
+                PositionType::RoPE,
+                true,                        // has_ffn_gate
+                false,                       // has_bias
+                (hidden_size as f32).sqrt(), // embedding_scale = sqrt(hidden_size)
+                false,                       // default causal (bidirectional)
+                true,                        // pre_norm (norm-before)
+                true,                        // rope_neox (Gemma uses NeoX-style RoPE)
+            ),
+            ModelArch::Bert => (
+                NormType::LayerNorm,
+                Activation::GELU,
+                PositionType::Learned,
+                false, // has_ffn_gate
+                true,  // has_bias
+                1.0,   // embedding_scale
+                false, // default causal
+                false, // post_norm (norm-after)
+                false, // rope_neox (BERT uses learned position, no RoPE)
+            ),
+            ModelArch::GPT2 => (
+                NormType::LayerNorm,
+                Activation::GELU,
+                PositionType::Learned,
+                false, // has_ffn_gate (no SwiGLU gate)
+                true,  // has_bias (all projections + norms have bias)
+                1.0,   // embedding_scale
+                true,  // default causal (autoregressive)
+                true,  // pre_norm (norm BEFORE sublayers)
+                false, // rope_neox (no RoPE, uses learned positions)
+            ),
+            ModelArch::Mistral3 => (
+                NormType::RMSNorm,
+                Activation::SwiGLU,
+                PositionType::RoPE,
+                true,  // has_ffn_gate
+                true,  // has_bias (optional, loaded via load_tensor_optional)
+                1.0,   // embedding_scale
+                true,  // default causal
+                true,  // pre_norm
+                false, // rope_neox (Mistral3 uses standard/NORM RoPE, like LLaMA)
+            ),
+            ModelArch::Phi2 => (
+                NormType::LayerNorm,
+                Activation::GELU,
+                PositionType::RoPE,
+                false, // has_ffn_gate (no SwiGLU gate)
+                true,  // has_bias (all projections have bias)
+                1.0,   // embedding_scale
+                true,  // default causal
+                true,  // pre_norm
+                true,  // rope_neox (Phi2 uses NeoX-style RoPE)
+            ),
+            ModelArch::Phi3 => (
+                NormType::RMSNorm,
+                Activation::SwiGLU,
+                PositionType::RoPE,
+                true,  // has_ffn_gate
+                false, // has_bias (Phi-3 uses RMSNorm, no biases)
+                1.0,   // embedding_scale
+                true,  // default causal
+                true,  // pre_norm
+                true,  // rope_neox (Phi3 uses NeoX-style RoPE)
+            ),
+        };
 
         // ---- Causal attention (metadata overrides default) ----
         let causal = gguf
@@ -586,10 +584,7 @@ mod tests {
     /// Helper: build a GGUF file from owned KV pairs and open it as a GgufFile.
     fn open_gguf_from_kv(kv_pairs: &[(&str, Vec<u8>)]) -> (GgufFile, NamedTempFile) {
         // Convert owned Vec<u8> references to &[u8] for build_gguf_bytes
-        let refs: Vec<(&str, &[u8])> = kv_pairs
-            .iter()
-            .map(|(k, v)| (*k, v.as_slice()))
-            .collect();
+        let refs: Vec<(&str, &[u8])> = kv_pairs.iter().map(|(k, v)| (*k, v.as_slice())).collect();
         let bytes = build_gguf_bytes(&refs);
         let file = write_temp_gguf(&bytes);
         let gguf = GgufFile::open(file.path()).expect("failed to open temp GGUF");
@@ -646,7 +641,7 @@ mod tests {
         assert!(config.has_ffn_gate);
         assert!(!config.has_bias);
         assert!(config.pre_norm); // Gemma2 uses pre-norm
-        // embedding_scale = sqrt(512) for Gemma2
+                                  // embedding_scale = sqrt(512) for Gemma2
         assert!((config.embedding_scale - (512.0f32).sqrt()).abs() < 1e-6);
     }
 
@@ -708,9 +703,7 @@ mod tests {
 
     #[test]
     fn test_unsupported_architecture() {
-        let kv = vec![
-            ("general.architecture", kv_string("mamba")),
-        ];
+        let kv = vec![("general.architecture", kv_string("mamba"))];
         let (gguf, _tmp) = open_gguf_from_kv(&kv);
 
         let result = ModelConfig::from_gguf(&gguf);
@@ -726,9 +719,7 @@ mod tests {
     #[test]
     fn test_missing_architecture_key() {
         // No general.architecture key at all
-        let kv: Vec<(&str, Vec<u8>)> = vec![
-            ("some.other.key", kv_u32(42)),
-        ];
+        let kv: Vec<(&str, Vec<u8>)> = vec![("some.other.key", kv_u32(42))];
         let (gguf, _tmp) = open_gguf_from_kv(&kv);
 
         let result = ModelConfig::from_gguf(&gguf);
@@ -989,8 +980,16 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             InferenceError::Model(msg) => {
-                assert!(msg.contains("num_heads"), "error should mention num_heads: {}", msg);
-                assert!(msg.contains("num_kv_heads"), "error should mention num_kv_heads: {}", msg);
+                assert!(
+                    msg.contains("num_heads"),
+                    "error should mention num_heads: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("num_kv_heads"),
+                    "error should mention num_kv_heads: {}",
+                    msg
+                );
             }
             e => panic!("expected Model error, got {:?}", e),
         }
@@ -1012,8 +1011,16 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             InferenceError::Model(msg) => {
-                assert!(msg.contains("hidden_size"), "error should mention hidden_size: {}", msg);
-                assert!(msg.contains("num_heads"), "error should mention num_heads: {}", msg);
+                assert!(
+                    msg.contains("hidden_size"),
+                    "error should mention hidden_size: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("num_heads"),
+                    "error should mention num_heads: {}",
+                    msg
+                );
             }
             e => panic!("expected Model error, got {:?}", e),
         }
@@ -1095,7 +1102,10 @@ mod tests {
             ("gemma3.block_count", kv_u32(24)),
             ("gemma3.attention.head_count", kv_u32(16)),
             ("gemma3.feed_forward_length", kv_u32(3072)),
-            ("tokenizer.ggml.tokens", kv_str_array(&["hello", "world", "foo"])),
+            (
+                "tokenizer.ggml.tokens",
+                kv_str_array(&["hello", "world", "foo"]),
+            ),
         ];
         let (gguf, _tmp) = open_gguf_from_kv(&kv);
 

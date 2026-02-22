@@ -173,7 +173,9 @@ impl EmbeddingEngine {
         // Guard: zero-length sequences get a zero vector (shouldn't happen in
         // normal use, but prevents underflow in the Last path).
         if seq_len == 0 {
-            return self.backend.upload(&Tensor::new(vec![hidden_size], vec![0.0f32; hidden_size]));
+            return self
+                .backend
+                .upload(&Tensor::new(vec![hidden_size], vec![0.0f32; hidden_size]));
         }
 
         match self.config.pooling_type {
@@ -187,7 +189,8 @@ impl EmbeddingEngine {
                 let f32_tensor = host.to_f32();
                 let data = f32_tensor.as_f32();
                 let cls_data = data[..hidden_size].to_vec();
-                self.backend.upload(&Tensor::new(vec![hidden_size], cls_data))
+                self.backend
+                    .upload(&Tensor::new(vec![hidden_size], cls_data))
             }
             PoolingType::Last => {
                 // Extract last row.
@@ -196,7 +199,8 @@ impl EmbeddingEngine {
                 let data = f32_tensor.as_f32();
                 let start = (seq_len - 1) * hidden_size;
                 let last_data = data[start..start + hidden_size].to_vec();
-                self.backend.upload(&Tensor::new(vec![hidden_size], last_data))
+                self.backend
+                    .upload(&Tensor::new(vec![hidden_size], last_data))
             }
         }
     }
@@ -221,14 +225,14 @@ mod tests {
         fn new() -> Self {
             Self {
                 vocab: vec![
-                    "<pad>".to_string(),  // 0
-                    "<bos>".to_string(),  // 1
-                    "<eos>".to_string(),  // 2
-                    "hello".to_string(),  // 3
-                    "world".to_string(),  // 4
-                    "foo".to_string(),    // 5
-                    "bar".to_string(),    // 6
-                    "baz".to_string(),    // 7
+                    "<pad>".to_string(), // 0
+                    "<bos>".to_string(), // 1
+                    "<eos>".to_string(), // 2
+                    "hello".to_string(), // 3
+                    "world".to_string(), // 4
+                    "foo".to_string(),   // 5
+                    "bar".to_string(),   // 6
+                    "baz".to_string(),   // 7
                 ],
             }
         }
@@ -464,7 +468,10 @@ mod tests {
         let engine = build_engine(config);
         let emb_a = engine.embed("hello").unwrap();
         let emb_b = engine.embed("foo").unwrap();
-        assert_ne!(emb_a, emb_b, "Different texts should produce different embeddings");
+        assert_ne!(
+            emb_a, emb_b,
+            "Different texts should produce different embeddings"
+        );
     }
 
     #[test]
@@ -519,9 +526,7 @@ mod tests {
         let hidden = dt(Tensor::new(
             vec![3, 4],
             vec![
-                1.0, 2.0, 3.0, 4.0,
-                5.0, 6.0, 7.0, 8.0,
-                9.0, 10.0, 11.0, 12.0,
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
             ],
         ));
         let mask = vec![1.0, 1.0, 1.0];
@@ -573,10 +578,7 @@ mod tests {
         let engine = build_engine(config);
         let hidden = dt(Tensor::new(
             vec![2, 4],
-            vec![
-                2.0, 4.0, 6.0, 8.0,
-                4.0, 6.0, 8.0, 10.0,
-            ],
+            vec![2.0, 4.0, 6.0, 8.0, 4.0, 6.0, 8.0, 10.0],
         ));
         let mask = vec![1.0, 1.0];
         let pooled = engine.pool(&hidden, &mask);

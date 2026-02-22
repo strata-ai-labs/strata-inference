@@ -53,7 +53,10 @@ struct Args {
 fn validate_output_format(s: &str) -> Result<String, String> {
     match s {
         "text" | "json" => Ok(s.to_string()),
-        _ => Err(format!("Unknown output format '{}'. Options: text, json", s)),
+        _ => Err(format!(
+            "Unknown output format '{}'. Options: text, json",
+            s
+        )),
     }
 }
 
@@ -81,11 +84,7 @@ fn main() {
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let model_path = cli::model::resolve_model(&args.model)?;
-    let input = cli::read_input(
-        args.prompt.as_deref(),
-        args.file.as_deref(),
-        args.stdin,
-    )?;
+    let input = cli::read_input(args.prompt.as_deref(), args.file.as_deref(), args.stdin)?;
 
     let gguf = GgufFile::open(&model_path)?;
     let tokenizer = create_tokenizer_from_gguf(&gguf)?;

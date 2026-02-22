@@ -228,8 +228,7 @@ pub static CATALOG: &[CatalogEntry] = &[
 pub fn find_entry(name: &str) -> Option<&'static CatalogEntry> {
     let lower = name.to_lowercase();
     CATALOG.iter().find(|e| {
-        e.name.to_lowercase() == lower
-            || e.aliases.iter().any(|a| a.to_lowercase() == lower)
+        e.name.to_lowercase() == lower || e.aliases.iter().any(|a| a.to_lowercase() == lower)
     })
 }
 
@@ -239,7 +238,9 @@ pub fn find_entry(name: &str) -> Option<&'static CatalogEntry> {
 /// - `["miniLM"]` → exact match
 /// - `["qwen3", "8b"]` → tries "qwen3:8b" as combined name
 /// - `["qwen3", "8b", "q6_k"]` → tries "qwen3:8b" as name, "q6_k" as quant
-pub fn find_entry_by_parts<'a>(parts: &[&'a str]) -> Option<(&'static CatalogEntry, Option<&'a str>)> {
+pub fn find_entry_by_parts<'a>(
+    parts: &[&'a str],
+) -> Option<(&'static CatalogEntry, Option<&'a str>)> {
     match parts.len() {
         0 => None,
         1 => find_entry(parts[0]).map(|e| (e, None)),
@@ -389,7 +390,8 @@ mod tests {
                 assert!(
                     seen.insert(lower_alias.clone()),
                     "Duplicate alias '{}' in entry '{}'",
-                    alias, entry.name
+                    alias,
+                    entry.name
                 );
             }
         }
@@ -413,7 +415,9 @@ mod tests {
                 assert!(
                     variant.hf_file.ends_with(".gguf"),
                     "Variant '{}' of '{}' doesn't end with .gguf: {}",
-                    variant.name, entry.name, variant.hf_file
+                    variant.name,
+                    entry.name,
+                    variant.hf_file
                 );
             }
         }

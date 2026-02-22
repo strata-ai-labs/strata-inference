@@ -65,13 +65,7 @@ impl WordPieceTokenizer {
     /// * `sep_id` - Token ID for [SEP] (separator / end token).
     /// * `unk_id` - Token ID for [UNK] (unknown / out-of-vocabulary token).
     /// * `pad_id` - Token ID for [PAD] (padding token).
-    pub fn new(
-        tokens: Vec<String>,
-        cls_id: u32,
-        sep_id: u32,
-        unk_id: u32,
-        pad_id: u32,
-    ) -> Self {
+    pub fn new(tokens: Vec<String>, cls_id: u32, sep_id: u32, unk_id: u32, pad_id: u32) -> Self {
         let mut vocab = HashMap::with_capacity(tokens.len());
         for (i, tok) in tokens.iter().enumerate() {
             vocab.insert(tok.clone(), i as u32);
@@ -79,11 +73,7 @@ impl WordPieceTokenizer {
 
         debug!(
             vocab_size = tokens.len(),
-            cls_id,
-            sep_id,
-            unk_id,
-            pad_id,
-            "WordPiece tokenizer initialized"
+            cls_id, sep_id, unk_id, pad_id, "WordPiece tokenizer initialized"
         );
 
         Self {
@@ -588,7 +578,8 @@ fn is_punctuation(ch: char) -> bool {
     if (0x21..=0x2F).contains(&cp)       // ! " # $ % & ' ( ) * + , - . /
         || (0x3A..=0x40).contains(&cp)    // : ; < = > ? @
         || (0x5B..=0x60).contains(&cp)    // [ \ ] ^ _ `
-        || (0x7B..=0x7E).contains(&cp)    // { | } ~
+        || (0x7B..=0x7E).contains(&cp)
+    // { | } ~
     {
         return true;
     }
@@ -600,10 +591,7 @@ fn is_punctuation(ch: char) -> bool {
     }
 
     // General punctuation categories for non-ASCII.
-    matches!(
-        unicode_general_category_p(cp),
-        true
-    )
+    matches!(unicode_general_category_p(cp), true)
 }
 
 /// Rough check for Unicode General Category "P" (Punctuation) for non-ASCII chars.
@@ -657,20 +645,20 @@ mod tests {
     fn make_test_vocab() -> Vec<String> {
         let mut tokens: Vec<String> = (0..100).map(|_| "[PAD]".to_string()).collect();
         tokens[0] = "[PAD]".to_string();
-        tokens.push("[UNK]".to_string());        // 100
-        tokens.push("[CLS]".to_string());        // 101
-        tokens.push("[SEP]".to_string());        // 102
+        tokens.push("[UNK]".to_string()); // 100
+        tokens.push("[CLS]".to_string()); // 101
+        tokens.push("[SEP]".to_string()); // 102
         tokens.push("\u{2581}hello".to_string()); // 103
         tokens.push("\u{2581}world".to_string()); // 104
-        tokens.push("ing".to_string());          // 105
-        tokens.push("\u{2581}test".to_string());  // 106
-        tokens.push("\u{2581},".to_string());     // 107
-        tokens.push("\u{2581}the".to_string());   // 108
-        tokens.push("s".to_string());            // 109
-        tokens.push("\u{2581}run".to_string());   // 110
-        tokens.push("ning".to_string());         // 111
-        tokens.push("\u{2581}a".to_string());     // 112
-        tokens.push("\u{2581}cafe".to_string());  // 113
+        tokens.push("ing".to_string()); // 105
+        tokens.push("\u{2581}test".to_string()); // 106
+        tokens.push("\u{2581},".to_string()); // 107
+        tokens.push("\u{2581}the".to_string()); // 108
+        tokens.push("s".to_string()); // 109
+        tokens.push("\u{2581}run".to_string()); // 110
+        tokens.push("ning".to_string()); // 111
+        tokens.push("\u{2581}a".to_string()); // 112
+        tokens.push("\u{2581}cafe".to_string()); // 113
         tokens
     }
 
@@ -751,8 +739,8 @@ mod tests {
         let tok = make_tokenizer();
         // "cafe" with accent (U+0301 combining acute) should normalize to "cafe".
         let ids = tok.encode("caf\u{00E9}", true); // e-acute
-        // After NFD + strip combining marks: "cafe"
-        // [CLS], cafe=113, [SEP]
+                                                   // After NFD + strip combining marks: "cafe"
+                                                   // [CLS], cafe=113, [SEP]
         assert_eq!(ids, vec![101, 113, 102]);
     }
 
@@ -853,7 +841,7 @@ mod tests {
         let tok = make_tokenizer();
         assert_eq!(tok.bos_token_id(), Some(101)); // CLS
         assert_eq!(tok.eos_token_id(), Some(102)); // SEP
-        assert_eq!(tok.pad_token_id(), Some(0));   // PAD
+        assert_eq!(tok.pad_token_id(), Some(0)); // PAD
     }
 
     #[test]
@@ -1042,7 +1030,7 @@ mod tests {
         // CJK fullwidth punctuation
         assert!(is_punctuation('\u{FF01}')); // fullwidth exclamation
         assert!(is_punctuation('\u{3001}')); // CJK comma
-        // Regular letter should not be punctuation
+                                             // Regular letter should not be punctuation
         assert!(!is_punctuation('\u{4E00}')); // CJK character "one"
     }
 
@@ -1156,8 +1144,7 @@ mod tests {
         for c in b'a'..=b'z' {
             tokens.push(format!("\u{2581}{}", c as char));
         }
-        let tok = WordPieceTokenizer::new(tokens, 101, 102, 100, 0)
-            .with_max_seq_len(10);
+        let tok = WordPieceTokenizer::new(tokens, 101, 102, 100, 0).with_max_seq_len(10);
 
         // Create input with many words
         let input: String = (0..100).map(|_| "a").collect::<Vec<_>>().join(" ");

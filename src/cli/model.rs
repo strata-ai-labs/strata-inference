@@ -191,7 +191,9 @@ mod tests {
         std::env::set_var("STRATA_MODELS_DIR", dir.path());
 
         let entry = crate::registry::catalog::find_entry("qwen3:8b").unwrap();
-        let expected_file = entry.variants.iter()
+        let expected_file = entry
+            .variants
+            .iter()
             .find(|v| v.name == entry.default_quant)
             .unwrap()
             .hf_file;

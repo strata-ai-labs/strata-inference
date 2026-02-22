@@ -2,13 +2,13 @@
 
 use tracing::{debug, info};
 
+use super::config::{ModelArch, ModelConfig, PositionType};
 use crate::backend::{ComputeBackend, DeviceTensor};
 use crate::error::InferenceError;
-use crate::gguf::GgufFile;
 use crate::gguf::quant::GgufTensorType;
 use crate::gguf::tensor::load_tensor_by_name;
+use crate::gguf::GgufFile;
 use crate::tensor::{Tensor, TensorDtype};
-use super::config::{ModelArch, ModelConfig, PositionType};
 
 /// Weights for a single transformer layer.
 #[derive(Debug, Clone)]
@@ -142,7 +142,12 @@ fn load_tensor(
     // Convert GGUF dims (u64) to Tensor shape (usize). GGUF stores dims with
     // the innermost (fastest-varying) dimension first. For a 2D weight matrix
     // with GGUF dims [cols, rows], our row-major Tensor shape is [rows, cols].
-    let shape: Vec<usize> = gguf_tensor.shape.iter().rev().map(|&d| d as usize).collect();
+    let shape: Vec<usize> = gguf_tensor
+        .shape
+        .iter()
+        .rev()
+        .map(|&d| d as usize)
+        .collect();
 
     debug!(
         tensor = name,
@@ -233,9 +238,13 @@ fn split_qkv(
         let v_rows = n_kv;
         let total_rows = q_rows + k_rows + v_rows;
         assert_eq!(
-            raw.len(), total_rows * row_bytes,
+            raw.len(),
+            total_rows * row_bytes,
             "fused QKV quantized data: {} bytes, expected {} = {} rows * {} bytes/row",
-            raw.len(), total_rows * row_bytes, total_rows, row_bytes,
+            raw.len(),
+            total_rows * row_bytes,
+            total_rows,
+            row_bytes,
         );
 
         let q_end = q_rows * row_bytes;
@@ -257,9 +266,14 @@ fn split_qkv(
 
         let expected = (n_embd + 2 * n_kv) * n_embd;
         assert_eq!(
-            f32_data.len(), expected,
+            f32_data.len(),
+            expected,
             "fused QKV weight has {} elements, expected {} = ({} + 2*{}) * {}",
-            f32_data.len(), expected, n_embd, n_kv, n_embd,
+            f32_data.len(),
+            expected,
+            n_embd,
+            n_kv,
+            n_embd,
         );
 
         let q_data = f32_data[..n_embd * n_embd].to_vec();
@@ -293,7 +307,10 @@ fn split_qkv_bias(
         f32_data.len(),
         expected,
         "fused QKV bias has {} elements, expected {} = {} + 2*{}",
-        f32_data.len(), expected, n_embd, n_kv,
+        f32_data.len(),
+        expected,
+        n_embd,
+        n_kv,
     );
 
     let q_data = f32_data[..n_embd].to_vec();
@@ -334,9 +351,13 @@ fn split_gate_up(
 
         let total_rows = 2 * n_ff;
         assert_eq!(
-            raw.len(), total_rows * row_bytes,
+            raw.len(),
+            total_rows * row_bytes,
             "fused gate+up quantized data: {} bytes, expected {} = {} rows * {} bytes/row",
-            raw.len(), total_rows * row_bytes, total_rows, row_bytes,
+            raw.len(),
+            total_rows * row_bytes,
+            total_rows,
+            row_bytes,
         );
 
         let gate_end = n_ff * row_bytes;
@@ -344,7 +365,11 @@ fn split_gate_up(
         let up_data = raw[gate_end..].to_vec();
 
         (
-            backend.upload(&Tensor::from_quantized(vec![n_ff, n_embd], dtype, gate_data)),
+            backend.upload(&Tensor::from_quantized(
+                vec![n_ff, n_embd],
+                dtype,
+                gate_data,
+            )),
             backend.upload(&Tensor::from_quantized(vec![n_ff, n_embd], dtype, up_data)),
         )
     } else {
@@ -354,9 +379,13 @@ fn split_gate_up(
 
         let expected = 2 * n_ff * n_embd;
         assert_eq!(
-            f32_data.len(), expected,
+            f32_data.len(),
+            expected,
             "fused gate+up weight has {} elements, expected {} = 2 * {} * {}",
-            f32_data.len(), expected, n_ff, n_embd,
+            f32_data.len(),
+            expected,
+            n_ff,
+            n_embd,
         );
 
         let gate_data = f32_data[..n_ff * n_embd].to_vec();
@@ -439,11 +468,7 @@ impl ModelWeights {
                     backend,
                 )?);
                 let b = if config.has_bias {
-                    load_tensor_optional(
-                        gguf,
-                        &format!("{}.attn_norm.bias", prefix),
-                        backend,
-                    )?
+                    load_tensor_optional(gguf, &format!("{}.attn_norm.bias", prefix), backend)?
                 } else {
                     None
                 };
@@ -453,11 +478,7 @@ impl ModelWeights {
                     backend,
                 )?);
                 let fb = if config.has_bias {
-                    load_tensor_optional(
-                        gguf,
-                        &format!("{}.ffn_norm.bias", prefix),
-                        backend,
-                    )?
+                    load_tensor_optional(gguf, &format!("{}.ffn_norm.bias", prefix), backend)?
                 } else {
                     None
                 };
@@ -468,75 +489,45 @@ impl ModelWeights {
             };
 
             // Attention projections — try fused QKV first (GPT-2, StarCoder, etc.)
-            let (attn_q, attn_k, attn_v) =
-                if gguf.find_tensor(&format!("{}.attn_qkv.weight", prefix)).is_some() {
-                    let qkv = load_tensor(
-                        gguf,
-                        &format!("{}.attn_qkv.weight", prefix),
-                        backend,
-                    )?;
-                    split_qkv(&qkv, config, backend)
-                } else {
-                    let q = load_tensor(
-                        gguf,
-                        &format!("{}.attn_q.weight", prefix),
-                        backend,
-                    )?;
-                    let k = load_tensor(
-                        gguf,
-                        &format!("{}.attn_k.weight", prefix),
-                        backend,
-                    )?;
-                    let v = load_tensor(
-                        gguf,
-                        &format!("{}.attn_v.weight", prefix),
-                        backend,
-                    )?;
-                    (q, k, v)
-                };
-            let attn_output = load_tensor(
-                gguf,
-                &format!("{}.attn_output.weight", prefix),
-                backend,
-            )?;
+            let (attn_q, attn_k, attn_v) = if gguf
+                .find_tensor(&format!("{}.attn_qkv.weight", prefix))
+                .is_some()
+            {
+                let qkv = load_tensor(gguf, &format!("{}.attn_qkv.weight", prefix), backend)?;
+                split_qkv(&qkv, config, backend)
+            } else {
+                let q = load_tensor(gguf, &format!("{}.attn_q.weight", prefix), backend)?;
+                let k = load_tensor(gguf, &format!("{}.attn_k.weight", prefix), backend)?;
+                let v = load_tensor(gguf, &format!("{}.attn_v.weight", prefix), backend)?;
+                (q, k, v)
+            };
+            let attn_output =
+                load_tensor(gguf, &format!("{}.attn_output.weight", prefix), backend)?;
 
             // Attention biases — try fused QKV bias first, then separate
             let (attn_q_bias, attn_k_bias, attn_v_bias) = if config.has_bias {
-                if gguf.find_tensor(&format!("{}.attn_qkv.bias", prefix)).is_some() {
-                    let qkv_bias = load_tensor(
-                        gguf,
-                        &format!("{}.attn_qkv.bias", prefix),
-                        backend,
-                    )?;
+                if gguf
+                    .find_tensor(&format!("{}.attn_qkv.bias", prefix))
+                    .is_some()
+                {
+                    let qkv_bias =
+                        load_tensor(gguf, &format!("{}.attn_qkv.bias", prefix), backend)?;
                     let (q, k, v) = split_qkv_bias(&qkv_bias, config, backend);
                     (Some(q), Some(k), Some(v))
                 } else {
-                    let q = load_tensor_optional(
-                        gguf,
-                        &format!("{}.attn_q.bias", prefix),
-                        backend,
-                    )?;
-                    let k = load_tensor_optional(
-                        gguf,
-                        &format!("{}.attn_k.bias", prefix),
-                        backend,
-                    )?;
-                    let v = load_tensor_optional(
-                        gguf,
-                        &format!("{}.attn_v.bias", prefix),
-                        backend,
-                    )?;
+                    let q =
+                        load_tensor_optional(gguf, &format!("{}.attn_q.bias", prefix), backend)?;
+                    let k =
+                        load_tensor_optional(gguf, &format!("{}.attn_k.bias", prefix), backend)?;
+                    let v =
+                        load_tensor_optional(gguf, &format!("{}.attn_v.bias", prefix), backend)?;
                     (q, k, v)
                 }
             } else {
                 (None, None, None)
             };
             let attn_output_bias = if config.has_bias {
-                load_tensor_optional(
-                    gguf,
-                    &format!("{}.attn_output.bias", prefix),
-                    backend,
-                )?
+                load_tensor_optional(gguf, &format!("{}.attn_output.bias", prefix), backend)?
             } else {
                 None
             };
@@ -570,27 +561,18 @@ impl ModelWeights {
                 };
 
             // FFN projections
-            let ffn_up_raw = load_tensor(
-                gguf,
-                &format!("{}.ffn_up.weight", prefix),
-                backend,
-            )?;
-            let ffn_down = load_tensor(
-                gguf,
-                &format!("{}.ffn_down.weight", prefix),
-                backend,
-            )?;
+            let ffn_up_raw = load_tensor(gguf, &format!("{}.ffn_up.weight", prefix), backend)?;
+            let ffn_down = load_tensor(gguf, &format!("{}.ffn_down.weight", prefix), backend)?;
 
             // FFN gate (SwiGLU architectures only: Gemma, LLaMA, Phi-3, Mistral3)
             // Some models (Phi-3) fuse gate+up into a single ffn_up tensor.
             let (ffn_up, ffn_gate) = if config.has_ffn_gate {
-                if gguf.find_tensor(&format!("{}.ffn_gate.weight", prefix)).is_some() {
+                if gguf
+                    .find_tensor(&format!("{}.ffn_gate.weight", prefix))
+                    .is_some()
+                {
                     // Separate gate tensor — load normally
-                    let gate = load_tensor(
-                        gguf,
-                        &format!("{}.ffn_gate.weight", prefix),
-                        backend,
-                    )?;
+                    let gate = load_tensor(gguf, &format!("{}.ffn_gate.weight", prefix), backend)?;
                     (ffn_up_raw, Some(gate))
                 } else if ffn_up_raw.shape()[0] == 2 * config.ffn_hidden {
                     // No separate gate — ffn_up has doubled width (fused [gate, up])
@@ -602,9 +584,10 @@ impl ModelWeights {
                     (up, Some(gate))
                 } else {
                     // Neither separate gate nor fused — missing tensor
-                    return Err(InferenceError::TensorNotFound(
-                        format!("{}.ffn_gate.weight", prefix),
-                    ));
+                    return Err(InferenceError::TensorNotFound(format!(
+                        "{}.ffn_gate.weight",
+                        prefix
+                    )));
                 }
             } else {
                 (ffn_up_raw, None)
@@ -612,59 +595,52 @@ impl ModelWeights {
 
             // FFN biases (BERT only)
             let ffn_up_bias = if config.has_bias {
-                load_tensor_optional(
-                    gguf,
-                    &format!("{}.ffn_up.bias", prefix),
-                    backend,
-                )?
+                load_tensor_optional(gguf, &format!("{}.ffn_up.bias", prefix), backend)?
             } else {
                 None
             };
             let ffn_down_bias = if config.has_bias {
-                load_tensor_optional(
-                    gguf,
-                    &format!("{}.ffn_down.bias", prefix),
-                    backend,
-                )?
+                load_tensor_optional(gguf, &format!("{}.ffn_down.bias", prefix), backend)?
             } else {
                 None
             };
 
             // Per-head Q/K normalization (Gemma3, GemmaEmbedding, Qwen3)
-            let (attn_q_norm_w, attn_k_norm_w) =
-                if matches!(config.arch, ModelArch::Gemma3 | ModelArch::Gemma2 | ModelArch::GemmaEmbedding | ModelArch::Qwen3) {
-                    let qn = load_tensor_optional(
-                        gguf,
-                        &format!("{}.attn_q_norm.weight", prefix),
-                        backend,
-                    )?;
-                    let kn = load_tensor_optional(
-                        gguf,
-                        &format!("{}.attn_k_norm.weight", prefix),
-                        backend,
-                    )?;
-                    (qn, kn)
-                } else {
-                    (None, None)
-                };
+            let (attn_q_norm_w, attn_k_norm_w) = if matches!(
+                config.arch,
+                ModelArch::Gemma3
+                    | ModelArch::Gemma2
+                    | ModelArch::GemmaEmbedding
+                    | ModelArch::Qwen3
+            ) {
+                let qn =
+                    load_tensor_optional(gguf, &format!("{}.attn_q_norm.weight", prefix), backend)?;
+                let kn =
+                    load_tensor_optional(gguf, &format!("{}.attn_k_norm.weight", prefix), backend)?;
+                (qn, kn)
+            } else {
+                (None, None)
+            };
 
             // Post-projection norms (Gemma3, Gemma2, GemmaEmbedding)
-            let (attn_post_norm_w, ffn_post_norm_w) =
-                if matches!(config.arch, ModelArch::Gemma3 | ModelArch::Gemma2 | ModelArch::GemmaEmbedding) {
-                    let apn = load_tensor_optional(
-                        gguf,
-                        &format!("{}.post_attention_norm.weight", prefix),
-                        backend,
-                    )?;
-                    let fpn = load_tensor_optional(
-                        gguf,
-                        &format!("{}.post_ffw_norm.weight", prefix),
-                        backend,
-                    )?;
-                    (apn, fpn)
-                } else {
-                    (None, None)
-                };
+            let (attn_post_norm_w, ffn_post_norm_w) = if matches!(
+                config.arch,
+                ModelArch::Gemma3 | ModelArch::Gemma2 | ModelArch::GemmaEmbedding
+            ) {
+                let apn = load_tensor_optional(
+                    gguf,
+                    &format!("{}.post_attention_norm.weight", prefix),
+                    backend,
+                )?;
+                let fpn = load_tensor_optional(
+                    gguf,
+                    &format!("{}.post_ffw_norm.weight", prefix),
+                    backend,
+                )?;
+                (apn, fpn)
+            } else {
+                (None, None)
+            };
 
             layers.push(LayerWeights {
                 attn_norm_w,
@@ -772,9 +748,7 @@ mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
     use crate::gguf::quant::f32_to_f16;
-    use crate::model::config::{
-        Activation, ModelArch, NormType, PoolingType,
-    };
+    use crate::model::config::{Activation, ModelArch, NormType, PoolingType};
 
     // ====================================================================
     // GGUF builder helpers for tests
@@ -805,9 +779,7 @@ mod tests {
     ///
     /// Each tensor is specified as (name, dims, dtype_id, tensor_data_bytes).
     /// The function computes correct offsets and alignment automatically.
-    fn build_gguf_with_tensors(
-        tensors: &[(&str, &[u64], u32, &[u8])],
-    ) -> Vec<u8> {
+    fn build_gguf_with_tensors(tensors: &[(&str, &[u64], u32, &[u8])]) -> Vec<u8> {
         let alignment: u32 = 32;
         let mut buf = Vec::new();
 
@@ -855,8 +827,8 @@ mod tests {
         // Write tensor data with alignment padding between tensors
         for (i, &(_, _, _, data)) in tensors.iter().enumerate() {
             if i > 0 {
-                let aligned = align_up(buf.len() - aligned_header, alignment as usize)
-                    + aligned_header;
+                let aligned =
+                    align_up(buf.len() - aligned_header, alignment as usize) + aligned_header;
                 buf.resize(aligned, 0);
             }
             buf.extend_from_slice(data);
@@ -1073,17 +1045,47 @@ mod tests {
 
     #[test]
     fn test_gguf_dtype_to_tensor_dtype() {
-        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::F32).unwrap(), TensorDtype::F32);
-        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::F16).unwrap(), TensorDtype::F16);
-        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q8_0).unwrap(), TensorDtype::Q8_0);
-        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q4_0).unwrap(), TensorDtype::Q4_0);
+        assert_eq!(
+            gguf_dtype_to_tensor_dtype(GgufTensorType::F32).unwrap(),
+            TensorDtype::F32
+        );
+        assert_eq!(
+            gguf_dtype_to_tensor_dtype(GgufTensorType::F16).unwrap(),
+            TensorDtype::F16
+        );
+        assert_eq!(
+            gguf_dtype_to_tensor_dtype(GgufTensorType::Q8_0).unwrap(),
+            TensorDtype::Q8_0
+        );
+        assert_eq!(
+            gguf_dtype_to_tensor_dtype(GgufTensorType::Q4_0).unwrap(),
+            TensorDtype::Q4_0
+        );
         // New K-quant and non-K types should be supported
-        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q4_1).unwrap(), TensorDtype::Q4_1);
-        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q5_0).unwrap(), TensorDtype::Q5_0);
-        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q5_1).unwrap(), TensorDtype::Q5_1);
-        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q4K).unwrap(), TensorDtype::Q4_K);
-        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q5K).unwrap(), TensorDtype::Q5_K);
-        assert_eq!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q6K).unwrap(), TensorDtype::Q6_K);
+        assert_eq!(
+            gguf_dtype_to_tensor_dtype(GgufTensorType::Q4_1).unwrap(),
+            TensorDtype::Q4_1
+        );
+        assert_eq!(
+            gguf_dtype_to_tensor_dtype(GgufTensorType::Q5_0).unwrap(),
+            TensorDtype::Q5_0
+        );
+        assert_eq!(
+            gguf_dtype_to_tensor_dtype(GgufTensorType::Q5_1).unwrap(),
+            TensorDtype::Q5_1
+        );
+        assert_eq!(
+            gguf_dtype_to_tensor_dtype(GgufTensorType::Q4K).unwrap(),
+            TensorDtype::Q4_K
+        );
+        assert_eq!(
+            gguf_dtype_to_tensor_dtype(GgufTensorType::Q5K).unwrap(),
+            TensorDtype::Q5_K
+        );
+        assert_eq!(
+            gguf_dtype_to_tensor_dtype(GgufTensorType::Q6K).unwrap(),
+            TensorDtype::Q6_K
+        );
         // Truly unsupported types should error
         assert!(gguf_dtype_to_tensor_dtype(GgufTensorType::BF16).is_err());
         assert!(gguf_dtype_to_tensor_dtype(GgufTensorType::Q2K).is_err());
@@ -1096,7 +1098,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -1155,7 +1159,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -1184,7 +1190,9 @@ mod tests {
         let filtered: Vec<_> = tensor_specs
             .iter()
             .filter(|(name, _, _, _)| name != "blk.0.attn_q.weight")
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&filtered);
@@ -1260,7 +1268,12 @@ mod tests {
         tensor_specs.push(("blk.0.attn_q.weight", &hh_dims, 8, q8_weight_data.clone()));
         tensor_specs.push(("blk.0.attn_k.weight", &hh_dims, 8, q8_weight_data.clone()));
         tensor_specs.push(("blk.0.attn_v.weight", &hh_dims, 8, q8_weight_data.clone()));
-        tensor_specs.push(("blk.0.attn_output.weight", &hh_dims, 8, q8_weight_data.clone()));
+        tensor_specs.push((
+            "blk.0.attn_output.weight",
+            &hh_dims,
+            8,
+            q8_weight_data.clone(),
+        ));
 
         // Layer 0 FFN weights (F32)
         let ffn_up_dims = vec![h as u64, ffn as u64];
@@ -1293,7 +1306,10 @@ mod tests {
         assert_eq!(layer.attn_output.dtype(), TensorDtype::Q8_0);
 
         // F32 weights should remain F32
-        assert_eq!(layer.attn_norm_w.as_ref().unwrap().dtype(), TensorDtype::F32);
+        assert_eq!(
+            layer.attn_norm_w.as_ref().unwrap().dtype(),
+            TensorDtype::F32
+        );
         assert_eq!(layer.ffn_norm_w.as_ref().unwrap().dtype(), TensorDtype::F32);
         assert_eq!(weights.token_embedding.dtype(), TensorDtype::F32);
 
@@ -1359,36 +1375,108 @@ mod tests {
         let prefix = "blk.0";
 
         // attn_norm
-        tensor_specs.push((format!("{}.attn_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensor_specs.push((format!("{}.attn_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((
+            format!("{}.attn_norm.weight", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensor_specs.push((
+            format!("{}.attn_norm.bias", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
 
         // attn weights + biases
         for name in &["attn_q", "attn_k", "attn_v", "attn_output"] {
-            tensor_specs.push((format!("{}.{}.weight", prefix, name), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
-            tensor_specs.push((format!("{}.{}.bias", prefix, name), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+            tensor_specs.push((
+                format!("{}.{}.weight", prefix, name),
+                vec![h as u64, h as u64],
+                0,
+                f32_tensor_data(&vec![0.01f32; h * h]),
+            ));
+            tensor_specs.push((
+                format!("{}.{}.bias", prefix, name),
+                vec![h as u64],
+                0,
+                f32_tensor_data(&vec![0.0f32; h]),
+            ));
         }
 
         // attn_output_norm
-        tensor_specs.push((format!("{}.attn_output_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensor_specs.push((format!("{}.attn_output_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((
+            format!("{}.attn_output_norm.weight", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensor_specs.push((
+            format!("{}.attn_output_norm.bias", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
 
         // ffn_norm
-        tensor_specs.push((format!("{}.ffn_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensor_specs.push((format!("{}.ffn_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((
+            format!("{}.ffn_norm.weight", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensor_specs.push((
+            format!("{}.ffn_norm.bias", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
 
         // ffn_up + ffn_down (no gate for BERT)
-        tensor_specs.push((format!("{}.ffn_up.weight", prefix), vec![h as u64, ffn as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
-        tensor_specs.push((format!("{}.ffn_up.bias", prefix), vec![ffn as u64], 0, f32_tensor_data(&vec![0.0f32; ffn])));
-        tensor_specs.push((format!("{}.ffn_down.weight", prefix), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
-        tensor_specs.push((format!("{}.ffn_down.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((
+            format!("{}.ffn_up.weight", prefix),
+            vec![h as u64, ffn as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * ffn]),
+        ));
+        tensor_specs.push((
+            format!("{}.ffn_up.bias", prefix),
+            vec![ffn as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; ffn]),
+        ));
+        tensor_specs.push((
+            format!("{}.ffn_down.weight", prefix),
+            vec![ffn as u64, h as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * ffn]),
+        ));
+        tensor_specs.push((
+            format!("{}.ffn_down.bias", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
 
         // layer_output_norm
-        tensor_specs.push((format!("{}.layer_output_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensor_specs.push((format!("{}.layer_output_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((
+            format!("{}.layer_output_norm.weight", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensor_specs.push((
+            format!("{}.layer_output_norm.bias", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -1442,7 +1530,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -1543,7 +1633,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -1553,10 +1645,20 @@ mod tests {
         let backend = CpuBackend::new();
         let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
 
-        // F16 tensors should be loaded as F16
-        assert_eq!(weights.output_norm_w.as_ref().unwrap().dtype(), TensorDtype::F16);
-        assert_eq!(weights.layers[0].attn_norm_w.as_ref().unwrap().dtype(), TensorDtype::F16);
-        assert_eq!(weights.layers[0].ffn_norm_w.as_ref().unwrap().dtype(), TensorDtype::F16);
+        // F16 tensors are converted to F32 at upload time (neither CPU nor GPU
+        // has native F16 compute paths), so after loading the dtype should be F32.
+        assert_eq!(
+            weights.output_norm_w.as_ref().unwrap().dtype(),
+            TensorDtype::F32
+        );
+        assert_eq!(
+            weights.layers[0].attn_norm_w.as_ref().unwrap().dtype(),
+            TensorDtype::F32
+        );
+        assert_eq!(
+            weights.layers[0].ffn_norm_w.as_ref().unwrap().dtype(),
+            TensorDtype::F32
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -1588,7 +1690,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -1617,7 +1721,9 @@ mod tests {
         let filtered: Vec<_> = tensor_specs
             .iter()
             .filter(|(name, _, _, _)| !name.contains("ffn_gate"))
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&filtered);
@@ -1630,7 +1736,11 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             InferenceError::TensorNotFound(name) => {
-                assert!(name.contains("ffn_gate"), "expected ffn_gate in error, got: {}", name);
+                assert!(
+                    name.contains("ffn_gate"),
+                    "expected ffn_gate in error, got: {}",
+                    name
+                );
             }
             e => panic!("expected TensorNotFound, got {:?}", e),
         }
@@ -1641,9 +1751,7 @@ mod tests {
     #[test]
     fn test_load_tensor_helper_f32() {
         let data = f32_tensor_data(&[1.0, 2.0, 3.0, 4.0]);
-        let gguf_bytes = build_gguf_with_tensors(&[
-            ("test.weight", &[4], 0, &data),
-        ]);
+        let gguf_bytes = build_gguf_with_tensors(&[("test.weight", &[4], 0, &data)]);
         let path = write_temp_gguf("helper_f32", &gguf_bytes);
 
         let gguf = GgufFile::open(&path).unwrap();
@@ -1660,9 +1768,7 @@ mod tests {
     #[test]
     fn test_load_tensor_helper_q8_0() {
         let data = q8_0_tensor_data(32);
-        let gguf_bytes = build_gguf_with_tensors(&[
-            ("q8.weight", &[32], 8, &data),
-        ]);
+        let gguf_bytes = build_gguf_with_tensors(&[("q8.weight", &[32], 8, &data)]);
         let path = write_temp_gguf("helper_q8", &gguf_bytes);
 
         let gguf = GgufFile::open(&path).unwrap();
@@ -1678,9 +1784,7 @@ mod tests {
     #[test]
     fn test_load_tensor_optional_present() {
         let data = f32_tensor_data(&[1.0, 2.0]);
-        let gguf_bytes = build_gguf_with_tensors(&[
-            ("present.bias", &[2], 0, &data),
-        ]);
+        let gguf_bytes = build_gguf_with_tensors(&[("present.bias", &[2], 0, &data)]);
         let path = write_temp_gguf("opt_present", &gguf_bytes);
 
         let gguf = GgufFile::open(&path).unwrap();
@@ -1696,9 +1800,7 @@ mod tests {
     #[test]
     fn test_load_tensor_optional_absent() {
         let data = f32_tensor_data(&[1.0, 2.0]);
-        let gguf_bytes = build_gguf_with_tensors(&[
-            ("some.weight", &[2], 0, &data),
-        ]);
+        let gguf_bytes = build_gguf_with_tensors(&[("some.weight", &[2], 0, &data)]);
         let path = write_temp_gguf("opt_absent", &gguf_bytes);
 
         let gguf = GgufFile::open(&path).unwrap();
@@ -1755,9 +1857,7 @@ mod tests {
         // BF16 (dtype_id=30) is not supported for inference.
         // BF16: 2 bytes per element, block_size=1
         let data = vec![0u8; 64]; // 32 BF16 elements
-        let gguf_bytes = build_gguf_with_tensors(&[
-            ("bf16.weight", &[32], 30, &data),
-        ]);
+        let gguf_bytes = build_gguf_with_tensors(&[("bf16.weight", &[32], 30, &data)]);
         let path = write_temp_gguf("unsupported_dtype", &gguf_bytes);
 
         let gguf = GgufFile::open(&path).unwrap();
@@ -1775,9 +1875,7 @@ mod tests {
     fn test_load_q4_1_tensor() {
         // Q4_1 (dtype_id=3) is now supported. 20 bytes per block of 32 elements.
         let data = vec![0u8; 20]; // 1 Q4_1 block
-        let gguf_bytes = build_gguf_with_tensors(&[
-            ("q4_1.weight", &[32], 3, &data),
-        ]);
+        let gguf_bytes = build_gguf_with_tensors(&[("q4_1.weight", &[32], 3, &data)]);
         let path = write_temp_gguf("q4_1_load", &gguf_bytes);
 
         let gguf = GgufFile::open(&path).unwrap();
@@ -1802,24 +1900,71 @@ mod tests {
 
         let mut tensor_specs: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
 
-        tensor_specs.push(("token_embd.weight".to_string(), vec![h as u64, v as u64], 0, f32_tensor_data(&vec![0.1f32; v * h])));
-        tensor_specs.push(("position_embd.weight".to_string(), vec![h as u64, max_seq as u64], 0, f32_tensor_data(&vec![0.01f32; max_seq * h])));
+        tensor_specs.push((
+            "token_embd.weight".to_string(),
+            vec![h as u64, v as u64],
+            0,
+            f32_tensor_data(&vec![0.1f32; v * h]),
+        ));
+        tensor_specs.push((
+            "position_embd.weight".to_string(),
+            vec![h as u64, max_seq as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; max_seq * h]),
+        ));
         // NO output_norm.weight
 
         let prefix = "blk.0";
         for name in &["attn_q", "attn_k", "attn_v", "attn_output"] {
-            tensor_specs.push((format!("{}.{}.weight", prefix, name), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
+            tensor_specs.push((
+                format!("{}.{}.weight", prefix, name),
+                vec![h as u64, h as u64],
+                0,
+                f32_tensor_data(&vec![0.01f32; h * h]),
+            ));
         }
-        tensor_specs.push((format!("{}.attn_output_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensor_specs.push((format!("{}.attn_output_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
-        tensor_specs.push((format!("{}.ffn_up.weight", prefix), vec![h as u64, ffn as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
-        tensor_specs.push((format!("{}.ffn_down.weight", prefix), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
-        tensor_specs.push((format!("{}.layer_output_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensor_specs.push((format!("{}.layer_output_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((
+            format!("{}.attn_output_norm.weight", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensor_specs.push((
+            format!("{}.attn_output_norm.bias", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
+        tensor_specs.push((
+            format!("{}.ffn_up.weight", prefix),
+            vec![h as u64, ffn as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * ffn]),
+        ));
+        tensor_specs.push((
+            format!("{}.ffn_down.weight", prefix),
+            vec![ffn as u64, h as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * ffn]),
+        ));
+        tensor_specs.push((
+            format!("{}.layer_output_norm.weight", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensor_specs.push((
+            format!("{}.layer_output_norm.bias", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -1924,10 +2069,30 @@ mod tests {
             let prefix = format!("blk.{}", i);
 
             // Pre-norm weights + biases (GPT-2 uses LayerNorm before sublayers)
-            tensors.push((format!("{}.attn_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-            tensors.push((format!("{}.attn_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
-            tensors.push((format!("{}.ffn_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-            tensors.push((format!("{}.ffn_norm.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+            tensors.push((
+                format!("{}.attn_norm.weight", prefix),
+                vec![h as u64],
+                0,
+                f32_tensor_data(&vec![1.0f32; h]),
+            ));
+            tensors.push((
+                format!("{}.attn_norm.bias", prefix),
+                vec![h as u64],
+                0,
+                f32_tensor_data(&vec![0.0f32; h]),
+            ));
+            tensors.push((
+                format!("{}.ffn_norm.weight", prefix),
+                vec![h as u64],
+                0,
+                f32_tensor_data(&vec![1.0f32; h]),
+            ));
+            tensors.push((
+                format!("{}.ffn_norm.bias", prefix),
+                vec![h as u64],
+                0,
+                f32_tensor_data(&vec![0.0f32; h]),
+            ));
 
             // Fused QKV weight: GGUF dims [hidden_size, 3*hidden_size]
             // (reversed to [3*h, h] in our row-major layout)
@@ -1956,14 +2121,44 @@ mod tests {
             ));
 
             // attn_output + bias
-            tensors.push((format!("{}.attn_output.weight", prefix), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
-            tensors.push((format!("{}.attn_output.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+            tensors.push((
+                format!("{}.attn_output.weight", prefix),
+                vec![h as u64, h as u64],
+                0,
+                f32_tensor_data(&vec![0.01f32; h * h]),
+            ));
+            tensors.push((
+                format!("{}.attn_output.bias", prefix),
+                vec![h as u64],
+                0,
+                f32_tensor_data(&vec![0.0f32; h]),
+            ));
 
             // FFN up/down + biases (no gate for GPT-2)
-            tensors.push((format!("{}.ffn_up.weight", prefix), vec![h as u64, ffn as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
-            tensors.push((format!("{}.ffn_up.bias", prefix), vec![ffn as u64], 0, f32_tensor_data(&vec![0.0f32; ffn])));
-            tensors.push((format!("{}.ffn_down.weight", prefix), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
-            tensors.push((format!("{}.ffn_down.bias", prefix), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+            tensors.push((
+                format!("{}.ffn_up.weight", prefix),
+                vec![h as u64, ffn as u64],
+                0,
+                f32_tensor_data(&vec![0.01f32; h * ffn]),
+            ));
+            tensors.push((
+                format!("{}.ffn_up.bias", prefix),
+                vec![ffn as u64],
+                0,
+                f32_tensor_data(&vec![0.0f32; ffn]),
+            ));
+            tensors.push((
+                format!("{}.ffn_down.weight", prefix),
+                vec![ffn as u64, h as u64],
+                0,
+                f32_tensor_data(&vec![0.01f32; h * ffn]),
+            ));
+            tensors.push((
+                format!("{}.ffn_down.bias", prefix),
+                vec![h as u64],
+                0,
+                f32_tensor_data(&vec![0.0f32; h]),
+            ));
         }
 
         tensors
@@ -1977,7 +2172,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2000,9 +2197,15 @@ mod tests {
 
         // Pre-norm weights AND biases should be present (LayerNorm, not RMSNorm)
         assert!(layer.attn_norm_w.is_some());
-        assert!(layer.attn_norm_b.is_some(), "GPT-2 pre-norm must have attn_norm bias");
+        assert!(
+            layer.attn_norm_b.is_some(),
+            "GPT-2 pre-norm must have attn_norm bias"
+        );
         assert!(layer.ffn_norm_w.is_some());
-        assert!(layer.ffn_norm_b.is_some(), "GPT-2 pre-norm must have ffn_norm bias");
+        assert!(
+            layer.ffn_norm_b.is_some(),
+            "GPT-2 pre-norm must have ffn_norm bias"
+        );
 
         // Fused QKV should have been split into separate Q, K, V
         assert_eq!(layer.attn_q.shape(), &[32, 32]);
@@ -2041,7 +2244,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2059,10 +2264,7 @@ mod tests {
         let q_data = q_tensor.as_f32();
         assert_eq!(q_data.len(), h * h);
         for (i, &val) in q_data.iter().enumerate() {
-            assert!(
-                (val - 0.1).abs() < 1e-6,
-                "Q[{}] = {}, expected 0.1", i, val,
-            );
+            assert!((val - 0.1).abs() < 1e-6, "Q[{}] = {}, expected 0.1", i, val,);
         }
 
         // Download and verify K data (should be all 0.2)
@@ -2070,10 +2272,7 @@ mod tests {
         let k_data = k_tensor.as_f32();
         assert_eq!(k_data.len(), h * h);
         for (i, &val) in k_data.iter().enumerate() {
-            assert!(
-                (val - 0.2).abs() < 1e-6,
-                "K[{}] = {}, expected 0.2", i, val,
-            );
+            assert!((val - 0.2).abs() < 1e-6, "K[{}] = {}, expected 0.2", i, val,);
         }
 
         // Download and verify V data (should be all 0.3)
@@ -2081,10 +2280,7 @@ mod tests {
         let v_data = v_tensor.as_f32();
         assert_eq!(v_data.len(), h * h);
         for (i, &val) in v_data.iter().enumerate() {
-            assert!(
-                (val - 0.3).abs() < 1e-6,
-                "V[{}] = {}, expected 0.3", i, val,
-            );
+            assert!((val - 0.3).abs() < 1e-6, "V[{}] = {}, expected 0.3", i, val,);
         }
 
         std::fs::remove_file(&path).ok();
@@ -2098,7 +2294,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2115,20 +2313,32 @@ mod tests {
         let q_bias = backend.download(layer.attn_q_bias.as_ref().unwrap());
         let q_bias_data = q_bias.as_f32();
         assert_eq!(q_bias_data.len(), h);
-        assert!((q_bias_data[0] - 1.0).abs() < 1e-6, "Q bias[0] = {}", q_bias_data[0]);
+        assert!(
+            (q_bias_data[0] - 1.0).abs() < 1e-6,
+            "Q bias[0] = {}",
+            q_bias_data[0]
+        );
         assert!((q_bias_data[h - 1] - 1.0).abs() < 1e-6);
 
         // K bias = 2.0
         let k_bias = backend.download(layer.attn_k_bias.as_ref().unwrap());
         let k_bias_data = k_bias.as_f32();
         assert_eq!(k_bias_data.len(), h);
-        assert!((k_bias_data[0] - 2.0).abs() < 1e-6, "K bias[0] = {}", k_bias_data[0]);
+        assert!(
+            (k_bias_data[0] - 2.0).abs() < 1e-6,
+            "K bias[0] = {}",
+            k_bias_data[0]
+        );
 
         // V bias = 3.0
         let v_bias = backend.download(layer.attn_v_bias.as_ref().unwrap());
         let v_bias_data = v_bias.as_f32();
         assert_eq!(v_bias_data.len(), h);
-        assert!((v_bias_data[0] - 3.0).abs() < 1e-6, "V bias[0] = {}", v_bias_data[0]);
+        assert!(
+            (v_bias_data[0] - 3.0).abs() < 1e-6,
+            "V bias[0] = {}",
+            v_bias_data[0]
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -2146,16 +2356,56 @@ mod tests {
         let mut tensor_specs: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
 
         // Token + position embeddings (F32)
-        tensor_specs.push(("token_embd.weight".to_string(), vec![h as u64, v as u64], 0, f32_tensor_data(&vec![0.1f32; v * h])));
-        tensor_specs.push(("position_embd.weight".to_string(), vec![h as u64, max_seq as u64], 0, f32_tensor_data(&vec![0.01f32; max_seq * h])));
-        tensor_specs.push(("output_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensor_specs.push(("output_norm.bias".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((
+            "token_embd.weight".to_string(),
+            vec![h as u64, v as u64],
+            0,
+            f32_tensor_data(&vec![0.1f32; v * h]),
+        ));
+        tensor_specs.push((
+            "position_embd.weight".to_string(),
+            vec![h as u64, max_seq as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; max_seq * h]),
+        ));
+        tensor_specs.push((
+            "output_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensor_specs.push((
+            "output_norm.bias".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
 
         // Layer 0 norms
-        tensor_specs.push(("blk.0.attn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensor_specs.push(("blk.0.attn_norm.bias".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
-        tensor_specs.push(("blk.0.ffn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensor_specs.push(("blk.0.ffn_norm.bias".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((
+            "blk.0.attn_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensor_specs.push((
+            "blk.0.attn_norm.bias".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
+        tensor_specs.push((
+            "blk.0.ffn_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensor_specs.push((
+            "blk.0.ffn_norm.bias".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
 
         // Fused QKV as Q8_0 (dtype_id = 8)
         let qkv_elements = 3 * h * h;
@@ -2177,18 +2427,50 @@ mod tests {
         ));
 
         // attn_output + bias
-        tensor_specs.push(("blk.0.attn_output.weight".to_string(), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
-        tensor_specs.push(("blk.0.attn_output.bias".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((
+            "blk.0.attn_output.weight".to_string(),
+            vec![h as u64, h as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * h]),
+        ));
+        tensor_specs.push((
+            "blk.0.attn_output.bias".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
 
         // FFN
-        tensor_specs.push(("blk.0.ffn_up.weight".to_string(), vec![h as u64, ffn as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
-        tensor_specs.push(("blk.0.ffn_up.bias".to_string(), vec![ffn as u64], 0, f32_tensor_data(&vec![0.0f32; ffn])));
-        tensor_specs.push(("blk.0.ffn_down.weight".to_string(), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
-        tensor_specs.push(("blk.0.ffn_down.bias".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![0.0f32; h])));
+        tensor_specs.push((
+            "blk.0.ffn_up.weight".to_string(),
+            vec![h as u64, ffn as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * ffn]),
+        ));
+        tensor_specs.push((
+            "blk.0.ffn_up.bias".to_string(),
+            vec![ffn as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; ffn]),
+        ));
+        tensor_specs.push((
+            "blk.0.ffn_down.weight".to_string(),
+            vec![ffn as u64, h as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * ffn]),
+        ));
+        tensor_specs.push((
+            "blk.0.ffn_down.bias".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![0.0f32; h]),
+        ));
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2220,7 +2502,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2233,7 +2517,11 @@ mod tests {
         assert_eq!(weights.layers.len(), 3);
         for (i, layer) in weights.layers.iter().enumerate() {
             // Every layer should have pre-norm biases (LayerNorm)
-            assert!(layer.attn_norm_b.is_some(), "layer {} missing attn_norm_b", i);
+            assert!(
+                layer.attn_norm_b.is_some(),
+                "layer {} missing attn_norm_b",
+                i
+            );
             assert!(layer.ffn_norm_b.is_some(), "layer {} missing ffn_norm_b", i);
 
             // Every layer should have split QKV
@@ -2247,7 +2535,11 @@ mod tests {
             assert!(layer.attn_v_bias.is_some(), "layer {} missing V bias", i);
 
             // No gate
-            assert!(layer.ffn_gate.is_none(), "layer {} has unexpected ffn_gate", i);
+            assert!(
+                layer.ffn_gate.is_none(),
+                "layer {} has unexpected ffn_gate",
+                i
+            );
         }
 
         std::fs::remove_file(&path).ok();
@@ -2262,7 +2554,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2460,7 +2754,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2470,13 +2766,16 @@ mod tests {
         let backend = CpuBackend::new();
         let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
 
-        let h = config.hidden_size;   // 32
-        let ffn = config.ffn_hidden;  // 64
+        let h = config.hidden_size; // 32
+        let ffn = config.ffn_hidden; // 64
 
         let layer = &weights.layers[0];
 
         // ffn_gate should exist (split from fused tensor)
-        assert!(layer.ffn_gate.is_some(), "ffn_gate should exist after fused split");
+        assert!(
+            layer.ffn_gate.is_some(),
+            "ffn_gate should exist after fused split"
+        );
 
         // Shapes: gate=[ffn, h], up=[ffn, h], down=[h, ffn] (GGUF dims reversed)
         assert_eq!(layer.ffn_gate.as_ref().unwrap().shape(), &[ffn, h]);
@@ -2494,7 +2793,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2510,10 +2811,14 @@ mod tests {
         let gate_data = layer.ffn_gate.as_ref().unwrap().as_tensor().as_f32();
         let up_data = layer.ffn_up.as_tensor().as_f32();
 
-        assert!(gate_data.iter().all(|&v| (v - 1.0).abs() < 1e-6),
-            "gate data should be all 1.0");
-        assert!(up_data.iter().all(|&v| (v - 2.0).abs() < 1e-6),
-            "up data should be all 2.0");
+        assert!(
+            gate_data.iter().all(|&v| (v - 1.0).abs() < 1e-6),
+            "gate data should be all 1.0"
+        );
+        assert!(
+            up_data.iter().all(|&v| (v - 2.0).abs() < 1e-6),
+            "up data should be all 2.0"
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -2527,7 +2832,9 @@ mod tests {
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensor_specs
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2537,8 +2844,8 @@ mod tests {
         let backend = CpuBackend::new();
         let weights = ModelWeights::from_gguf(&gguf, &config, &backend).unwrap();
 
-        let h = config.hidden_size;   // 32
-        let ffn = config.ffn_hidden;  // 128
+        let h = config.hidden_size; // 32
+        let ffn = config.ffn_hidden; // 128
 
         let layer = &weights.layers[0];
         assert!(layer.ffn_gate.is_some());
@@ -2560,7 +2867,7 @@ mod tests {
         // Gate half: scale=1.0, quants=[0,1,...,31]
         // Up half: scale=2.0, quants=[0,1,...,31]
         let gate_rows = ffn; // 64 rows for gate
-        let up_rows = ffn;   // 64 rows for up
+        let up_rows = ffn; // 64 rows for up
         let gate_data = q8_0_tensor_data(gate_rows * h); // 64*32 = 2048 elements
         let up_data = {
             // Custom Q8_0 data with scale=2.0 to distinguish from gate
@@ -2601,8 +2908,18 @@ mod tests {
 
         // Layer tensors
         let prefix = "blk.0";
-        tensors.push((format!("{}.attn_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0; h])));
-        tensors.push((format!("{}.ffn_norm.weight", prefix), vec![h as u64], 0, f32_tensor_data(&vec![1.0; h])));
+        tensors.push((
+            format!("{}.attn_norm.weight", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0; h]),
+        ));
+        tensors.push((
+            format!("{}.ffn_norm.weight", prefix),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0; h]),
+        ));
 
         // Fused QKV
         let n_kv = config.num_kv_heads * config.head_dim;
@@ -2615,7 +2932,12 @@ mod tests {
         ));
 
         // Attention output
-        tensors.push((format!("{}.attn_output.weight", prefix), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01; h * h])));
+        tensors.push((
+            format!("{}.attn_output.weight", prefix),
+            vec![h as u64, h as u64],
+            0,
+            f32_tensor_data(&vec![0.01; h * h]),
+        ));
 
         // Fused gate+up as Q8_0: GGUF dtype=8 (Q8_0), dims [h, 2*ffn]
         tensors.push((
@@ -2626,11 +2948,18 @@ mod tests {
         ));
 
         // FFN down
-        tensors.push((format!("{}.ffn_down.weight", prefix), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01; h * ffn])));
+        tensors.push((
+            format!("{}.ffn_down.weight", prefix),
+            vec![ffn as u64, h as u64],
+            0,
+            f32_tensor_data(&vec![0.01; h * ffn]),
+        ));
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensors
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2643,7 +2972,10 @@ mod tests {
         let layer = &weights.layers[0];
 
         // Verify shapes
-        assert!(layer.ffn_gate.is_some(), "ffn_gate should exist after fused split");
+        assert!(
+            layer.ffn_gate.is_some(),
+            "ffn_gate should exist after fused split"
+        );
         assert_eq!(layer.ffn_gate.as_ref().unwrap().shape(), &[ffn, h]);
         assert_eq!(layer.ffn_up.shape(), &[ffn, h]);
 
@@ -2658,14 +2990,38 @@ mod tests {
         let up_f32 = up_deq.as_f32();
 
         // Gate: scale=1.0, values [0,1,...,31] repeated → first 32 values are 0.0, 1.0, ..., 31.0
-        assert!((gate_f32[0] - 0.0).abs() < 1e-3, "gate[0] should be 0.0, got {}", gate_f32[0]);
-        assert!((gate_f32[1] - 1.0).abs() < 1e-3, "gate[1] should be 1.0, got {}", gate_f32[1]);
-        assert!((gate_f32[31] - 31.0).abs() < 1e-3, "gate[31] should be 31.0, got {}", gate_f32[31]);
+        assert!(
+            (gate_f32[0] - 0.0).abs() < 1e-3,
+            "gate[0] should be 0.0, got {}",
+            gate_f32[0]
+        );
+        assert!(
+            (gate_f32[1] - 1.0).abs() < 1e-3,
+            "gate[1] should be 1.0, got {}",
+            gate_f32[1]
+        );
+        assert!(
+            (gate_f32[31] - 31.0).abs() < 1e-3,
+            "gate[31] should be 31.0, got {}",
+            gate_f32[31]
+        );
 
         // Up: scale=2.0, values [0,1,...,31] repeated → first 32 values are 0.0, 2.0, ..., 62.0
-        assert!((up_f32[0] - 0.0).abs() < 1e-3, "up[0] should be 0.0, got {}", up_f32[0]);
-        assert!((up_f32[1] - 2.0).abs() < 1e-3, "up[1] should be 2.0, got {}", up_f32[1]);
-        assert!((up_f32[31] - 62.0).abs() < 1e-3, "up[31] should be 62.0, got {}", up_f32[31]);
+        assert!(
+            (up_f32[0] - 0.0).abs() < 1e-3,
+            "up[0] should be 0.0, got {}",
+            up_f32[0]
+        );
+        assert!(
+            (up_f32[1] - 2.0).abs() < 1e-3,
+            "up[1] should be 2.0, got {}",
+            up_f32[1]
+        );
+        assert!(
+            (up_f32[31] - 62.0).abs() < 1e-3,
+            "up[31] should be 62.0, got {}",
+            up_f32[31]
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -2688,20 +3044,40 @@ mod tests {
         let mut tensors = Vec::new();
 
         // Token embedding
-        tensors.push(("token_embd.weight".to_string(), vec![h as u64, v as u64], 0, f32_tensor_data(&vec![0.1f32; v * h])));
+        tensors.push((
+            "token_embd.weight".to_string(),
+            vec![h as u64, v as u64],
+            0,
+            f32_tensor_data(&vec![0.1f32; v * h]),
+        ));
         // Output norm
-        tensors.push(("output_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensors.push((
+            "output_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
         // Layer norms
-        tensors.push(("blk.0.attn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensors.push(("blk.0.ffn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensors.push((
+            "blk.0.attn_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensors.push((
+            "blk.0.ffn_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
 
         // Fused QKV: [h, h + 2*n_kv] in GGUF dims → [h + 2*n_kv, h] rows
         // Fill Q region with 0.1, K with 0.2, V with 0.3
         let qkv_cols = h + 2 * n_kv; // 32 + 2*8 = 48
         let mut qkv_data = Vec::with_capacity(qkv_cols * h);
-        qkv_data.extend(std::iter::repeat(0.1f32).take(h * h));      // Q: h rows
-        qkv_data.extend(std::iter::repeat(0.2f32).take(n_kv * h));   // K: n_kv rows
-        qkv_data.extend(std::iter::repeat(0.3f32).take(n_kv * h));   // V: n_kv rows
+        qkv_data.extend(std::iter::repeat(0.1f32).take(h * h)); // Q: h rows
+        qkv_data.extend(std::iter::repeat(0.2f32).take(n_kv * h)); // K: n_kv rows
+        qkv_data.extend(std::iter::repeat(0.3f32).take(n_kv * h)); // V: n_kv rows
         tensors.push((
             "blk.0.attn_qkv.weight".to_string(),
             vec![h as u64, qkv_cols as u64],
@@ -2710,15 +3086,32 @@ mod tests {
         ));
 
         // Attention output
-        tensors.push(("blk.0.attn_output.weight".to_string(), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
+        tensors.push((
+            "blk.0.attn_output.weight".to_string(),
+            vec![h as u64, h as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * h]),
+        ));
         // Fused gate+up
-        tensors.push(("blk.0.ffn_up.weight".to_string(), vec![h as u64, (2 * ffn) as u64], 0, f32_tensor_data(&vec![0.01f32; 2 * ffn * h])));
+        tensors.push((
+            "blk.0.ffn_up.weight".to_string(),
+            vec![h as u64, (2 * ffn) as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; 2 * ffn * h]),
+        ));
         // FFN down
-        tensors.push(("blk.0.ffn_down.weight".to_string(), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
+        tensors.push((
+            "blk.0.ffn_down.weight".to_string(),
+            vec![ffn as u64, h as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * ffn]),
+        ));
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensors
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);
@@ -2772,10 +3165,30 @@ mod tests {
         let mut tensors = Vec::new();
 
         // Token embedding, norms (F32)
-        tensors.push(("token_embd.weight".to_string(), vec![h as u64, v as u64], 0, f32_tensor_data(&vec![0.1f32; v * h])));
-        tensors.push(("output_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensors.push(("blk.0.attn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
-        tensors.push(("blk.0.ffn_norm.weight".to_string(), vec![h as u64], 0, f32_tensor_data(&vec![1.0f32; h])));
+        tensors.push((
+            "token_embd.weight".to_string(),
+            vec![h as u64, v as u64],
+            0,
+            f32_tensor_data(&vec![0.1f32; v * h]),
+        ));
+        tensors.push((
+            "output_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensors.push((
+            "blk.0.attn_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
+        tensors.push((
+            "blk.0.ffn_norm.weight".to_string(),
+            vec![h as u64],
+            0,
+            f32_tensor_data(&vec![1.0f32; h]),
+        ));
 
         // Fused QKV as Q8_0: rows = qkv_cols = 48, cols = h = 32
         // Q8_0: block_size=32, so h=32 means 1 block per row, 34 bytes per row
@@ -2788,15 +3201,32 @@ mod tests {
         ));
 
         // Attention output (F32)
-        tensors.push(("blk.0.attn_output.weight".to_string(), vec![h as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * h])));
+        tensors.push((
+            "blk.0.attn_output.weight".to_string(),
+            vec![h as u64, h as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * h]),
+        ));
         // Fused gate+up (F32)
-        tensors.push(("blk.0.ffn_up.weight".to_string(), vec![h as u64, (2 * ffn) as u64], 0, f32_tensor_data(&vec![0.01f32; 2 * ffn * h])));
+        tensors.push((
+            "blk.0.ffn_up.weight".to_string(),
+            vec![h as u64, (2 * ffn) as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; 2 * ffn * h]),
+        ));
         // FFN down (F32)
-        tensors.push(("blk.0.ffn_down.weight".to_string(), vec![ffn as u64, h as u64], 0, f32_tensor_data(&vec![0.01f32; h * ffn])));
+        tensors.push((
+            "blk.0.ffn_down.weight".to_string(),
+            vec![ffn as u64, h as u64],
+            0,
+            f32_tensor_data(&vec![0.01f32; h * ffn]),
+        ));
 
         let tensor_refs: Vec<(&str, &[u64], u32, &[u8])> = tensors
             .iter()
-            .map(|(name, dims, dtype, data)| (name.as_str(), dims.as_slice(), *dtype, data.as_slice()))
+            .map(|(name, dims, dtype, data)| {
+                (name.as_str(), dims.as_slice(), *dtype, data.as_slice())
+            })
             .collect();
 
         let gguf_bytes = build_gguf_with_tensors(&tensor_refs);

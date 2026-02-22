@@ -1,11 +1,11 @@
 // M1: Tensor data loading and memory mapping from GGUF files
 
-use crate::error::InferenceError;
-use super::GgufFile;
 use super::quant::{
-    self, GgufTensorType, bytes_as_q4_0_blocks, bytes_as_q8_0_blocks,
-    dequantize_q4_0, dequantize_q8_0, f16_to_f32,
+    self, bytes_as_q4_0_blocks, bytes_as_q8_0_blocks, dequantize_q4_0, dequantize_q8_0, f16_to_f32,
+    GgufTensorType,
 };
+use super::GgufFile;
+use crate::error::InferenceError;
 
 // ---------------------------------------------------------------------------
 // GgufTensor — a named, typed view into memory-mapped tensor data
@@ -94,10 +94,7 @@ impl<'a> GgufTensor<'a> {
 ///
 /// The returned `GgufTensor` borrows directly from the file's memory map
 /// (zero-copy). The tensor data is validated for size consistency.
-pub fn load_tensor<'a>(
-    file: &'a GgufFile,
-    index: usize,
-) -> Result<GgufTensor<'a>, InferenceError> {
+pub fn load_tensor<'a>(file: &'a GgufFile, index: usize) -> Result<GgufTensor<'a>, InferenceError> {
     let infos = file.tensor_infos();
     let info = infos.get(index).ok_or_else(|| {
         InferenceError::TensorNotFound(format!("tensor index {} out of range", index))
@@ -331,10 +328,7 @@ mod tests {
     #[test]
     fn test_load_all_tensors() {
         // Build a file with one tensor
-        let data: Vec<u8> = [1.0f32, 2.0]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let data: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
         let (path, _) = build_gguf_with_tensor("all_tensor", &[2], 0, &data);
 
         let file = GgufFile::open(&path).unwrap();
@@ -415,7 +409,10 @@ mod tests {
     #[test]
     fn test_gguf_tensor_n_elements_and_sizes() {
         // Verify n_elements, byte_size, and expected_byte_size for various shapes.
-        let data: Vec<u8> = (1..=24).map(|i| i as f32).flat_map(|v| v.to_le_bytes()).collect();
+        let data: Vec<u8> = (1..=24)
+            .map(|i| i as f32)
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         let (path, _) = build_gguf_with_tensor("matrix24", &[6, 4], 0, &data);
 
         let file = GgufFile::open(&path).unwrap();
@@ -474,7 +471,9 @@ mod tests {
             assert!(
                 (f32_data[i] - expected).abs() < 1e-6,
                 "Q8_0 precision mismatch at {}: got {}, expected {}",
-                i, f32_data[i], expected
+                i,
+                f32_data[i],
+                expected
             );
         }
 
@@ -499,7 +498,9 @@ mod tests {
             assert!(
                 (f32_data[i] - expected).abs() < 1e-3,
                 "F16 special value mismatch at {}: got {}, expected {}",
-                i, f32_data[i], expected
+                i,
+                f32_data[i],
+                expected
             );
         }
 
@@ -510,7 +511,10 @@ mod tests {
     fn test_load_tensor_3d_shape() {
         // Verify that 3D tensors can be loaded.
         // 2x3x2 = 12 elements = 48 bytes
-        let data: Vec<u8> = (1..=12).map(|i| i as f32).flat_map(|v| v.to_le_bytes()).collect();
+        let data: Vec<u8> = (1..=12)
+            .map(|i| i as f32)
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         let (path, _) = build_gguf_with_tensor("tensor3d", &[2, 3, 2], 0, &data);
 
         let file = GgufFile::open(&path).unwrap();

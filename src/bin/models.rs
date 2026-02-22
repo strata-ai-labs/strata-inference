@@ -71,10 +71,7 @@ fn cmd_list(registry: &ModelRegistry, local_only: bool) -> Result<(), Box<dyn st
     }
 
     // Print header
-    println!(
-        "{:<16} {:<10} {:<10} {}",
-        "NAME", "TASK", "SIZE", "STATUS"
-    );
+    println!("{:<16} {:<10} {:<10} {}", "NAME", "TASK", "SIZE", "STATUS");
 
     for m in &models {
         let task = match m.task {

@@ -430,8 +430,7 @@ impl BpeTokenizer {
             }
 
             // Validate the bigram is still current (symbols haven't changed).
-            let current_text =
-                format!("{}{}", symbols[left_idx].text, symbols[right_idx].text);
+            let current_text = format!("{}{}", symbols[left_idx].text, symbols[right_idx].text);
             if current_text != bigram.text {
                 continue;
             }
@@ -547,7 +546,11 @@ impl BpeTokenizer {
                             single_codepoint_token_found = true;
                         }
                         // USER_DEFINED tokens get score 0.0 (more likely to be selected).
-                        let tt = self.token_types.get(token_id as usize).copied().unwrap_or(0);
+                        let tt = self
+                            .token_types
+                            .get(token_id as usize)
+                            .copied()
+                            .unwrap_or(0);
                         let token_score = if tt == TOKEN_TYPE_USER_DEFINED {
                             0.0
                         } else {
@@ -616,7 +619,11 @@ impl BpeTokenizer {
         if self.use_scores {
             // SentencePiece: look up the merged token's score.
             if let Some(&id) = self.token_to_id.get(&merged_text) {
-                let score = self.scores.get(id as usize).copied().unwrap_or(f32::NEG_INFINITY);
+                let score = self
+                    .scores
+                    .get(id as usize)
+                    .copied()
+                    .unwrap_or(f32::NEG_INFINITY);
                 Some(Bigram {
                     left: left as i32,
                     right: right as i32,
@@ -646,11 +653,7 @@ impl BpeTokenizer {
 
     /// Compare two bigrams for sorting. Lower rank/higher score comes last
     /// (so we can pop from the end of a sorted Vec).
-    fn compare_bigrams(
-        &self,
-        a: &Bigram,
-        b: &Bigram,
-    ) -> std::cmp::Ordering {
+    fn compare_bigrams(&self, a: &Bigram, b: &Bigram) -> std::cmp::Ordering {
         // We want the "best" merge at the end of the vec (popped last).
         // "Best" means lowest rank_or_neg_score value.
         // So we sort in reverse: higher values first, lower values last.
@@ -822,9 +825,8 @@ impl BpeTokenizer {
                                 let abs_pos = offset + pos;
                                 // Text before the match.
                                 if abs_pos > offset {
-                                    new_fragments.push(Fragment::RawText(
-                                        raw[offset..abs_pos].to_string(),
-                                    ));
+                                    new_fragments
+                                        .push(Fragment::RawText(raw[offset..abs_pos].to_string()));
                                 }
                                 // The matched token.
                                 new_fragments.push(Fragment::Token(*token_id));
@@ -939,10 +941,7 @@ impl Tokenizer for BpeTokenizer {
         for &id in ids {
             if let Some(token) = self.id_to_token.get(id as usize) {
                 // Skip special tokens during decoding.
-                if Some(id) == self.bos_id
-                    || Some(id) == self.eos_id
-                    || Some(id) == self.pad_id
-                {
+                if Some(id) == self.bos_id || Some(id) == self.eos_id || Some(id) == self.pad_id {
                     continue;
                 }
                 text.push_str(token);
@@ -974,8 +973,7 @@ impl Tokenizer for BpeTokenizer {
                         && lookahead[1] == 'x'
                         && lookahead[4] == '>'
                     {
-                        let hex_str: String =
-                            [lookahead[2], lookahead[3]].iter().collect();
+                        let hex_str: String = [lookahead[2], lookahead[3]].iter().collect();
                         if let Ok(byte_val) = u8::from_str_radix(&hex_str, 16) {
                             result.push(byte_val as char);
                             matched = true;
@@ -1179,12 +1177,7 @@ fn gpt_pre_tokenize(text: &str) -> Vec<String> {
 
 /// Accumulate characters of the same category into `piece`, handling
 /// contractions as split points. `i` is advanced past consumed characters.
-fn accumulate_word(
-    chars: &[char],
-    i: &mut usize,
-    piece: &mut String,
-    pieces: &mut Vec<String>,
-) {
+fn accumulate_word(chars: &[char], i: &mut usize, piece: &mut String, pieces: &mut Vec<String>) {
     let len = chars.len();
     if *i >= len {
         return;
@@ -1298,78 +1291,78 @@ mod tests {
     ///   _ + w -> _w -> _w + o -> _wo -> ... -> _world
     fn make_spm_tokenizer(add_bos: bool, add_eos: bool) -> BpeTokenizer {
         let tokens = vec![
-            "<pad>".to_string(),              // 0
-            "<bos>".to_string(),              // 1
-            "<eos>".to_string(),              // 2
-            "<unk>".to_string(),              // 3
-            SPIECE_UNDERLINE.to_string(),     // 4
-            "h".to_string(),                  // 5
-            "e".to_string(),                  // 6
-            "l".to_string(),                  // 7
-            "o".to_string(),                  // 8
-            "w".to_string(),                  // 9
-            "r".to_string(),                  // 10
-            "d".to_string(),                  // 11
-            "he".to_string(),                 // 12
-            "ll".to_string(),                 // 13
-            "lo".to_string(),                 // 14
-            "wo".to_string(),                 // 15
-            "or".to_string(),                 // 16
-            "rl".to_string(),                 // 17
-            "ld".to_string(),                 // 18
-            "hel".to_string(),                // 19
-            "hell".to_string(),               // 20
-            "hello".to_string(),              // 21
-            "wor".to_string(),                // 22
-            "worl".to_string(),               // 23
-            "world".to_string(),              // 24
-            format!("{}h", SPIECE_UNDERLINE), // 25
-            format!("{}w", SPIECE_UNDERLINE), // 26
-            format!("{}he", SPIECE_UNDERLINE),// 27
-            format!("{}wo", SPIECE_UNDERLINE),// 28
-            format!("{}hel", SPIECE_UNDERLINE),  // 29
-            format!("{}wor", SPIECE_UNDERLINE),  // 30
-            format!("{}hell", SPIECE_UNDERLINE), // 31
-            format!("{}worl", SPIECE_UNDERLINE), // 32
-            format!("{}hello", SPIECE_UNDERLINE),// 33
-            format!("{}world", SPIECE_UNDERLINE),// 34
+            "<pad>".to_string(),                  // 0
+            "<bos>".to_string(),                  // 1
+            "<eos>".to_string(),                  // 2
+            "<unk>".to_string(),                  // 3
+            SPIECE_UNDERLINE.to_string(),         // 4
+            "h".to_string(),                      // 5
+            "e".to_string(),                      // 6
+            "l".to_string(),                      // 7
+            "o".to_string(),                      // 8
+            "w".to_string(),                      // 9
+            "r".to_string(),                      // 10
+            "d".to_string(),                      // 11
+            "he".to_string(),                     // 12
+            "ll".to_string(),                     // 13
+            "lo".to_string(),                     // 14
+            "wo".to_string(),                     // 15
+            "or".to_string(),                     // 16
+            "rl".to_string(),                     // 17
+            "ld".to_string(),                     // 18
+            "hel".to_string(),                    // 19
+            "hell".to_string(),                   // 20
+            "hello".to_string(),                  // 21
+            "wor".to_string(),                    // 22
+            "worl".to_string(),                   // 23
+            "world".to_string(),                  // 24
+            format!("{}h", SPIECE_UNDERLINE),     // 25
+            format!("{}w", SPIECE_UNDERLINE),     // 26
+            format!("{}he", SPIECE_UNDERLINE),    // 27
+            format!("{}wo", SPIECE_UNDERLINE),    // 28
+            format!("{}hel", SPIECE_UNDERLINE),   // 29
+            format!("{}wor", SPIECE_UNDERLINE),   // 30
+            format!("{}hell", SPIECE_UNDERLINE),  // 31
+            format!("{}worl", SPIECE_UNDERLINE),  // 32
+            format!("{}hello", SPIECE_UNDERLINE), // 33
+            format!("{}world", SPIECE_UNDERLINE), // 34
         ];
         let scores = vec![
-            0.0,    // 0:  <pad>
-            0.0,    // 1:  <bos>
-            0.0,    // 2:  <eos>
-            0.0,    // 3:  <unk>
-            -5.0,   // 4:  _ (single char, low priority)
-            -5.0,   // 5:  h
-            -5.0,   // 6:  e
-            -5.0,   // 7:  l
-            -5.0,   // 8:  o
-            -5.0,   // 9:  w
-            -5.0,   // 10: r
-            -5.0,   // 11: d
-            -4.0,   // 12: he
-            -4.0,   // 13: ll
-            -4.0,   // 14: lo
-            -4.0,   // 15: wo
-            -4.0,   // 16: or
-            -4.0,   // 17: rl
-            -4.0,   // 18: ld
-            -3.0,   // 19: hel
-            -2.0,   // 20: hell
-            -1.0,   // 21: hello
-            -3.0,   // 22: wor
-            -2.0,   // 23: worl
-            -1.0,   // 24: world
-            -3.5,   // 25: _h
-            -3.5,   // 26: _w
-            -3.0,   // 27: _he
-            -3.0,   // 28: _wo
-            -2.5,   // 29: _hel
-            -2.5,   // 30: _wor
-            -1.5,   // 31: _hell
-            -1.5,   // 32: _worl
-            -0.5,   // 33: _hello
-            -0.5,   // 34: _world
+            0.0,  // 0:  <pad>
+            0.0,  // 1:  <bos>
+            0.0,  // 2:  <eos>
+            0.0,  // 3:  <unk>
+            -5.0, // 4:  _ (single char, low priority)
+            -5.0, // 5:  h
+            -5.0, // 6:  e
+            -5.0, // 7:  l
+            -5.0, // 8:  o
+            -5.0, // 9:  w
+            -5.0, // 10: r
+            -5.0, // 11: d
+            -4.0, // 12: he
+            -4.0, // 13: ll
+            -4.0, // 14: lo
+            -4.0, // 15: wo
+            -4.0, // 16: or
+            -4.0, // 17: rl
+            -4.0, // 18: ld
+            -3.0, // 19: hel
+            -2.0, // 20: hell
+            -1.0, // 21: hello
+            -3.0, // 22: wor
+            -2.0, // 23: worl
+            -1.0, // 24: world
+            -3.5, // 25: _h
+            -3.5, // 26: _w
+            -3.0, // 27: _he
+            -3.0, // 28: _wo
+            -2.5, // 29: _hel
+            -2.5, // 30: _wor
+            -1.5, // 31: _hell
+            -1.5, // 32: _worl
+            -0.5, // 33: _hello
+            -0.5, // 34: _world
         ];
         let token_types = vec![0u32; tokens.len()];
 
@@ -1383,8 +1376,8 @@ mod tests {
             Some(0),
             add_bos,
             add_eos,
-            true, // add_space_prefix
-            None, // pre_type (SentencePiece doesn't use regex)
+            true,  // add_space_prefix
+            None,  // pre_type (SentencePiece doesn't use regex)
             false, // use_viterbi
         )
     }
@@ -1406,34 +1399,34 @@ mod tests {
     ///   hel l → hell (rank 4) -- note: "hel" is a single token for this merge
     fn make_rank_tokenizer() -> BpeTokenizer {
         let tokens = vec![
-            "<pad>".to_string(),  // 0
-            "<bos>".to_string(),  // 1
-            "<eos>".to_string(),  // 2
-            "h".to_string(),      // 3
-            "e".to_string(),      // 4
-            "l".to_string(),      // 5
-            "o".to_string(),      // 6
-            "w".to_string(),      // 7
-            "r".to_string(),      // 8
-            "d".to_string(),      // 9
-            " ".to_string(),      // 10
-            "he".to_string(),     // 11
-            "ll".to_string(),     // 12
-            "lo".to_string(),     // 13
-            "hel".to_string(),    // 14
-            "hell".to_string(),   // 15
-            "hello".to_string(),  // 16
+            "<pad>".to_string(), // 0
+            "<bos>".to_string(), // 1
+            "<eos>".to_string(), // 2
+            "h".to_string(),     // 3
+            "e".to_string(),     // 4
+            "l".to_string(),     // 5
+            "o".to_string(),     // 6
+            "w".to_string(),     // 7
+            "r".to_string(),     // 8
+            "d".to_string(),     // 9
+            " ".to_string(),     // 10
+            "he".to_string(),    // 11
+            "ll".to_string(),    // 12
+            "lo".to_string(),    // 13
+            "hel".to_string(),   // 14
+            "hell".to_string(),  // 15
+            "hello".to_string(), // 16
         ];
         let scores = vec![0.0; tokens.len()];
         let token_types = vec![0u32; tokens.len()];
 
         let merges = vec![
-            "h e".to_string(),     // rank 0: h+e → he
-            "l l".to_string(),     // rank 1: l+l → ll
-            "l o".to_string(),     // rank 2: l+o → lo
-            "he l".to_string(),    // rank 3: he+l → hel
-            "hel l".to_string(),   // rank 4: hel+l → hell (note: uses merged token)
-            "hell o".to_string(),  // rank 5: hell+o → hello
+            "h e".to_string(),    // rank 0: h+e → he
+            "l l".to_string(),    // rank 1: l+l → ll
+            "l o".to_string(),    // rank 2: l+o → lo
+            "he l".to_string(),   // rank 3: he+l → hel
+            "hel l".to_string(),  // rank 4: hel+l → hell (note: uses merged token)
+            "hell o".to_string(), // rank 5: hell+o → hello
         ];
 
         BpeTokenizer::new(
@@ -1446,8 +1439,8 @@ mod tests {
             Some(0),
             false,
             false,
-            true, // add_space_prefix (not used for rank-based)
-            None, // pre_type
+            true,  // add_space_prefix (not used for rank-based)
+            None,  // pre_type
             false, // use_viterbi
         )
     }
@@ -1470,9 +1463,9 @@ mod tests {
     fn test_spm_encode_with_bos_eos() {
         let tok = make_spm_tokenizer(true, true);
         let ids = tok.encode("hello world", true);
-        assert_eq!(ids[0], 1);  // BOS
-        assert_eq!(*ids.last().unwrap(), 2);  // EOS
-        // Middle tokens should be _hello and _world.
+        assert_eq!(ids[0], 1); // BOS
+        assert_eq!(*ids.last().unwrap(), 2); // EOS
+                                             // Middle tokens should be _hello and _world.
         assert_eq!(ids[1], 33); // _hello
         assert_eq!(ids[2], 34); // _world
     }
@@ -1644,10 +1637,7 @@ mod tests {
     fn test_gpt_pre_tokenize_contractions() {
         let pieces = gpt_pre_tokenize("I'm don't we'll");
         // "I" + "'m" + " don" + "'t" + " we" + "'ll"
-        assert_eq!(
-            pieces,
-            vec!["I", "'m", " don", "'t", " we", "'ll"]
-        );
+        assert_eq!(pieces, vec!["I", "'m", " don", "'t", " we", "'ll"]);
     }
 
     #[test]
@@ -1714,8 +1704,8 @@ mod tests {
             Some(0),
             false,
             false,
-            true, // add_space_prefix
-            None, // pre_type
+            true,  // add_space_prefix
+            None,  // pre_type
             false, // use_viterbi
         );
 
@@ -1775,40 +1765,46 @@ mod tests {
         // but ▁-prefixed tokens like ▁world DO exist.
         // The Viterbi should still find ▁world from the input "a▁world".
         let tokens = vec![
-            "<pad>".to_string(),             // 0
-            "a".to_string(),                 // 1
-            "w".to_string(),                 // 2
-            "o".to_string(),                 // 3
-            "r".to_string(),                 // 4
-            "l".to_string(),                 // 5
-            "d".to_string(),                 // 6
-            "or".to_string(),                // 7
-            "ld".to_string(),                // 8
-            "world".to_string(),             // 9
+            "<pad>".to_string(),                  // 0
+            "a".to_string(),                      // 1
+            "w".to_string(),                      // 2
+            "o".to_string(),                      // 3
+            "r".to_string(),                      // 4
+            "l".to_string(),                      // 5
+            "d".to_string(),                      // 6
+            "or".to_string(),                     // 7
+            "ld".to_string(),                     // 8
+            "world".to_string(),                  // 9
             format!("{}world", SPIECE_UNDERLINE), // 10 ▁world
             format!("{}a", SPIECE_UNDERLINE),     // 11 ▁a
-            // NOTE: No standalone ▁ token!
+                                                  // NOTE: No standalone ▁ token!
         ];
         let scores: Vec<f32> = vec![
-            0.0,    // 0: <pad>
-            -5.0,   // 1: a
-            -5.0,   // 2: w
-            -5.0,   // 3: o
-            -5.0,   // 4: r
-            -5.0,   // 5: l
-            -5.0,   // 6: d
-            -4.0,   // 7: or
-            -4.0,   // 8: ld
-            -2.0,   // 9: world
-            -1.0,   // 10: ▁world
-            -1.0,   // 11: ▁a
+            0.0,  // 0: <pad>
+            -5.0, // 1: a
+            -5.0, // 2: w
+            -5.0, // 3: o
+            -5.0, // 4: r
+            -5.0, // 5: l
+            -5.0, // 6: d
+            -4.0, // 7: or
+            -4.0, // 8: ld
+            -2.0, // 9: world
+            -1.0, // 10: ▁world
+            -1.0, // 11: ▁a
         ];
         let token_types = vec![0u32; tokens.len()];
 
         let tok = BpeTokenizer::new(
-            tokens, scores, token_types, vec![],
-            None, None, Some(0),
-            false, false,
+            tokens,
+            scores,
+            token_types,
+            vec![],
+            None,
+            None,
+            Some(0),
+            false,
+            false,
             false, // add_space_prefix = false (Gemma style)
             None,
             true, // use_viterbi = true (UGM/T5 mode)
@@ -1852,9 +1848,16 @@ mod tests {
         }
 
         BpeTokenizer::new(
-            tokens, scores, token_types, vec![],
-            Some(1), Some(2), None,
-            false, false, false,
+            tokens,
+            scores,
+            token_types,
+            vec![],
+            Some(1),
+            Some(2),
+            None,
+            false,
+            false,
+            false,
             None,
             true, // use_viterbi
         )
@@ -1866,8 +1869,8 @@ mod tests {
         // "a" (-1) + "b" (-1) = -2 total (much better).
         // Viterbi must NOT be short-circuited by whole-word lookup.
         let tok = make_viterbi_tokenizer(vec![
-            ("a", -1.0, 1),   // 3
-            ("b", -1.0, 1),   // 4
+            ("a", -1.0, 1),     // 3
+            ("b", -1.0, 1),     // 4
             ("ab", -1000.0, 1), // 5
         ]);
         let ids = tok.viterbi_encode("ab");
@@ -1884,7 +1887,11 @@ mod tests {
             ("ab", -1.0, 1), // 5
         ]);
         let ids = tok.viterbi_encode("ab");
-        assert_eq!(ids, vec![5], "Viterbi should prefer ab when it scores better");
+        assert_eq!(
+            ids,
+            vec![5],
+            "Viterbi should prefer ab when it scores better"
+        );
     }
 
     #[test]
@@ -1943,12 +1950,16 @@ mod tests {
     fn test_viterbi_multibyte_utf8() {
         // Test with multi-byte UTF-8: é (2 bytes: 0xC3 0xA9) and 中 (3 bytes).
         let tok = make_viterbi_tokenizer(vec![
-            ("\u{00e9}", -1.0, 1),    // 3: é (2-byte UTF-8)
-            ("\u{4e2d}", -1.0, 1),    // 4: 中 (3-byte UTF-8)
-            ("a", -1.0, 1),           // 5
+            ("\u{00e9}", -1.0, 1), // 3: é (2-byte UTF-8)
+            ("\u{4e2d}", -1.0, 1), // 4: 中 (3-byte UTF-8)
+            ("a", -1.0, 1),        // 5
         ]);
         let ids = tok.viterbi_encode("a\u{00e9}\u{4e2d}");
-        assert_eq!(ids, vec![5, 3, 4], "Multi-byte UTF-8 codepoints should tokenize correctly");
+        assert_eq!(
+            ids,
+            vec![5, 3, 4],
+            "Multi-byte UTF-8 codepoints should tokenize correctly"
+        );
     }
 
     #[test]
@@ -1959,7 +1970,11 @@ mod tests {
         ]);
         // 中 (3 bytes) is unknown. Should be one UNK, not three.
         let ids = tok.viterbi_encode("a\u{4e2d}");
-        assert_eq!(ids, vec![3, 0], "Unknown multi-byte char should be single UNK");
+        assert_eq!(
+            ids,
+            vec![3, 0],
+            "Unknown multi-byte char should be single UNK"
+        );
     }
 
     #[test]
@@ -1967,13 +1982,17 @@ mod tests {
         // USER_DEFINED tokens (type=4) get score 0.0 regardless of stored score.
         // Since normal scores are negative, USER_DEFINED tokens are strongly preferred.
         let tok = make_viterbi_tokenizer(vec![
-            ("a", -1.0, 1),             // 3: normal
-            ("b", -1.0, 1),             // 4: normal
-            ("ab", -100.0, 4),          // 5: USER_DEFINED (type=4), stored score=-100
+            ("a", -1.0, 1),    // 3: normal
+            ("b", -1.0, 1),    // 4: normal
+            ("ab", -100.0, 4), // 5: USER_DEFINED (type=4), stored score=-100
         ]);
         // USER_DEFINED "ab" gets effective score 0.0, which beats a(-1)+b(-1)=-2.
         let ids = tok.viterbi_encode("ab");
-        assert_eq!(ids, vec![5], "USER_DEFINED token should use score 0.0 and win");
+        assert_eq!(
+            ids,
+            vec![5],
+            "USER_DEFINED token should use score 0.0 and win"
+        );
     }
 
     #[test]
@@ -2057,7 +2076,7 @@ mod tests {
         // since our test vocab lacks <0xNN> tokens).
         let tok = make_spm_tokenizer(false, false);
         let ids = tok.encode("\u{4e16}", false); // Chinese character "shi" (world)
-        // Should not panic, regardless of result
+                                                 // Should not panic, regardless of result
         let _ = ids;
     }
 
@@ -2183,20 +2202,26 @@ mod tests {
     fn test_rank_encode_with_special_tokens() {
         // Create a rank tokenizer with BOS/EOS enabled.
         let tokens = vec![
-            "<pad>".to_string(),  // 0
-            "<bos>".to_string(),  // 1
-            "<eos>".to_string(),  // 2
-            "h".to_string(),      // 3
-            "e".to_string(),      // 4
+            "<pad>".to_string(), // 0
+            "<bos>".to_string(), // 1
+            "<eos>".to_string(), // 2
+            "h".to_string(),     // 3
+            "e".to_string(),     // 4
         ];
         let scores = vec![0.0; tokens.len()];
         let token_types = vec![0u32; tokens.len()];
         let tok = BpeTokenizer::new(
-            tokens, scores, token_types, vec![],
-            Some(1), Some(2), Some(0),
-            true, true,
-            true, // add_space_prefix
-            None, // pre_type
+            tokens,
+            scores,
+            token_types,
+            vec![],
+            Some(1),
+            Some(2),
+            Some(0),
+            true,
+            true,
+            true,  // add_space_prefix
+            None,  // pre_type
             false, // use_viterbi
         );
         let ids = tok.encode("h", true);
@@ -2255,11 +2280,17 @@ mod tests {
     fn test_bpe_no_bos_eos_configured() {
         let tokens = vec!["a".to_string(), "b".to_string()];
         let tok = BpeTokenizer::new(
-            tokens, vec![0.0; 2], vec![0; 2], vec![],
-            None, None, None,
-            false, false,
-            true, // add_space_prefix
-            None, // pre_type
+            tokens,
+            vec![0.0; 2],
+            vec![0; 2],
+            vec![],
+            None,
+            None,
+            None,
+            false,
+            false,
+            true,  // add_space_prefix
+            None,  // pre_type
             false, // use_viterbi
         );
         assert_eq!(tok.bos_token_id(), None);
@@ -2294,7 +2325,10 @@ mod tests {
 
         // Space (0x20) is NOT in the direct range, so it maps to a codepoint >= 256.
         let space_char = BYTE_TO_UNICODE[0x20].chars().next().unwrap();
-        assert!(space_char as u32 >= 256, "space should map to extended codepoint");
+        assert!(
+            space_char as u32 >= 256,
+            "space should map to extended codepoint"
+        );
         // Specifically, 0x20 is the 33rd non-direct byte (bytes 0x00..=0x20),
         // so it maps to 256 + 32 = 288 = 'Ġ'.
         assert_eq!(space_char, 'Ġ');
@@ -2309,7 +2343,12 @@ mod tests {
         for byte in 0u8..=255 {
             let encoded = &BYTE_TO_UNICODE[byte as usize];
             let decoded = UNICODE_TO_BYTE.get(encoded).copied();
-            assert_eq!(decoded, Some(byte), "roundtrip failed for byte {:#04x}", byte);
+            assert_eq!(
+                decoded,
+                Some(byte),
+                "roundtrip failed for byte {:#04x}",
+                byte
+            );
         }
     }
 
@@ -2360,22 +2399,22 @@ mod tests {
         let token_types = vec![0u32; tokens.len()];
 
         let merges = vec![
-            "h e".to_string(),       // rank 0
-            "l l".to_string(),       // rank 1
-            "l o".to_string(),       // rank 2
-            "he l".to_string(),      // rank 3
-            "hel l".to_string(),     // rank 4
-            "hell o".to_string(),    // rank 5
-            "w o".to_string(),       // rank 6
-            "wo r".to_string(),      // rank 7
-            "wor l".to_string(),     // rank 8
-            "worl d".to_string(),    // rank 9
-            "Ġ h".to_string(),       // rank 10
-            "Ġ w".to_string(),       // rank 11
-            "Ġh ello".to_string(),   // rank 12  (not actually used due to how BPE chains work)
-            "Ġ hello".to_string(),   // rank 13
-            "Ġ world".to_string(),   // rank 14
-            "Ġw orld".to_string(),   // rank 15
+            "h e".to_string(),     // rank 0
+            "l l".to_string(),     // rank 1
+            "l o".to_string(),     // rank 2
+            "he l".to_string(),    // rank 3
+            "hel l".to_string(),   // rank 4
+            "hell o".to_string(),  // rank 5
+            "w o".to_string(),     // rank 6
+            "wo r".to_string(),    // rank 7
+            "wor l".to_string(),   // rank 8
+            "worl d".to_string(),  // rank 9
+            "Ġ h".to_string(),     // rank 10
+            "Ġ w".to_string(),     // rank 11
+            "Ġh ello".to_string(), // rank 12  (not actually used due to how BPE chains work)
+            "Ġ hello".to_string(), // rank 13
+            "Ġ world".to_string(), // rank 14
+            "Ġw orld".to_string(), // rank 15
         ];
 
         BpeTokenizer::new(
@@ -2388,8 +2427,8 @@ mod tests {
             Some(0),
             false,
             false,
-            true, // add_space_prefix (not used for rank-based)
-            None, // pre_type (use hand-written pre-tokenizer for tests)
+            true,  // add_space_prefix (not used for rank-based)
+            None,  // pre_type (use hand-written pre-tokenizer for tests)
             false, // use_viterbi
         )
     }
@@ -2453,7 +2492,7 @@ mod tests {
         tokens.push("<pad>".to_string()); // 0
         tokens.push("<bos>".to_string()); // 1
         tokens.push("<eos>".to_string()); // 2
-        // Add byte-encoded tokens for all 256 bytes.
+                                          // Add byte-encoded tokens for all 256 bytes.
         for byte in 0u8..=255 {
             tokens.push(BYTE_TO_UNICODE[byte as usize].clone());
         }
@@ -2471,8 +2510,8 @@ mod tests {
             Some(0),
             false,
             false,
-            true, // add_space_prefix (not used for rank-based)
-            None, // pre_type
+            true,  // add_space_prefix (not used for rank-based)
+            None,  // pre_type
             false, // use_viterbi
         );
 
@@ -2525,12 +2564,27 @@ mod tests {
     #[test]
     fn test_pretokenizer_regex_compiles() {
         // Verify all patterns for all types compile without error.
-        for pre_type in &["default", "gpt-2", "llama3", "llama-bpe", "deepseek-llm",
-                          "deepseek-coder", "qwen2", "command-r", "falcon"] {
+        for pre_type in &[
+            "default",
+            "gpt-2",
+            "llama3",
+            "llama-bpe",
+            "deepseek-llm",
+            "deepseek-coder",
+            "qwen2",
+            "command-r",
+            "falcon",
+        ] {
             let patterns = pretokenizer_regex_for(pre_type).unwrap();
             for (i, pattern) in patterns.iter().enumerate() {
                 let re = Regex::new(pattern);
-                assert!(re.is_ok(), "Failed to compile pattern #{} for {}: {:?}", i, pre_type, re.err());
+                assert!(
+                    re.is_ok(),
+                    "Failed to compile pattern #{} for {}: {:?}",
+                    i,
+                    pre_type,
+                    re.err()
+                );
             }
         }
     }
@@ -2699,22 +2753,22 @@ mod tests {
         let token_types = vec![0u32; tokens.len()];
 
         let merges = vec![
-            "h e".to_string(),       // rank 0
-            "l l".to_string(),       // rank 1
-            "l o".to_string(),       // rank 2
-            "he l".to_string(),      // rank 3
-            "hel l".to_string(),     // rank 4
-            "hell o".to_string(),    // rank 5
-            "w o".to_string(),       // rank 6
-            "wo r".to_string(),      // rank 7
-            "wor l".to_string(),     // rank 8
-            "worl d".to_string(),    // rank 9
-            "Ġ h".to_string(),       // rank 10
-            "Ġ w".to_string(),       // rank 11
-            "Ġh ello".to_string(),   // rank 12
-            "Ġ hello".to_string(),   // rank 13
-            "Ġ world".to_string(),   // rank 14
-            "Ġw orld".to_string(),   // rank 15
+            "h e".to_string(),     // rank 0
+            "l l".to_string(),     // rank 1
+            "l o".to_string(),     // rank 2
+            "he l".to_string(),    // rank 3
+            "hel l".to_string(),   // rank 4
+            "hell o".to_string(),  // rank 5
+            "w o".to_string(),     // rank 6
+            "wo r".to_string(),    // rank 7
+            "wor l".to_string(),   // rank 8
+            "worl d".to_string(),  // rank 9
+            "Ġ h".to_string(),     // rank 10
+            "Ġ w".to_string(),     // rank 11
+            "Ġh ello".to_string(), // rank 12
+            "Ġ hello".to_string(), // rank 13
+            "Ġ world".to_string(), // rank 14
+            "Ġw orld".to_string(), // rank 15
         ];
 
         BpeTokenizer::new(
@@ -2751,40 +2805,54 @@ mod tests {
         let token_types = vec![0, 3, 3, 0, 4]; // NORMAL, CONTROL, CONTROL, NORMAL, USER_DEFINED
 
         let tok = BpeTokenizer::new(
-            tokens, scores, token_types, vec![],
-            Some(1), Some(2), Some(0),
-            false, false, true,
+            tokens,
+            scores,
+            token_types,
+            vec![],
+            Some(1),
+            Some(2),
+            Some(0),
+            false,
+            false,
+            true,
             None,
             false, // use_viterbi
         );
 
         // CONTROL + USER_DEFINED tokens should all be in special_tokens.
         assert_eq!(tok.special_tokens.len(), 3); // <s>, </s>, <special>
-        // Verify is_control flags.
+                                                 // Verify is_control flags.
         let control_count = tok.special_tokens.iter().filter(|(_, _, c)| *c).count();
         let user_defined_count = tok.special_tokens.iter().filter(|(_, _, c)| !*c).count();
-        assert_eq!(control_count, 2);     // <s>, </s>
+        assert_eq!(control_count, 2); // <s>, </s>
         assert_eq!(user_defined_count, 1); // <special>
     }
 
     #[test]
     fn test_control_token_partitioning_with_include() {
         let tokens = vec![
-            "<pad>".to_string(),     // 0
-            "<s>".to_string(),       // 1 (CONTROL)
-            "</s>".to_string(),      // 2 (CONTROL)
-            "h".to_string(),         // 3
-            "e".to_string(),         // 4
-            "l".to_string(),         // 5
-            "o".to_string(),         // 6
+            "<pad>".to_string(), // 0
+            "<s>".to_string(),   // 1 (CONTROL)
+            "</s>".to_string(),  // 2 (CONTROL)
+            "h".to_string(),     // 3
+            "e".to_string(),     // 4
+            "l".to_string(),     // 5
+            "o".to_string(),     // 6
         ];
         let scores = vec![0.0; tokens.len()];
         let token_types = vec![0, 3, 3, 0, 0, 0, 0];
 
         let tok = BpeTokenizer::new(
-            tokens, scores, token_types, vec![],
-            Some(1), Some(2), Some(0),
-            false, false, false, // no space prefix
+            tokens,
+            scores,
+            token_types,
+            vec![],
+            Some(1),
+            Some(2),
+            Some(0),
+            false,
+            false,
+            false, // no space prefix
             None,
             false, // use_viterbi
         );
@@ -2800,7 +2868,7 @@ mod tests {
             }
         }
         assert_eq!(token_count, 1); // <s>
-        assert_eq!(raw_count, 2);   // "hello", "world"
+        assert_eq!(raw_count, 2); // "hello", "world"
     }
 
     #[test]
@@ -2820,9 +2888,16 @@ mod tests {
         let token_types = vec![0, 3, 3, 0, 0, 0, 0, 4];
 
         let tok = BpeTokenizer::new(
-            tokens, scores, token_types, vec![],
-            Some(1), Some(2), Some(0),
-            false, false, false,
+            tokens,
+            scores,
+            token_types,
+            vec![],
+            Some(1),
+            Some(2),
+            Some(0),
+            false,
+            false,
+            false,
             None,
             false, // use_viterbi
         );
@@ -2865,18 +2940,25 @@ mod tests {
         // Test NFC normalization through the full encode path with CONTROL tokens.
         // This exercises spm_process_fragment (the path taken when special_tokens is non-empty).
         let tokens = vec![
-            "<pad>".to_string(),     // 0
-            "<s>".to_string(),       // 1 (CONTROL)
-            "</s>".to_string(),      // 2 (CONTROL)
+            "<pad>".to_string(),            // 0
+            "<s>".to_string(),              // 1 (CONTROL)
+            "</s>".to_string(),             // 2 (CONTROL)
             "\u{2581}\u{00e9}".to_string(), // 3: "▁é" (precomposed)
         ];
         let scores = vec![0.0, 0.0, 0.0, -1.0];
         let token_types = vec![0, 3, 3, 0]; // CONTROL tokens at 1 and 2
 
         let tok = BpeTokenizer::new(
-            tokens, scores, token_types, vec![],
-            Some(1), Some(2), Some(0),
-            false, false, true, // add_space_prefix
+            tokens,
+            scores,
+            token_types,
+            vec![],
+            Some(1),
+            Some(2),
+            Some(0),
+            false,
+            false,
+            true, // add_space_prefix
             None,
             false, // use_viterbi
         );
@@ -2909,24 +2991,24 @@ mod tests {
     fn test_regex_bpe_with_control_token_partitioning() {
         // End-to-end test: regex-BPE tokenizer with CONTROL tokens.
         let tokens = vec![
-            "<pad>".to_string(),     // 0 (NORMAL)
-            "<bos>".to_string(),     // 1 (CONTROL)
-            "<eos>".to_string(),     // 2 (CONTROL)
-            "h".to_string(),         // 3
-            "e".to_string(),         // 4
-            "l".to_string(),         // 5
-            "o".to_string(),         // 6
-            "Ġ".to_string(),         // 7 (byte-encoded space)
-            "he".to_string(),        // 8
-            "ll".to_string(),        // 9
-            "lo".to_string(),        // 10
-            "hel".to_string(),       // 11
-            "hell".to_string(),      // 12
-            "hello".to_string(),     // 13
-            "w".to_string(),         // 14
-            "r".to_string(),         // 15
-            "d".to_string(),         // 16
-            "Ġworld".to_string(),    // 17
+            "<pad>".to_string(),  // 0 (NORMAL)
+            "<bos>".to_string(),  // 1 (CONTROL)
+            "<eos>".to_string(),  // 2 (CONTROL)
+            "h".to_string(),      // 3
+            "e".to_string(),      // 4
+            "l".to_string(),      // 5
+            "o".to_string(),      // 6
+            "Ġ".to_string(),      // 7 (byte-encoded space)
+            "he".to_string(),     // 8
+            "ll".to_string(),     // 9
+            "lo".to_string(),     // 10
+            "hel".to_string(),    // 11
+            "hell".to_string(),   // 12
+            "hello".to_string(),  // 13
+            "w".to_string(),      // 14
+            "r".to_string(),      // 15
+            "d".to_string(),      // 16
+            "Ġworld".to_string(), // 17
         ];
         let scores = vec![0.0; tokens.len()];
         let token_types = vec![0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -2941,9 +3023,16 @@ mod tests {
         ];
 
         let tok = BpeTokenizer::new(
-            tokens, scores, token_types, merges,
-            Some(1), Some(2), Some(0),
-            false, false, true,
+            tokens,
+            scores,
+            token_types,
+            merges,
+            Some(1),
+            Some(2),
+            Some(0),
+            false,
+            false,
+            true,
             Some("gpt-2"),
             false, // use_viterbi
         );

@@ -623,10 +623,7 @@ fn read_gguf_bool<R: Read>(r: &mut R) -> Result<bool, InferenceError> {
 }
 
 /// Read a single GGUF value of the given type.
-fn read_gguf_value<R: Read>(
-    r: &mut R,
-    vtype: GgufValueType,
-) -> Result<GgufValue, InferenceError> {
+fn read_gguf_value<R: Read>(r: &mut R, vtype: GgufValueType) -> Result<GgufValue, InferenceError> {
     match vtype {
         GgufValueType::Uint8 => Ok(GgufValue::U8(read_u8(r)?)),
         GgufValueType::Int8 => Ok(GgufValue::I8(read_i8(r)?)),
@@ -998,11 +995,7 @@ mod tests {
                     GgufValueType::Float32,
                     &kv_eps,
                 ),
-                (
-                    "llama.attention.causal",
-                    GgufValueType::Bool,
-                    &kv_causal,
-                ),
+                ("llama.attention.causal", GgufValueType::Bool, &kv_causal),
             ],
             &[],
             32,
@@ -1015,7 +1008,9 @@ mod tests {
         let gguf = GgufFile::open(&path).unwrap();
         assert_eq!(gguf.get_str("general.architecture"), Some("llama"));
         assert_eq!(gguf.get_u32("llama.block_count"), Some(24));
-        let eps = gguf.get_f32("llama.attention.layer_norm_rms_epsilon").unwrap();
+        let eps = gguf
+            .get_f32("llama.attention.layer_norm_rms_epsilon")
+            .unwrap();
         assert!((eps - 1e-6).abs() < 1e-10);
         assert_eq!(gguf.get_bool("llama.attention.causal"), Some(true));
         assert_eq!(gguf.n_metadata(), 4);
@@ -1037,9 +1032,9 @@ mod tests {
             &[("general.architecture", GgufValueType::String, &kv_arch)],
             &[(
                 "test_tensor",
-                &[4],                             // shape: [4]
-                0,                                 // F32
-                0,                                 // offset 0 relative to data section
+                &[4], // shape: [4]
+                0,    // F32
+                0,    // offset 0 relative to data section
                 &tensor_data,
             )],
             32,
@@ -1093,8 +1088,8 @@ mod tests {
             &[("general.architecture", GgufValueType::String, &kv_arch)],
             &[(
                 "weight",
-                &[3, 2],  // shape: [3, 2] (GGUF uses column-major dims)
-                0,        // F32
+                &[3, 2], // shape: [3, 2] (GGUF uses column-major dims)
+                0,       // F32
                 0,
                 &tensor_data,
             )],
@@ -1141,7 +1136,7 @@ mod tests {
         let mut file_bytes = Vec::new();
         file_bytes.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
         file_bytes.extend_from_slice(&99u32.to_le_bytes()); // version 99
-        // Pad to make it a valid-enough file
+                                                            // Pad to make it a valid-enough file
         file_bytes.resize(64, 0);
 
         let dir = std::env::temp_dir();
@@ -1207,11 +1202,7 @@ mod tests {
     fn test_data_offset_alignment() {
         // With a very small header, data_offset should be aligned to 32
         let kv_arch = kv_string("t");
-        let file_bytes = build_gguf_file(
-            &[("a", GgufValueType::String, &kv_arch)],
-            &[],
-            32,
-        );
+        let file_bytes = build_gguf_file(&[("a", GgufValueType::String, &kv_arch)], &[], 32);
 
         let dir = std::env::temp_dir();
         let path = dir.join("test_data_offset.gguf");
@@ -1244,8 +1235,8 @@ mod tests {
             &[("general.architecture", GgufValueType::String, &kv_arch)],
             &[(
                 "quantized",
-                &[32],  // 32 elements
-                8,      // Q8_0
+                &[32], // 32 elements
+                8,     // Q8_0
                 0,
                 &tensor_data,
             )],
@@ -1615,7 +1606,7 @@ mod tests {
         buf.extend_from_slice(&2u32.to_le_bytes()); // version 2
         buf.extend_from_slice(&0u64.to_le_bytes()); // n_tensors = 0
         buf.extend_from_slice(&0u64.to_le_bytes()); // n_kv = 0
-        // Pad to alignment
+                                                    // Pad to alignment
         let aligned = align_offset(buf.len() as u64, 32) as usize;
         buf.resize(aligned, 0);
 
@@ -1875,7 +1866,7 @@ mod tests {
         kv_array.extend_from_slice(&9u32.to_le_bytes()); // GGUF_TYPE_ARRAY
         kv_array.extend_from_slice(&8u32.to_le_bytes()); // element type: String
         kv_array.extend_from_slice(&2u64.to_le_bytes()); // count: 2
-        // String "foo"
+                                                         // String "foo"
         kv_array.extend_from_slice(&3u64.to_le_bytes());
         kv_array.extend_from_slice(b"foo");
         // String "bar"

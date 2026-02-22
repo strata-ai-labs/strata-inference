@@ -62,7 +62,13 @@ fn normalize(
 /// Extract a per-head slice from a [seq_len, total_dim] tensor.
 ///
 /// Returns a [seq_len, head_dim] tensor for the given head index.
-fn extract_head(data: &[f32], seq_len: usize, total_dim: usize, head: usize, head_dim: usize) -> Tensor {
+fn extract_head(
+    data: &[f32],
+    seq_len: usize,
+    total_dim: usize,
+    head: usize,
+    head_dim: usize,
+) -> Tensor {
     let mut head_data = vec![0.0f32; seq_len * head_dim];
     for pos in 0..seq_len {
         let src_offset = pos * total_dim + head * head_dim;
@@ -74,7 +80,12 @@ fn extract_head(data: &[f32], seq_len: usize, total_dim: usize, head: usize, hea
 }
 
 /// Reassemble per-head outputs into a single [seq_len, num_heads * head_dim] tensor.
-fn assemble_heads(head_outputs: &[Vec<f32>], seq_len: usize, num_heads: usize, head_dim: usize) -> Tensor {
+fn assemble_heads(
+    head_outputs: &[Vec<f32>],
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> Tensor {
     let total_dim = num_heads * head_dim;
     let mut result = vec![0.0f32; seq_len * total_dim];
     for head in 0..num_heads {
@@ -144,22 +155,45 @@ fn multi_head_attention(
     let num_kv_heads = config.num_kv_heads;
     let head_dim = config.head_dim;
 
-    trace!(seq_len, num_heads, num_kv_heads, head_dim, "multi_head_attention");
+    trace!(
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        "multi_head_attention"
+    );
 
     // Step a: Apply RoPE if configured (RoPE applies to Q and K only, not V)
     let (q_proc, k_proc) = if config.position_type == PositionType::RoPE {
         if let Some(params) = longrope {
             rope_neox_with_factors(
-                &q, &k, pos_offset, config.rope_freq_base,
-                head_dim, config.rope_dim, params.factors, params.mscale, backend,
+                &q,
+                &k,
+                pos_offset,
+                config.rope_freq_base,
+                head_dim,
+                config.rope_dim,
+                params.factors,
+                params.mscale,
+                backend,
             )
         } else if config.rope_neox {
             backend.rope_neox(
-                &q, &k, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
+                &q,
+                &k,
+                pos_offset,
+                config.rope_freq_base,
+                head_dim,
+                config.rope_dim,
             )
         } else {
             backend.rope(
-                &q, &k, pos_offset, config.rope_freq_base, head_dim, config.rope_dim,
+                &q,
+                &k,
+                pos_offset,
+                config.rope_freq_base,
+                head_dim,
+                config.rope_dim,
             )
         }
     } else {
@@ -257,6 +291,7 @@ fn multi_head_attention(
         // Step i: Weighted sum: output = probs @ V: [seq_len, seq_len] x [seq_len, head_dim] -> [seq_len, head_dim]
         let head_out = backend.matmul(&probs, &v_dev);
         let head_out_host = backend.download(&head_out);
+
         head_outputs.push(head_out_host.as_f32().to_vec());
     }
 
@@ -278,19 +313,35 @@ pub(crate) fn transformer_layer_forward(
     attention_mask: &[f32],
     longrope: Option<&LongRopeParams>,
 ) -> DeviceTensor {
-    trace!(pos_offset, pre_norm = config.pre_norm, "transformer_layer_forward");
+    trace!(
+        pos_offset,
+        pre_norm = config.pre_norm,
+        "transformer_layer_forward"
+    );
 
     match config.arch {
         ModelArch::GemmaEmbedding => {
             // GemmaEmbedding doesn't use LongRoPE
             gemma_embedding_layer_forward(input, layer, config, backend, pos_offset, attention_mask)
         }
-        _ if config.pre_norm => {
-            pre_norm_layer_forward(input, layer, config, backend, pos_offset, attention_mask, longrope)
-        }
-        _ => {
-            post_norm_layer_forward(input, layer, config, backend, pos_offset, attention_mask, longrope)
-        }
+        _ if config.pre_norm => pre_norm_layer_forward(
+            input,
+            layer,
+            config,
+            backend,
+            pos_offset,
+            attention_mask,
+            longrope,
+        ),
+        _ => post_norm_layer_forward(
+            input,
+            layer,
+            config,
+            backend,
+            pos_offset,
+            attention_mask,
+            longrope,
+        ),
     }
 }
 
@@ -314,7 +365,9 @@ fn pre_norm_layer_forward(
     longrope: Option<&LongRopeParams>,
 ) -> DeviceTensor {
     // 1. Pre-attention normalization
-    let attn_norm_w = layer.attn_norm_w.as_ref()
+    let attn_norm_w = layer
+        .attn_norm_w
+        .as_ref()
         .expect("pre_norm layer requires attn_norm_w");
     let normed = normalize(
         input,
@@ -331,14 +384,41 @@ fn pre_norm_layer_forward(
 
     // Per-head Q/K RMSNorm (Qwen3)
     let q = if let Some(ref qn_w) = layer.attn_q_norm_w {
-        rms_norm_per_head(q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
-    } else { q };
+        rms_norm_per_head(
+            q,
+            qn_w,
+            config.num_heads,
+            config.head_dim,
+            config.norm_eps,
+            backend,
+        )
+    } else {
+        q
+    };
     let k = if let Some(ref kn_w) = layer.attn_k_norm_w {
-        rms_norm_per_head(k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
-    } else { k };
+        rms_norm_per_head(
+            k,
+            kn_w,
+            config.num_kv_heads,
+            config.head_dim,
+            config.norm_eps,
+            backend,
+        )
+    } else {
+        k
+    };
 
     // 3. Multi-head attention
-    let attn_out = multi_head_attention(q, k, v, config, backend, pos_offset, attention_mask, longrope);
+    let attn_out = multi_head_attention(
+        q,
+        k,
+        v,
+        config,
+        backend,
+        pos_offset,
+        attention_mask,
+        longrope,
+    );
 
     // 4. Output projection
     let projected = linear_forward(
@@ -358,7 +438,9 @@ fn pre_norm_layer_forward(
     let residual = backend.add(input, &projected);
 
     // 5. Pre-FFN normalization
-    let ffn_norm_w = layer.ffn_norm_w.as_ref()
+    let ffn_norm_w = layer
+        .ffn_norm_w
+        .as_ref()
         .expect("pre_norm layer requires ffn_norm_w");
     let normed2 = normalize(
         &residual,
@@ -407,7 +489,16 @@ fn post_norm_layer_forward(
     let v = linear_forward(input, &layer.attn_v, layer.attn_v_bias.as_ref(), backend);
 
     // 2. Multi-head attention
-    let attn_out = multi_head_attention(q, k, v, config, backend, pos_offset, attention_mask, longrope);
+    let attn_out = multi_head_attention(
+        q,
+        k,
+        v,
+        config,
+        backend,
+        pos_offset,
+        attention_mask,
+        longrope,
+    );
 
     // 3. Output projection + residual
     let projected = linear_forward(
@@ -505,7 +596,9 @@ fn gemma_embedding_layer_forward(
     attention_mask: &[f32],
 ) -> DeviceTensor {
     // 1. Pre-attention normalization
-    let attn_norm_w = layer.attn_norm_w.as_ref()
+    let attn_norm_w = layer
+        .attn_norm_w
+        .as_ref()
         .expect("GemmaEmbedding layer requires attn_norm_w");
     let normed = normalize(input, attn_norm_w, None, config, backend);
 
@@ -516,12 +609,26 @@ fn gemma_embedding_layer_forward(
 
     // 3-4. Per-head Q/K RMSNorm
     let q = if let Some(ref qn_w) = layer.attn_q_norm_w {
-        rms_norm_per_head(q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
+        rms_norm_per_head(
+            q,
+            qn_w,
+            config.num_heads,
+            config.head_dim,
+            config.norm_eps,
+            backend,
+        )
     } else {
         q
     };
     let k = if let Some(ref kn_w) = layer.attn_k_norm_w {
-        rms_norm_per_head(k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
+        rms_norm_per_head(
+            k,
+            kn_w,
+            config.num_kv_heads,
+            config.head_dim,
+            config.norm_eps,
+            backend,
+        )
     } else {
         k
     };
@@ -544,7 +651,9 @@ fn gemma_embedding_layer_forward(
     let residual = backend.add(input, &projected);
 
     // 10. Pre-FFN normalization
-    let ffn_norm_w = layer.ffn_norm_w.as_ref()
+    let ffn_norm_w = layer
+        .ffn_norm_w
+        .as_ref()
         .expect("GemmaEmbedding layer requires ffn_norm_w");
     let normed2 = normalize(&residual, ffn_norm_w, None, config, backend);
 
@@ -578,7 +687,12 @@ fn ffn_forward(
             let gate = linear_forward(input, gate_weight, None, backend);
             let up = linear_forward(input, &layer.ffn_up, layer.ffn_up_bias.as_ref(), backend);
             let activated = backend.swiglu(&gate, &up);
-            linear_forward(&activated, &layer.ffn_down, layer.ffn_down_bias.as_ref(), backend)
+            linear_forward(
+                &activated,
+                &layer.ffn_down,
+                layer.ffn_down_bias.as_ref(),
+                backend,
+            )
         }
         Activation::GeGLU => {
             let gate_weight = layer
@@ -588,12 +702,22 @@ fn ffn_forward(
             let gate = linear_forward(input, gate_weight, None, backend);
             let up = linear_forward(input, &layer.ffn_up, layer.ffn_up_bias.as_ref(), backend);
             let activated = backend.geglu(&gate, &up);
-            linear_forward(&activated, &layer.ffn_down, layer.ffn_down_bias.as_ref(), backend)
+            linear_forward(
+                &activated,
+                &layer.ffn_down,
+                layer.ffn_down_bias.as_ref(),
+                backend,
+            )
         }
         Activation::GELU => {
             let up = linear_forward(input, &layer.ffn_up, layer.ffn_up_bias.as_ref(), backend);
             let activated = backend.gelu(&up);
-            linear_forward(&activated, &layer.ffn_down, layer.ffn_down_bias.as_ref(), backend)
+            linear_forward(
+                &activated,
+                &layer.ffn_down,
+                layer.ffn_down_bias.as_ref(),
+                backend,
+            )
         }
     }
 }
@@ -618,7 +742,12 @@ pub fn model_forward(
     pos_offset: usize,
 ) -> Result<DeviceTensor, InferenceError> {
     let seq_len = input_ids.len();
-    debug!(seq_len, num_layers = config.num_layers, pos_offset, "model_forward");
+    debug!(
+        seq_len,
+        num_layers = config.num_layers,
+        pos_offset,
+        "model_forward"
+    );
 
     // 1. Validate input_ids against vocab_size
     for &id in input_ids {
@@ -699,9 +828,15 @@ pub fn model_forward(
     for (i, layer) in weights.layers.iter().enumerate() {
         trace!(layer = i, "Running layer");
         hidden = transformer_layer_forward(
-            &hidden, layer, config, backend, pos_offset, attention_mask,
+            &hidden,
+            layer,
+            config,
+            backend,
+            pos_offset,
+            attention_mask,
             longrope_params.as_ref(),
         );
+
     }
 
     // 8. Final output normalization (absent for BERT which uses per-layer post-norm)
@@ -743,8 +878,13 @@ fn rope_neox_with_factors(
     backend: &dyn ComputeBackend,
 ) -> (DeviceTensor, DeviceTensor) {
     let half_rope_dim = rope_dim / 2;
-    assert_eq!(factors.len(), half_rope_dim,
-        "rope factors length ({}) must equal rope_dim/2 ({})", factors.len(), half_rope_dim);
+    assert_eq!(
+        factors.len(),
+        half_rope_dim,
+        "rope factors length ({}) must equal rope_dim/2 ({})",
+        factors.len(),
+        half_rope_dim
+    );
 
     let q_host = backend.download(q);
     let k_host = backend.download(k);
@@ -842,16 +982,33 @@ fn multi_head_attention_cached(
         if let Some(params) = longrope {
             // LongRoPE with per-dimension frequency factors and mscale
             rope_neox_with_factors(
-                &q, &k_new, pos_offset, rope_freq_base,
-                head_dim, config.rope_dim, params.factors, params.mscale, backend,
+                &q,
+                &k_new,
+                pos_offset,
+                rope_freq_base,
+                head_dim,
+                config.rope_dim,
+                params.factors,
+                params.mscale,
+                backend,
             )
         } else if config.rope_neox {
             backend.rope_neox(
-                &q, &k_new, pos_offset, rope_freq_base, head_dim, config.rope_dim,
+                &q,
+                &k_new,
+                pos_offset,
+                rope_freq_base,
+                head_dim,
+                config.rope_dim,
             )
         } else {
             backend.rope(
-                &q, &k_new, pos_offset, rope_freq_base, head_dim, config.rope_dim,
+                &q,
+                &k_new,
+                pos_offset,
+                rope_freq_base,
+                head_dim,
+                config.rope_dim,
             )
         }
     } else {
@@ -874,9 +1031,15 @@ fn multi_head_attention_cached(
         let v_full = cache.get_v_gpu(layer_idx);
 
         return Ok(backend.grouped_attention_decode(
-            &q_proc, k_full, v_full, total_len,
-            num_heads, num_kv_heads, head_dim,
-            attn_scale, config.attn_logit_softcap,
+            &q_proc,
+            k_full,
+            v_full,
+            total_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attn_scale,
+            config.attn_logit_softcap,
         ));
     }
 
@@ -896,10 +1059,17 @@ fn multi_head_attention_cached(
         let v_full = cache.get_v_gpu(layer_idx);
 
         return Ok(backend.batched_causal_attention(
-            &q_proc, k_full, v_full,
-            n_new, total_len, pos_offset,
-            num_heads, num_kv_heads, head_dim,
-            attn_scale, config.attn_logit_softcap,
+            &q_proc,
+            k_full,
+            v_full,
+            n_new,
+            total_len,
+            pos_offset,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            attn_scale,
+            config.attn_logit_softcap,
         ));
     }
 
@@ -1017,9 +1187,17 @@ fn transformer_layer_forward_cached(
 
     if config.pre_norm {
         // Pre-norm path (Gemma/LLaMA)
-        let attn_norm_w = layer.attn_norm_w.as_ref()
+        let attn_norm_w = layer
+            .attn_norm_w
+            .as_ref()
             .expect("pre_norm layer requires attn_norm_w");
-        let normed = normalize(input, attn_norm_w, layer.attn_norm_b.as_ref(), config, backend);
+        let normed = normalize(
+            input,
+            attn_norm_w,
+            layer.attn_norm_b.as_ref(),
+            config,
+            backend,
+        );
 
         let q = linear_forward(&normed, &layer.attn_q, layer.attn_q_bias.as_ref(), backend);
         let k = linear_forward(&normed, &layer.attn_k, layer.attn_k_bias.as_ref(), backend);
@@ -1027,16 +1205,48 @@ fn transformer_layer_forward_cached(
 
         // Per-head Q/K RMSNorm (Qwen3)
         let q = if let Some(ref qn_w) = layer.attn_q_norm_w {
-            rms_norm_per_head(q, qn_w, config.num_heads, config.head_dim, config.norm_eps, backend)
-        } else { q };
+            rms_norm_per_head(
+                q,
+                qn_w,
+                config.num_heads,
+                config.head_dim,
+                config.norm_eps,
+                backend,
+            )
+        } else {
+            q
+        };
         let k = if let Some(ref kn_w) = layer.attn_k_norm_w {
-            rms_norm_per_head(k, kn_w, config.num_kv_heads, config.head_dim, config.norm_eps, backend)
-        } else { k };
+            rms_norm_per_head(
+                k,
+                kn_w,
+                config.num_kv_heads,
+                config.head_dim,
+                config.norm_eps,
+                backend,
+            )
+        } else {
+            k
+        };
 
-        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend, longrope, rope_freq_base, swa_window)?;
+        let attn_out = multi_head_attention_cached(
+            q,
+            k,
+            v,
+            cache,
+            layer_idx,
+            config,
+            backend,
+            longrope,
+            rope_freq_base,
+            swa_window,
+        )?;
 
         let projected = linear_forward(
-            &attn_out, &layer.attn_output, layer.attn_output_bias.as_ref(), backend,
+            &attn_out,
+            &layer.attn_output,
+            layer.attn_output_bias.as_ref(),
+            backend,
         );
 
         // Post-attention norm (Gemma3: applied to projection BEFORE residual add)
@@ -1048,9 +1258,17 @@ fn transformer_layer_forward_cached(
 
         let residual = backend.add(input, &projected);
 
-        let ffn_norm_w = layer.ffn_norm_w.as_ref()
+        let ffn_norm_w = layer
+            .ffn_norm_w
+            .as_ref()
             .expect("pre_norm layer requires ffn_norm_w");
-        let normed2 = normalize(&residual, ffn_norm_w, layer.ffn_norm_b.as_ref(), config, backend);
+        let normed2 = normalize(
+            &residual,
+            ffn_norm_w,
+            layer.ffn_norm_b.as_ref(),
+            config,
+            backend,
+        );
         let ffn_out = ffn_forward(&normed2, layer, config, backend);
 
         // Post-FFN norm (Gemma3: applied to FFN output BEFORE residual add)
@@ -1068,22 +1286,48 @@ fn transformer_layer_forward_cached(
         let k = linear_forward(input, &layer.attn_k, layer.attn_k_bias.as_ref(), backend);
         let v = linear_forward(input, &layer.attn_v, layer.attn_v_bias.as_ref(), backend);
 
-        let attn_out = multi_head_attention_cached(q, k, v, cache, layer_idx, config, backend, longrope, rope_freq_base, swa_window)?;
+        let attn_out = multi_head_attention_cached(
+            q,
+            k,
+            v,
+            cache,
+            layer_idx,
+            config,
+            backend,
+            longrope,
+            rope_freq_base,
+            swa_window,
+        )?;
 
         let projected = linear_forward(
-            &attn_out, &layer.attn_output, layer.attn_output_bias.as_ref(), backend,
+            &attn_out,
+            &layer.attn_output,
+            layer.attn_output_bias.as_ref(),
+            backend,
         );
         let mut residual = backend.add(input, &projected);
 
         if let Some(ref norm_w) = layer.attn_output_norm_w {
-            residual = normalize(&residual, norm_w, layer.attn_output_norm_b.as_ref(), config, backend);
+            residual = normalize(
+                &residual,
+                norm_w,
+                layer.attn_output_norm_b.as_ref(),
+                config,
+                backend,
+            );
         }
 
         let ffn_out = ffn_forward(&residual, layer, config, backend);
         let mut output = backend.add(&residual, &ffn_out);
 
         if let Some(ref norm_w) = layer.ffn_output_norm_w {
-            output = normalize(&output, norm_w, layer.ffn_output_norm_b.as_ref(), config, backend);
+            output = normalize(
+                &output,
+                norm_w,
+                layer.ffn_output_norm_b.as_ref(),
+                config,
+                backend,
+            );
         }
 
         Ok(output)
@@ -1140,7 +1384,11 @@ pub fn model_forward_step(
     // 5. Embedding normalization (BERT only)
     if let Some(ref norm_w) = weights.embedding_norm_w {
         hidden = normalize(
-            &hidden, norm_w, weights.embedding_norm_b.as_ref(), config, backend,
+            &hidden,
+            norm_w,
+            weights.embedding_norm_b.as_ref(),
+            config,
+            backend,
         );
     }
 
@@ -1180,8 +1428,15 @@ pub fn model_forward_step(
             0
         };
         hidden = transformer_layer_forward_cached(
-            &hidden, layer, i, config, backend, cache, longrope_params.as_ref(),
-            layer_rope_base, layer_swa_window,
+            &hidden,
+            layer,
+            i,
+            config,
+            backend,
+            cache,
+            longrope_params.as_ref(),
+            layer_rope_base,
+            layer_swa_window,
         )?;
     }
 
@@ -1217,7 +1472,12 @@ mod tests {
     }
 
     /// Create a Gemma-style config for testing.
-    fn gemma_config(hidden_size: usize, num_heads: usize, head_dim: usize, ffn_hidden: usize) -> ModelConfig {
+    fn gemma_config(
+        hidden_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        ffn_hidden: usize,
+    ) -> ModelConfig {
         ModelConfig {
             arch: ModelArch::Gemma3,
             arch_name: "gemma3".to_string(),
@@ -1253,7 +1513,12 @@ mod tests {
     }
 
     /// Create a BERT-style config for testing.
-    fn bert_config(hidden_size: usize, num_heads: usize, head_dim: usize, ffn_hidden: usize) -> ModelConfig {
+    fn bert_config(
+        hidden_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        ffn_hidden: usize,
+    ) -> ModelConfig {
         ModelConfig {
             arch: ModelArch::Bert,
             arch_name: "bert".to_string(),
@@ -1299,7 +1564,10 @@ mod tests {
 
     /// Create a zero weight matrix [out, in].
     fn zero_weight(out_dim: usize, in_dim: usize) -> DeviceTensor {
-        dt(Tensor::new(vec![out_dim, in_dim], vec![0.0f32; out_dim * in_dim]))
+        dt(Tensor::new(
+            vec![out_dim, in_dim],
+            vec![0.0f32; out_dim * in_dim],
+        ))
     }
 
     /// Create a ones weight vector [dim].
@@ -1381,7 +1649,10 @@ mod tests {
     #[test]
     fn test_linear_forward_f32_identity() {
         let b = cpu();
-        let input = dt(Tensor::new(vec![2, 4], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
+        let input = dt(Tensor::new(
+            vec![2, 4],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        ));
         let weight = identity_weight(4);
         let result = linear_forward(&input, &weight, None, &b);
         assert_eq!(result.shape(), &[2, 4]);
@@ -1440,10 +1711,7 @@ mod tests {
         let head1 = extract_head(&data, 2, 6, 1, 3);
         assert_eq!(head1.as_f32(), &[4.0, 5.0, 6.0, 10.0, 11.0, 12.0]);
 
-        let head_outputs = vec![
-            head0.as_f32().to_vec(),
-            head1.as_f32().to_vec(),
-        ];
+        let head_outputs = vec![head0.as_f32().to_vec(), head1.as_f32().to_vec()];
         let assembled = assemble_heads(&head_outputs, 2, 2, 3);
         assert_eq!(assembled.as_f32(), &data[..]);
     }
@@ -1493,7 +1761,9 @@ mod tests {
         let layer = gemma_layer_weights(hidden_size, ffn_hidden);
 
         let seq_len = 3;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
@@ -1517,7 +1787,9 @@ mod tests {
         let layer = bert_layer_weights(hidden_size, ffn_hidden);
 
         let seq_len = 3;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
@@ -1577,7 +1849,10 @@ mod tests {
 
         // At position 0, cos(0)=1, sin(0)=0, so rotation is identity
         let q0 = q_rot0.as_tensor().as_f32();
-        assert!((q0[0] - 1.0).abs() < 1e-5, "RoPE at pos 0 should be identity for Q");
+        assert!(
+            (q0[0] - 1.0).abs() < 1e-5,
+            "RoPE at pos 0 should be identity for Q"
+        );
 
         // At position 5, the rotation should be different
         let q5 = q_rot5.as_tensor().as_f32();
@@ -1588,7 +1863,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_different, "RoPE at different positions should produce different Q vectors");
+        assert!(
+            any_different,
+            "RoPE at different positions should produce different Q vectors"
+        );
 
         // Also verify K is rotated differently
         let k0 = k_rot0.as_tensor().as_f32();
@@ -1600,7 +1878,10 @@ mod tests {
                 break;
             }
         }
-        assert!(k_different, "RoPE at different positions should produce different K vectors");
+        assert!(
+            k_different,
+            "RoPE at different positions should produce different K vectors"
+        );
     }
 
     #[test]
@@ -1620,12 +1901,16 @@ mod tests {
         let layer = gemma_layer_weights(hidden_size, ffn_hidden);
 
         let seq_len = 2;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32 + 1.0) * 0.5)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
-        let output_rope = transformer_layer_forward(&input, &layer, &config_rope, &b, 0, &mask, None);
-        let output_no_rope = transformer_layer_forward(&input, &layer, &config_no_rope, &b, 0, &mask, None);
+        let output_rope =
+            transformer_layer_forward(&input, &layer, &config_rope, &b, 0, &mask, None);
+        let output_no_rope =
+            transformer_layer_forward(&input, &layer, &config_no_rope, &b, 0, &mask, None);
 
         let data_r = output_rope.as_tensor().as_f32();
         let data_nr = output_no_rope.as_tensor().as_f32();
@@ -1637,7 +1922,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_different, "RoPE should change outputs compared to no-RoPE");
+        assert!(
+            any_different,
+            "RoPE should change outputs compared to no-RoPE"
+        );
     }
 
     #[test]
@@ -1658,12 +1946,16 @@ mod tests {
         let layer = gemma_layer_weights(hidden_size, ffn_hidden);
 
         let seq_len = 3;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
-        let output_causal = transformer_layer_forward(&input, &layer, &config_causal, &b, 0, &mask, None);
-        let output_bidir = transformer_layer_forward(&input, &layer, &config_bidir, &b, 0, &mask, None);
+        let output_causal =
+            transformer_layer_forward(&input, &layer, &config_causal, &b, 0, &mask, None);
+        let output_bidir =
+            transformer_layer_forward(&input, &layer, &config_bidir, &b, 0, &mask, None);
 
         // Outputs should differ because causal mask restricts attention
         let data_c = output_causal.as_tensor().as_f32();
@@ -1676,7 +1968,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_different, "Causal and bidirectional should produce different outputs for seq_len > 1");
+        assert!(
+            any_different,
+            "Causal and bidirectional should produce different outputs for seq_len > 1"
+        );
     }
 
     #[test]
@@ -1691,7 +1986,9 @@ mod tests {
         // Create layer with non-zero FFN weights to exercise the GELU path
         let mut layer = bert_layer_weights(hidden_size, ffn_hidden);
         // Set ffn_up to have some non-zero values
-        let up_data: Vec<f32> = (0..ffn_hidden * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let up_data: Vec<f32> = (0..ffn_hidden * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         layer.ffn_up = dt(Tensor::new(vec![ffn_hidden, hidden_size], up_data));
 
         let input_data: Vec<f32> = (0..hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
@@ -1716,8 +2013,12 @@ mod tests {
 
         // Create layer with non-zero FFN weights to exercise the SwiGLU path
         let mut layer = gemma_layer_weights(hidden_size, ffn_hidden);
-        let gate_data: Vec<f32> = (0..ffn_hidden * hidden_size).map(|i| (i as f32) * 0.01).collect();
-        let up_data: Vec<f32> = (0..ffn_hidden * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let gate_data: Vec<f32> = (0..ffn_hidden * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
+        let up_data: Vec<f32> = (0..ffn_hidden * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         layer.ffn_gate = Some(dt(Tensor::new(vec![ffn_hidden, hidden_size], gate_data)));
         layer.ffn_up = dt(Tensor::new(vec![ffn_hidden, hidden_size], up_data));
 
@@ -1775,14 +2076,20 @@ mod tests {
         };
 
         let seq_len = 2;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
         let output = transformer_layer_forward(&input, &layer, &config, &b, 0, &mask, None);
         assert_eq!(output.shape(), &[seq_len, hidden_size]);
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "GQA forward pass produced non-finite value: {}", v);
+            assert!(
+                v.is_finite(),
+                "GQA forward pass produced non-finite value: {}",
+                v
+            );
         }
     }
 
@@ -1800,7 +2107,9 @@ mod tests {
         let vocab_size = 16;
         let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
@@ -1836,12 +2145,19 @@ mod tests {
         let max_seq_len = 128;
         let config = bert_config(hidden_size, num_heads, head_dim, ffn_hidden);
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
-        let pos_emb_data: Vec<f32> = (0..max_seq_len * hidden_size).map(|i| (i as f32) * 0.001).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
+        let pos_emb_data: Vec<f32> = (0..max_seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.001)
+            .collect();
 
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
-            position_embedding: Some(dt(Tensor::new(vec![max_seq_len, hidden_size], pos_emb_data))),
+            position_embedding: Some(dt(Tensor::new(
+                vec![max_seq_len, hidden_size],
+                pos_emb_data,
+            ))),
             token_type_embedding: None,
             embedding_norm_w: Some(ones_weight(hidden_size)),
             embedding_norm_b: Some(zeros_bias(hidden_size)),
@@ -1859,7 +2175,10 @@ mod tests {
         let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
         assert_eq!(output.shape(), &[4, hidden_size]);
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "BERT model_forward produced non-finite value");
+            assert!(
+                v.is_finite(),
+                "BERT model_forward produced non-finite value"
+            );
         }
     }
 
@@ -1877,10 +2196,7 @@ mod tests {
         config.vocab_size = vocab_size;
 
         let embedding_data = vec![
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
@@ -1904,7 +2220,10 @@ mod tests {
         // With scale=2.0, the embedding is doubled before going through the layers.
         // Just verify the output is finite and the function runs without error.
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "Scaled embedding model_forward produced non-finite value");
+            assert!(
+                v.is_finite(),
+                "Scaled embedding model_forward produced non-finite value"
+            );
         }
     }
 
@@ -1920,7 +2239,9 @@ mod tests {
         let mut config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
         config.num_layers = 3;
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
@@ -1945,7 +2266,10 @@ mod tests {
         let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
         assert_eq!(output.shape(), &[2, hidden_size]);
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "Multi-layer model_forward produced non-finite value");
+            assert!(
+                v.is_finite(),
+                "Multi-layer model_forward produced non-finite value"
+            );
         }
     }
 
@@ -1959,7 +2283,9 @@ mod tests {
         let vocab_size = 8;
         let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
@@ -1980,7 +2306,10 @@ mod tests {
         let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
         assert_eq!(output.shape(), &[1, hidden_size]);
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "Single token model_forward produced non-finite value");
+            assert!(
+                v.is_finite(),
+                "Single token model_forward produced non-finite value"
+            );
         }
     }
 
@@ -2002,12 +2331,16 @@ mod tests {
         let layer = gemma_layer_weights(hidden_size, ffn_hidden);
 
         let seq_len = 2;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 5.0).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32 + 1.0) * 5.0)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
-        let output_no_cap = transformer_layer_forward(&input, &layer, &config_no_cap, &b, 0, &mask, None);
-        let output_with_cap = transformer_layer_forward(&input, &layer, &config_with_cap, &b, 0, &mask, None);
+        let output_no_cap =
+            transformer_layer_forward(&input, &layer, &config_no_cap, &b, 0, &mask, None);
+        let output_with_cap =
+            transformer_layer_forward(&input, &layer, &config_with_cap, &b, 0, &mask, None);
 
         // Softcap should change outputs (unless scores are very small)
         let data_no = output_no_cap.as_tensor().as_f32();
@@ -2038,9 +2371,18 @@ mod tests {
         config.position_type = PositionType::Learned; // skip RoPE for this test
 
         let seq_len = 3;
-        let q = dt(Tensor::new(vec![seq_len, hidden_size], vec![0.1; seq_len * hidden_size]));
-        let k = dt(Tensor::new(vec![seq_len, hidden_size], vec![0.1; seq_len * hidden_size]));
-        let v = dt(Tensor::new(vec![seq_len, hidden_size], vec![0.1; seq_len * hidden_size]));
+        let q = dt(Tensor::new(
+            vec![seq_len, hidden_size],
+            vec![0.1; seq_len * hidden_size],
+        ));
+        let k = dt(Tensor::new(
+            vec![seq_len, hidden_size],
+            vec![0.1; seq_len * hidden_size],
+        ));
+        let v = dt(Tensor::new(
+            vec![seq_len, hidden_size],
+            vec![0.1; seq_len * hidden_size],
+        ));
         let mask = vec![1.0f32; seq_len];
 
         let output = multi_head_attention(q, k, v, &config, &b, 0, &mask, None);
@@ -2063,9 +2405,18 @@ mod tests {
 
         let seq_len = 3;
         let val = 0.5f32;
-        let q = dt(Tensor::new(vec![seq_len, hidden_size], vec![val; seq_len * hidden_size]));
-        let k = dt(Tensor::new(vec![seq_len, hidden_size], vec![val; seq_len * hidden_size]));
-        let v = dt(Tensor::new(vec![seq_len, hidden_size], vec![val; seq_len * hidden_size]));
+        let q = dt(Tensor::new(
+            vec![seq_len, hidden_size],
+            vec![val; seq_len * hidden_size],
+        ));
+        let k = dt(Tensor::new(
+            vec![seq_len, hidden_size],
+            vec![val; seq_len * hidden_size],
+        ));
+        let v = dt(Tensor::new(
+            vec![seq_len, hidden_size],
+            vec![val; seq_len * hidden_size],
+        ));
         let mask = vec![1.0f32; seq_len];
 
         let output = multi_head_attention(q, k, v, &config, &b, 0, &mask, None);
@@ -2127,7 +2478,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_diff, "Attention mask should change outputs when padding token has different V values");
+        assert!(
+            any_diff,
+            "Attention mask should change outputs when padding token has different V values"
+        );
     }
 
     #[test]
@@ -2140,7 +2494,9 @@ mod tests {
         let vocab_size = 8;
         let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
@@ -2183,7 +2539,9 @@ mod tests {
         let vocab_size = 16;
         let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
@@ -2205,7 +2563,10 @@ mod tests {
         assert_eq!(cache.len(), 3);
 
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "model_forward_step produced non-finite value");
+            assert!(
+                v.is_finite(),
+                "model_forward_step produced non-finite value"
+            );
         }
     }
 
@@ -2219,7 +2580,9 @@ mod tests {
         let vocab_size = 16;
         let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
@@ -2246,7 +2609,10 @@ mod tests {
         assert_eq!(cache.len(), 4);
 
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "Single token decode produced non-finite value");
+            assert!(
+                v.is_finite(),
+                "Single token decode produced non-finite value"
+            );
         }
     }
 
@@ -2262,7 +2628,9 @@ mod tests {
         let vocab_size = 16;
         let config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
@@ -2294,7 +2662,9 @@ mod tests {
             assert!(
                 (uncached_data[i] - cached_data[i]).abs() < 1e-4,
                 "Mismatch at index {}: uncached={} cached={}",
-                i, uncached_data[i], cached_data[i]
+                i,
+                uncached_data[i],
+                cached_data[i]
             );
         }
     }
@@ -2311,7 +2681,9 @@ mod tests {
         let mut config = gemma_config(hidden_size, num_heads, head_dim, ffn_hidden);
         config.num_layers = 2;
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
@@ -2389,7 +2761,9 @@ mod tests {
             ffn_post_norm_w: None,
         };
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
@@ -2417,7 +2791,11 @@ mod tests {
         assert_eq!(cache.len(), 3);
 
         for &v in out2.as_tensor().as_f32() {
-            assert!(v.is_finite(), "GQA cached forward pass produced non-finite value: {}", v);
+            assert!(
+                v.is_finite(),
+                "GQA cached forward pass produced non-finite value: {}",
+                v
+            );
         }
     }
 
@@ -2441,7 +2819,13 @@ mod tests {
         let r = result.as_tensor().as_f32();
         let e = expected.as_tensor().as_f32();
         for i in 0..r.len() {
-            assert!((r[i] - e[i]).abs() < 1e-5, "mismatch at {}: {} vs {}", i, r[i], e[i]);
+            assert!(
+                (r[i] - e[i]).abs() < 1e-5,
+                "mismatch at {}: {} vs {}",
+                i,
+                r[i],
+                e[i]
+            );
         }
     }
 
@@ -2453,12 +2837,12 @@ mod tests {
         let num_heads = 2;
         let head_dim = 2;
         let total_dim = num_heads * head_dim; // 4
-        // seq_len=1: [3.0, 4.0, 0.1, 0.1]
-        // Head 0: [3.0, 4.0], Head 1: [0.1, 0.1]
-        // RMS of head 0 = sqrt((9+16)/2) = sqrt(12.5) ≈ 3.536
-        // RMS of head 1 = sqrt((0.01+0.01)/2) = sqrt(0.01) = 0.1
-        // Per-head norm produces very different scales for the two heads,
-        // whereas full-dim norm would use a single RMS over all 4 values.
+                                              // seq_len=1: [3.0, 4.0, 0.1, 0.1]
+                                              // Head 0: [3.0, 4.0], Head 1: [0.1, 0.1]
+                                              // RMS of head 0 = sqrt((9+16)/2) = sqrt(12.5) ≈ 3.536
+                                              // RMS of head 1 = sqrt((0.01+0.01)/2) = sqrt(0.01) = 0.1
+                                              // Per-head norm produces very different scales for the two heads,
+                                              // whereas full-dim norm would use a single RMS over all 4 values.
         let input = dt(Tensor::new(vec![1, total_dim], vec![3.0, 4.0, 0.1, 0.1]));
         let weight = ones_weight(head_dim);
 
@@ -2479,14 +2863,24 @@ mod tests {
                 break;
             }
         }
-        assert!(any_different, "per-head norm should differ from full-dim norm when heads have different magnitudes");
+        assert!(
+            any_different,
+            "per-head norm should differ from full-dim norm when heads have different magnitudes"
+        );
 
         // Per-head: head 0 values should be roughly [3/3.536, 4/3.536] ≈ [0.849, 1.131]
         // Per-head: head 1 values should be roughly [0.1/0.1, 0.1/0.1] = [1.0, 1.0]
-        assert!((ph[0] - 3.0 / (12.5f32).sqrt()).abs() < 1e-3,
-            "head 0 elem 0: expected ~{}, got {}", 3.0 / (12.5f32).sqrt(), ph[0]);
-        assert!((ph[2] - 1.0).abs() < 1e-3,
-            "head 1 elem 0: expected ~1.0, got {}", ph[2]);
+        assert!(
+            (ph[0] - 3.0 / (12.5f32).sqrt()).abs() < 1e-3,
+            "head 0 elem 0: expected ~{}, got {}",
+            3.0 / (12.5f32).sqrt(),
+            ph[0]
+        );
+        assert!(
+            (ph[2] - 1.0).abs() < 1e-3,
+            "head 1 elem 0: expected ~1.0, got {}",
+            ph[2]
+        );
     }
 
     #[test]
@@ -2497,7 +2891,9 @@ mod tests {
         let seq_len = 5;
         let total_dim = num_heads * head_dim; // 12
 
-        let input_data: Vec<f32> = (0..seq_len * total_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let input_data: Vec<f32> = (0..seq_len * total_dim)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, total_dim], input_data));
         let weight = ones_weight(head_dim);
 
@@ -2506,7 +2902,11 @@ mod tests {
 
         // All values should be finite
         for &v in result.as_tensor().as_f32() {
-            assert!(v.is_finite(), "rms_norm_per_head produced non-finite value: {}", v);
+            assert!(
+                v.is_finite(),
+                "rms_norm_per_head produced non-finite value: {}",
+                v
+            );
         }
     }
 
@@ -2516,8 +2916,11 @@ mod tests {
 
     /// Create a GemmaEmbedding-style config for testing.
     fn gemma_embedding_config(
-        hidden_size: usize, num_heads: usize, num_kv_heads: usize,
-        head_dim: usize, ffn_hidden: usize,
+        hidden_size: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        ffn_hidden: usize,
     ) -> ModelConfig {
         ModelConfig {
             arch: ModelArch::GemmaEmbedding,
@@ -2555,7 +2958,10 @@ mod tests {
 
     /// Create minimal LayerWeights for GemmaEmbedding with per-head norms and post-projection norms.
     fn gemma_embedding_layer_weights(
-        hidden_size: usize, num_kv_heads: usize, head_dim: usize, ffn_hidden: usize,
+        hidden_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        ffn_hidden: usize,
     ) -> LayerWeights {
         let kv_dim = num_kv_heads * head_dim;
         LayerWeights {
@@ -2596,11 +3002,14 @@ mod tests {
         let head_dim = 4;
         let ffn_hidden = 16;
 
-        let config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        let config =
+            gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
         let layer = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
 
         let seq_len = 3;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
@@ -2608,7 +3017,11 @@ mod tests {
         assert_eq!(output.shape(), &[seq_len, hidden_size]);
 
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "GemmaEmbedding layer produced non-finite value: {}", v);
+            assert!(
+                v.is_finite(),
+                "GemmaEmbedding layer produced non-finite value: {}",
+                v
+            );
         }
     }
 
@@ -2623,11 +3036,14 @@ mod tests {
         let head_dim = 4;
         let ffn_hidden = 8;
 
-        let config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        let config =
+            gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
         let layer = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
 
         let seq_len = 2;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
@@ -2635,7 +3051,11 @@ mod tests {
         assert_eq!(output.shape(), &[seq_len, hidden_size]);
 
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "GemmaEmbedding GQA layer produced non-finite value: {}", v);
+            assert!(
+                v.is_finite(),
+                "GemmaEmbedding GQA layer produced non-finite value: {}",
+                v
+            );
         }
     }
 
@@ -2650,31 +3070,55 @@ mod tests {
         let head_dim = 4;
         let ffn_hidden = 16;
 
-        let config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        let config =
+            gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
 
         // Layer WITH post-norms (use non-trivial weights to see a difference)
-        let mut layer_with = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        let mut layer_with =
+            gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
         // Use non-identity attn weights so attention actually does something
-        let attn_data: Vec<f32> = (0..hidden_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
-        layer_with.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
-        layer_with.attn_k = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
-        layer_with.attn_v = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+        let attn_data: Vec<f32> = (0..hidden_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
+        layer_with.attn_q = dt(Tensor::new(
+            vec![hidden_size, hidden_size],
+            attn_data.clone(),
+        ));
+        layer_with.attn_k = dt(Tensor::new(
+            vec![hidden_size, hidden_size],
+            attn_data.clone(),
+        ));
+        layer_with.attn_v = dt(Tensor::new(
+            vec![hidden_size, hidden_size],
+            attn_data.clone(),
+        ));
 
         // Layer WITHOUT post-norms (but otherwise identical)
-        let mut layer_without = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
-        layer_without.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
-        layer_without.attn_k = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+        let mut layer_without =
+            gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        layer_without.attn_q = dt(Tensor::new(
+            vec![hidden_size, hidden_size],
+            attn_data.clone(),
+        ));
+        layer_without.attn_k = dt(Tensor::new(
+            vec![hidden_size, hidden_size],
+            attn_data.clone(),
+        ));
         layer_without.attn_v = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data));
         layer_without.attn_post_norm_w = None;
         layer_without.ffn_post_norm_w = None;
 
         let seq_len = 2;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32 + 1.0) * 0.5)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
-        let output_with = transformer_layer_forward(&input, &layer_with, &config, &b, 0, &mask, None);
-        let output_without = transformer_layer_forward(&input, &layer_without, &config, &b, 0, &mask, None);
+        let output_with =
+            transformer_layer_forward(&input, &layer_with, &config, &b, 0, &mask, None);
+        let output_without =
+            transformer_layer_forward(&input, &layer_without, &config, &b, 0, &mask, None);
 
         let data_w = output_with.as_tensor().as_f32();
         let data_wo = output_without.as_tensor().as_f32();
@@ -2686,7 +3130,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_different, "Post-norms should change the output when attention weights are non-zero");
+        assert!(
+            any_different,
+            "Post-norms should change the output when attention weights are non-zero"
+        );
     }
 
     #[test]
@@ -2699,23 +3146,33 @@ mod tests {
         let head_dim = 4;
         let ffn_hidden = 16;
 
-        let config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        let config =
+            gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
 
         // Use non-zero K and V weights so attention actually does something
-        let attn_data: Vec<f32> = (0..hidden_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let attn_data: Vec<f32> = (0..hidden_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let kv_dim = num_kv_heads * head_dim;
-        let kv_data: Vec<f32> = (0..kv_dim * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let kv_data: Vec<f32> = (0..kv_dim * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
 
         // Layer WITH per-head Q/K norms (using weight 2.0 so it's different from 1.0)
-        let mut layer_with = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
-        layer_with.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+        let mut layer_with =
+            gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        layer_with.attn_q = dt(Tensor::new(
+            vec![hidden_size, hidden_size],
+            attn_data.clone(),
+        ));
         layer_with.attn_k = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
         layer_with.attn_v = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
         layer_with.attn_q_norm_w = Some(dt(Tensor::new(vec![head_dim], vec![2.0f32; head_dim])));
         layer_with.attn_k_norm_w = Some(dt(Tensor::new(vec![head_dim], vec![2.0f32; head_dim])));
 
         // Layer WITHOUT per-head norms (but same attention weights)
-        let mut layer_without = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        let mut layer_without =
+            gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
         layer_without.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data));
         layer_without.attn_k = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
         layer_without.attn_v = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data));
@@ -2723,12 +3180,16 @@ mod tests {
         layer_without.attn_k_norm_w = None;
 
         let seq_len = 2;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32 + 1.0) * 0.5)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
-        let output_with = transformer_layer_forward(&input, &layer_with, &config, &b, 0, &mask, None);
-        let output_without = transformer_layer_forward(&input, &layer_without, &config, &b, 0, &mask, None);
+        let output_with =
+            transformer_layer_forward(&input, &layer_with, &config, &b, 0, &mask, None);
+        let output_without =
+            transformer_layer_forward(&input, &layer_without, &config, &b, 0, &mask, None);
 
         let data_w = output_with.as_tensor().as_f32();
         let data_wo = output_without.as_tensor().as_f32();
@@ -2740,7 +3201,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_different, "Per-head Q/K norms with weight=2.0 should produce different output than no norms");
+        assert!(
+            any_different,
+            "Per-head Q/K norms with weight=2.0 should produce different output than no norms"
+        );
     }
 
     #[test]
@@ -2756,12 +3220,19 @@ mod tests {
         let max_seq_len = 128;
         let config = bert_config(hidden_size, num_heads, head_dim, ffn_hidden);
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
-        let pos_emb_data: Vec<f32> = (0..max_seq_len * hidden_size).map(|i| (i as f32) * 0.001).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
+        let pos_emb_data: Vec<f32> = (0..max_seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.001)
+            .collect();
 
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
-            position_embedding: Some(dt(Tensor::new(vec![max_seq_len, hidden_size], pos_emb_data))),
+            position_embedding: Some(dt(Tensor::new(
+                vec![max_seq_len, hidden_size],
+                pos_emb_data,
+            ))),
             token_type_embedding: None,
             embedding_norm_w: Some(ones_weight(hidden_size)),
             embedding_norm_b: Some(zeros_bias(hidden_size)),
@@ -2779,7 +3250,10 @@ mod tests {
         let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
         assert_eq!(output.shape(), &[4, hidden_size]);
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "BERT model_forward without output_norm produced non-finite value");
+            assert!(
+                v.is_finite(),
+                "BERT model_forward without output_norm produced non-finite value"
+            );
         }
     }
 
@@ -2794,10 +3268,13 @@ mod tests {
         let ffn_hidden = 8;
         let vocab_size = 16;
 
-        let mut config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        let mut config =
+            gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
         config.vocab_size = vocab_size;
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let layer = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
 
         let weights = ModelWeights {
@@ -2820,13 +3297,19 @@ mod tests {
         let output = model_forward(input_ids, attention_mask, &weights, &config, &b, 0).unwrap();
         assert_eq!(output.shape(), &[3, hidden_size]);
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "GemmaEmbedding model_forward produced non-finite value: {}", v);
+            assert!(
+                v.is_finite(),
+                "GemmaEmbedding model_forward produced non-finite value: {}",
+                v
+            );
         }
 
         // Verify embedding scale is applied (output should differ from unscaled)
         let mut config_no_scale = config.clone();
         config_no_scale.embedding_scale = 1.0;
-        let embedding_data2: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data2: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let layer2 = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
         let weights2 = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data2)),
@@ -2841,7 +3324,15 @@ mod tests {
             rope_factors_short: None,
             rope_factors_long: None,
         };
-        let output_no_scale = model_forward(input_ids, attention_mask, &weights2, &config_no_scale, &b, 0).unwrap();
+        let output_no_scale = model_forward(
+            input_ids,
+            attention_mask,
+            &weights2,
+            &config_no_scale,
+            &b,
+            0,
+        )
+        .unwrap();
         let d1 = output.as_tensor().as_f32();
         let d2 = output_no_scale.as_tensor().as_f32();
         let mut any_diff = false;
@@ -2866,17 +3357,25 @@ mod tests {
         let ffn_hidden = 16;
         let vocab_size = 16;
 
-        let mut config = gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
+        let mut config =
+            gemma_embedding_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
         config.vocab_size = vocab_size;
         assert!(!config.causal, "GemmaEmbedding should be bidirectional");
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.05).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.05)
+            .collect();
 
         // Use non-zero K and V weights so attention actually attends across positions
-        let mut layer = gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
-        let attn_data: Vec<f32> = (0..hidden_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let mut layer =
+            gemma_embedding_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        let attn_data: Vec<f32> = (0..hidden_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let kv_dim = num_kv_heads * head_dim;
-        let kv_data: Vec<f32> = (0..kv_dim * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let kv_data: Vec<f32> = (0..kv_dim * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         layer.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data));
         layer.attn_k = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
         layer.attn_v = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data));
@@ -2905,7 +3404,10 @@ mod tests {
         let d1 = out1.as_tensor().as_f32();
         let d2 = out2.as_tensor().as_f32();
         let pos0_differs = (0..hidden_size).any(|j| (d1[j] - d2[j]).abs() > 1e-6);
-        assert!(pos0_differs, "Bidirectional: changing token at pos 2 should affect output at pos 0");
+        assert!(
+            pos0_differs,
+            "Bidirectional: changing token at pos 2 should affect output at pos 0"
+        );
     }
 
     // ====================================================================
@@ -2914,8 +3416,11 @@ mod tests {
 
     /// Create a Qwen3-style config for testing.
     fn qwen3_config(
-        hidden_size: usize, num_heads: usize, num_kv_heads: usize,
-        head_dim: usize, ffn_hidden: usize,
+        hidden_size: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        ffn_hidden: usize,
     ) -> ModelConfig {
         ModelConfig {
             arch: ModelArch::Qwen3,
@@ -2953,7 +3458,10 @@ mod tests {
 
     /// Create minimal LayerWeights for Qwen3 with per-head Q/K norms.
     fn qwen3_layer_weights(
-        hidden_size: usize, num_kv_heads: usize, head_dim: usize, ffn_hidden: usize,
+        hidden_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        ffn_hidden: usize,
     ) -> LayerWeights {
         let kv_dim = num_kv_heads * head_dim;
         LayerWeights {
@@ -2998,7 +3506,9 @@ mod tests {
         let layer = qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
 
         let seq_len = 3;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
@@ -3006,7 +3516,11 @@ mod tests {
         assert_eq!(output.shape(), &[seq_len, hidden_size]);
 
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "Qwen3 layer produced non-finite value: {}", v);
+            assert!(
+                v.is_finite(),
+                "Qwen3 layer produced non-finite value: {}",
+                v
+            );
         }
     }
 
@@ -3023,19 +3537,27 @@ mod tests {
         let config = qwen3_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
 
         let kv_dim = num_kv_heads * head_dim;
-        let kv_data: Vec<f32> = (0..kv_dim * hidden_size).map(|i| (i as f32) * 0.01).collect();
-        let attn_data: Vec<f32> = (0..hidden_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let kv_data: Vec<f32> = (0..kv_dim * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
+        let attn_data: Vec<f32> = (0..hidden_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
 
         // Layer WITH per-head Q/K norms (weight=2.0)
         let mut layer_with = qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
-        layer_with.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data.clone()));
+        layer_with.attn_q = dt(Tensor::new(
+            vec![hidden_size, hidden_size],
+            attn_data.clone(),
+        ));
         layer_with.attn_k = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
         layer_with.attn_v = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
         layer_with.attn_q_norm_w = Some(dt(Tensor::new(vec![head_dim], vec![2.0f32; head_dim])));
         layer_with.attn_k_norm_w = Some(dt(Tensor::new(vec![head_dim], vec![2.0f32; head_dim])));
 
         // Layer WITHOUT per-head norms (same attention weights)
-        let mut layer_without = qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
+        let mut layer_without =
+            qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
         layer_without.attn_q = dt(Tensor::new(vec![hidden_size, hidden_size], attn_data));
         layer_without.attn_k = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data.clone()));
         layer_without.attn_v = dt(Tensor::new(vec![kv_dim, hidden_size], kv_data));
@@ -3043,12 +3565,16 @@ mod tests {
         layer_without.attn_k_norm_w = None;
 
         let seq_len = 2;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32 + 1.0) * 0.5)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
-        let output_with = transformer_layer_forward(&input, &layer_with, &config, &b, 0, &mask, None);
-        let output_without = transformer_layer_forward(&input, &layer_without, &config, &b, 0, &mask, None);
+        let output_with =
+            transformer_layer_forward(&input, &layer_with, &config, &b, 0, &mask, None);
+        let output_without =
+            transformer_layer_forward(&input, &layer_without, &config, &b, 0, &mask, None);
 
         let data_w = output_with.as_tensor().as_f32();
         let data_wo = output_without.as_tensor().as_f32();
@@ -3072,7 +3598,9 @@ mod tests {
         let layer = qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden);
 
         let seq_len = 3;
-        let input_data: Vec<f32> = (0..seq_len * hidden_size).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let input_data: Vec<f32> = (0..seq_len * hidden_size)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
         let input = dt(Tensor::new(vec![seq_len, hidden_size], input_data));
         let mask = vec![1.0f32; seq_len];
 
@@ -3080,7 +3608,11 @@ mod tests {
         assert_eq!(output.shape(), &[seq_len, hidden_size]);
 
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "Qwen3 GQA with per-head norms produced non-finite value: {}", v);
+            assert!(
+                v.is_finite(),
+                "Qwen3 GQA with per-head norms produced non-finite value: {}",
+                v
+            );
         }
     }
 
@@ -3098,14 +3630,21 @@ mod tests {
         let mut config = qwen3_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
         config.num_layers = 1;
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
             token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
-            layers: vec![qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden)],
+            layers: vec![qwen3_layer_weights(
+                hidden_size,
+                num_kv_heads,
+                head_dim,
+                ffn_hidden,
+            )],
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
@@ -3126,7 +3665,10 @@ mod tests {
         assert_eq!(cache.len(), 4);
 
         for &v in output.as_tensor().as_f32() {
-            assert!(v.is_finite(), "Qwen3 cached decode with per-head norms produced non-finite value");
+            assert!(
+                v.is_finite(),
+                "Qwen3 cached decode with per-head norms produced non-finite value"
+            );
         }
     }
 
@@ -3145,14 +3687,21 @@ mod tests {
         let mut config = qwen3_config(hidden_size, num_heads, num_kv_heads, head_dim, ffn_hidden);
         config.num_layers = 1;
 
-        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size).map(|i| (i as f32) * 0.01).collect();
+        let embedding_data: Vec<f32> = (0..vocab_size * hidden_size)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
         let weights = ModelWeights {
             token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data)),
             position_embedding: None,
             token_type_embedding: None,
             embedding_norm_w: None,
             embedding_norm_b: None,
-            layers: vec![qwen3_layer_weights(hidden_size, num_kv_heads, head_dim, ffn_hidden)],
+            layers: vec![qwen3_layer_weights(
+                hidden_size,
+                num_kv_heads,
+                head_dim,
+                ffn_hidden,
+            )],
             output_norm_w: Some(ones_weight(hidden_size)),
             output_norm_b: None,
             output_projection: None,
@@ -3177,7 +3726,9 @@ mod tests {
             assert!(
                 (uncached_data[i] - cached_data[i]).abs() < 1e-4,
                 "Qwen3 cached vs uncached mismatch at {}: uncached={} cached={}",
-                i, uncached_data[i], cached_data[i]
+                i,
+                uncached_data[i],
+                cached_data[i]
             );
         }
     }
@@ -3205,8 +3756,7 @@ mod tests {
         let k = dt(Tensor::new(vec![1, 4], k_data.clone()));
 
         let (q_rot, k_rot) = rope_neox_with_factors(
-            &q, &k, pos_offset, freq_base, head_dim, rope_dim,
-            &factors, mscale, &b,
+            &q, &k, pos_offset, freq_base, head_dim, rope_dim, &factors, mscale, &b,
         );
 
         // Manual computation
@@ -3240,24 +3790,30 @@ mod tests {
         for i in 0..4 {
             assert!(
                 (q_out[i] - expected_q[i]).abs() < 1e-5,
-                "Q mismatch at {}: got {} expected {}", i, q_out[i], expected_q[i]
+                "Q mismatch at {}: got {} expected {}",
+                i,
+                q_out[i],
+                expected_q[i]
             );
             assert!(
                 (k_out[i] - expected_k[i]).abs() < 1e-5,
-                "K mismatch at {}: got {} expected {}", i, k_out[i], expected_k[i]
+                "K mismatch at {}: got {} expected {}",
+                i,
+                k_out[i],
+                expected_k[i]
             );
         }
 
         // Verify mscale != 1.0 actually changes the output magnitude
         let (q_no_scale, _) = rope_neox_with_factors(
-            &q, &k, pos_offset, freq_base, head_dim, rope_dim,
-            &factors, 1.0, &b,
+            &q, &k, pos_offset, freq_base, head_dim, rope_dim, &factors, 1.0, &b,
         );
         let q_ns = q_no_scale.as_tensor().as_f32();
         for i in 0..4 {
             assert!(
                 (q_out[i] - q_ns[i] * mscale).abs() < 1e-5,
-                "mscale should linearly scale output at {}", i
+                "mscale should linearly scale output at {}",
+                i
             );
         }
     }
@@ -3294,7 +3850,9 @@ mod tests {
             assert!(
                 (q1_data[i] - q2_data[i]).abs() < 1e-5,
                 "factor=2 at pos=10 should match factor=1 at pos=5 (idx {}): {} vs {}",
-                i, q2_data[i], q1_data[i]
+                i,
+                q2_data[i],
+                q1_data[i]
             );
         }
 
@@ -3310,7 +3868,10 @@ mod tests {
                 break;
             }
         }
-        assert!(different, "Different positions should produce different rotations");
+        assert!(
+            different,
+            "Different positions should produce different rotations"
+        );
     }
 
     #[test]
@@ -3342,7 +3903,10 @@ mod tests {
         let long_factors = vec![0.5f32; head_dim / 2];
 
         let weights_with_factors = ModelWeights {
-            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data.clone())),
+            token_embedding: dt(Tensor::new(
+                vec![vocab_size, hidden_size],
+                embedding_data.clone(),
+            )),
             position_embedding: None,
             token_type_embedding: None,
             embedding_norm_w: None,
@@ -3375,11 +3939,19 @@ mod tests {
 
         // Run with LongRoPE factors (max_seq_len=32 < original_ctx=64 → uses short factors)
         let mut cache1 = KvCache::new(&config);
-        let out_factored = model_forward_step(input_ids, &weights_with_factors, &config, &b, &mut cache1).unwrap();
+        let out_factored =
+            model_forward_step(input_ids, &weights_with_factors, &config, &b, &mut cache1).unwrap();
 
         // Run without LongRoPE factors
         let mut cache2 = KvCache::new(&config_no_longrope);
-        let out_unfactored = model_forward_step(input_ids, &weights_no_factors, &config_no_longrope, &b, &mut cache2).unwrap();
+        let out_unfactored = model_forward_step(
+            input_ids,
+            &weights_no_factors,
+            &config_no_longrope,
+            &b,
+            &mut cache2,
+        )
+        .unwrap();
 
         // Outputs should differ because factored RoPE changes rotation frequencies
         let data_f = out_factored.as_tensor().as_f32();
@@ -3393,14 +3965,24 @@ mod tests {
                 break;
             }
         }
-        assert!(any_different, "LongRoPE factors should change outputs vs unfactored RoPE");
+        assert!(
+            any_different,
+            "LongRoPE factors should change outputs vs unfactored RoPE"
+        );
 
         // Now test long factor selection: max_seq_len > original_ctx → uses long factors
         let mut config_long = config.clone();
         config_long.max_seq_len = 128; // > original_ctx=64
 
         let mut cache3 = KvCache::new(&config_long);
-        let out_long = model_forward_step(input_ids, &weights_with_factors, &config_long, &b, &mut cache3).unwrap();
+        let out_long = model_forward_step(
+            input_ids,
+            &weights_with_factors,
+            &config_long,
+            &b,
+            &mut cache3,
+        )
+        .unwrap();
 
         let data_l = out_long.as_tensor().as_f32();
 
@@ -3412,7 +3994,10 @@ mod tests {
                 break;
             }
         }
-        assert!(long_vs_short_differ, "Long vs short factors should produce different outputs");
+        assert!(
+            long_vs_short_differ,
+            "Long vs short factors should produce different outputs"
+        );
 
         // All outputs should be finite
         for &v in data_f.iter().chain(data_l.iter()) {
@@ -3447,7 +4032,10 @@ mod tests {
         let long_factors = vec![0.5f32; head_dim / 2];
 
         let weights_with_factors = ModelWeights {
-            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data.clone())),
+            token_embedding: dt(Tensor::new(
+                vec![vocab_size, hidden_size],
+                embedding_data.clone(),
+            )),
             position_embedding: None,
             token_type_embedding: None,
             embedding_norm_w: None,
@@ -3480,10 +4068,19 @@ mod tests {
         let mask = &[1.0f32, 1.0, 1.0];
 
         // Run model_forward WITH LongRoPE factors
-        let out_factored = model_forward(input_ids, mask, &weights_with_factors, &config, &b, 0).unwrap();
+        let out_factored =
+            model_forward(input_ids, mask, &weights_with_factors, &config, &b, 0).unwrap();
 
         // Run model_forward WITHOUT LongRoPE factors
-        let out_unfactored = model_forward(input_ids, mask, &weights_no_factors, &config_no_longrope, &b, 0).unwrap();
+        let out_unfactored = model_forward(
+            input_ids,
+            mask,
+            &weights_no_factors,
+            &config_no_longrope,
+            &b,
+            0,
+        )
+        .unwrap();
 
         let data_f = out_factored.as_tensor().as_f32();
         let data_u = out_unfactored.as_tensor().as_f32();
@@ -3498,12 +4095,17 @@ mod tests {
                 break;
             }
         }
-        assert!(any_different,
-            "model_forward with LongRoPE factors must produce different output than without");
+        assert!(
+            any_different,
+            "model_forward with LongRoPE factors must produce different output than without"
+        );
 
         // All outputs should be finite
         for &v in data_f.iter() {
-            assert!(v.is_finite(), "Non-finite value in model_forward LongRoPE output");
+            assert!(
+                v.is_finite(),
+                "Non-finite value in model_forward LongRoPE output"
+            );
         }
     }
 
@@ -3528,7 +4130,10 @@ mod tests {
         let long_factors = vec![0.5f32; head_dim / 2];
 
         let make_weights = |short: Vec<f32>, long: Vec<f32>| ModelWeights {
-            token_embedding: dt(Tensor::new(vec![vocab_size, hidden_size], embedding_data.clone())),
+            token_embedding: dt(Tensor::new(
+                vec![vocab_size, hidden_size],
+                embedding_data.clone(),
+            )),
             position_embedding: None,
             token_type_embedding: None,
             embedding_norm_w: None,
@@ -3581,7 +4186,9 @@ mod tests {
                 break;
             }
         }
-        assert!(any_different,
-            "Boundary: max_seq_len > original_ctx (long) should differ from == (short)");
+        assert!(
+            any_different,
+            "Boundary: max_seq_len > original_ctx (long) should differ from == (short)"
+        );
     }
 }

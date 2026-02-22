@@ -75,7 +75,10 @@ struct Args {
 fn validate_output_format(s: &str) -> Result<String, String> {
     match s {
         "text" | "json" => Ok(s.to_string()),
-        _ => Err(format!("Unknown output format '{}'. Options: text, json", s)),
+        _ => Err(format!(
+            "Unknown output format '{}'. Options: text, json",
+            s
+        )),
     }
 }
 
@@ -121,7 +124,9 @@ fn main() {
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.profile {
-        unsafe { std::env::set_var("STRATA_PROFILE", "1"); }
+        unsafe {
+            std::env::set_var("STRATA_PROFILE", "1");
+        }
     }
     let model_path = cli::model::resolve_model(&args.model)?;
     let input = cli::read_input(args.prompt.as_deref(), args.file.as_deref(), false)?;
@@ -130,7 +135,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load model with explicit backend selection
     let load_start = Instant::now();
-    let mut engine = GenerationEngine::from_gguf_with_options(&model_path, &args.backend, args.ctx)?;
+    let mut engine =
+        GenerationEngine::from_gguf_with_options(&model_path, &args.backend, args.ctx)?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
     // Build generation config

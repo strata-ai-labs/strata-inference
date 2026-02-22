@@ -4,11 +4,11 @@
 //! and [`DeviceTensor`] as a wrapper for tensors that live on a compute device.
 
 pub mod cpu;
-#[cfg(all(feature = "metal", target_os = "macos"))]
-pub mod metal;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 mod dl;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
 
 use std::any::Any;
 use std::sync::Arc;
@@ -263,12 +263,7 @@ pub trait ComputeBackend: Send + Sync {
     /// dest must be pre-allocated as `[max_rows, cols]`.
     /// src: `[n_rows, cols]`.
     /// Writes src into `dest[dest_row_offset..dest_row_offset + n_rows]`.
-    fn copy_rows_into(
-        &self,
-        dest: &DeviceTensor,
-        src: &DeviceTensor,
-        dest_row_offset: usize,
-    );
+    fn copy_rows_into(&self, dest: &DeviceTensor, src: &DeviceTensor, dest_row_offset: usize);
 
     /// Grouped-query attention for single-token decode.
     ///

@@ -43,11 +43,11 @@ impl TensorDtype {
         match self {
             TensorDtype::F32 => 4,
             TensorDtype::F16 => 2,
-            TensorDtype::Q8_0 => 34,  // 2 bytes f16 scale + 32 bytes i8 values
-            TensorDtype::Q4_0 => 18,  // 2 bytes f16 scale + 16 bytes (32 nibbles)
-            TensorDtype::Q4_1 => 20,  // 2*f16 + 16 bytes
-            TensorDtype::Q5_0 => 22,  // f16 + 4 + 16 bytes
-            TensorDtype::Q5_1 => 24,  // 2*f16 + 4 + 16 bytes
+            TensorDtype::Q8_0 => 34, // 2 bytes f16 scale + 32 bytes i8 values
+            TensorDtype::Q4_0 => 18, // 2 bytes f16 scale + 16 bytes (32 nibbles)
+            TensorDtype::Q4_1 => 20, // 2*f16 + 16 bytes
+            TensorDtype::Q5_0 => 22, // f16 + 4 + 16 bytes
+            TensorDtype::Q5_1 => 24, // 2*f16 + 4 + 16 bytes
             TensorDtype::Q4_K => 144, // 2*f16 + 12 + 128 bytes
             TensorDtype::Q5_K => 176, // 2*f16 + 12 + 32 + 128 bytes
             TensorDtype::Q6_K => 210, // f16 + 16 + 64 + 128 bytes
@@ -282,13 +282,11 @@ impl Tensor {
                 for block_idx in 0..n_blocks {
                     let block_start = block_idx * 34;
                     // First 2 bytes: f16 scale
-                    let scale_bits =
-                        u16::from_le_bytes([raw[block_start], raw[block_start + 1]]);
+                    let scale_bits = u16::from_le_bytes([raw[block_start], raw[block_start + 1]]);
                     let scale = half::f16::from_bits(scale_bits).to_f32();
 
                     // Next 32 bytes: i8 quantized values
-                    let values_in_block =
-                        std::cmp::min(32, n_elements - block_idx * 32);
+                    let values_in_block = std::cmp::min(32, n_elements - block_idx * 32);
                     for i in 0..values_in_block {
                         let qs = raw[block_start + 2 + i] as i8;
                         output[block_idx * 32 + i] = scale * qs as f32;
@@ -314,8 +312,7 @@ impl Tensor {
                 for block_idx in 0..n_blocks {
                     let block_start = block_idx * 18;
                     // First 2 bytes: f16 scale
-                    let scale_bits =
-                        u16::from_le_bytes([raw[block_start], raw[block_start + 1]]);
+                    let scale_bits = u16::from_le_bytes([raw[block_start], raw[block_start + 1]]);
                     let scale = half::f16::from_bits(scale_bits).to_f32();
 
                     // Next 16 bytes: 32 4-bit values packed into 16 bytes.
@@ -344,8 +341,12 @@ impl Tensor {
                     storage: TensorStorage::F32(output),
                 }
             }
-            TensorDtype::Q4_1 | TensorDtype::Q5_0 | TensorDtype::Q5_1
-            | TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => {
+            TensorDtype::Q4_1
+            | TensorDtype::Q5_0
+            | TensorDtype::Q5_1
+            | TensorDtype::Q4_K
+            | TensorDtype::Q5_K
+            | TensorDtype::Q6_K => {
                 let raw = match &self.storage {
                     TensorStorage::Quantized(data) => data,
                     _ => unreachable!("{:?} dtype must have Quantized storage", self.dtype),
@@ -497,14 +498,23 @@ mod tests {
     #[test]
     fn test_f16_to_f32() {
         let vals: Vec<f32> = vec![1.0, -0.5, 3.14, 0.0];
-        let bits: Vec<u16> = vals.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        let bits: Vec<u16> = vals
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
         let t = Tensor::from_f16(vec![4], bits);
         let converted = t.to_f32();
         assert_eq!(converted.dtype(), TensorDtype::F32);
         let data = converted.as_f32();
         for (i, &expected) in vals.iter().enumerate() {
             let diff = (data[i] - expected).abs();
-            assert!(diff < 0.01, "F16 round-trip failed at index {}: expected {}, got {}", i, expected, data[i]);
+            assert!(
+                diff < 0.01,
+                "F16 round-trip failed at index {}: expected {}, got {}",
+                i,
+                expected,
+                data[i]
+            );
         }
     }
 
@@ -589,12 +599,16 @@ mod tests {
             assert!(
                 (data[j] - expected).abs() < 1e-6,
                 "Q4_0 low nibble at {}: expected {}, got {}",
-                j, expected, data[j]
+                j,
+                expected,
+                data[j]
             );
             assert!(
                 (data[j + 16] - expected).abs() < 1e-6,
                 "Q4_0 high nibble at {}: expected {}, got {}",
-                j + 16, expected, data[j + 16]
+                j + 16,
+                expected,
+                data[j + 16]
             );
         }
     }

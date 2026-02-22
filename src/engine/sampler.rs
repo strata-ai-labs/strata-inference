@@ -103,7 +103,10 @@ pub fn sample_token(logits: &[f32], config: &SamplingConfig, rng: &mut XorShiftR
     }
 
     // Softmax over candidates
-    let max_logit = candidates.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
+    let max_logit = candidates
+        .iter()
+        .map(|c| c.1)
+        .fold(f32::NEG_INFINITY, f32::max);
     let mut probs: Vec<(u32, f32)> = candidates
         .iter()
         .map(|&(idx, logit)| (idx, (logit - max_logit).exp()))
@@ -263,7 +266,11 @@ mod tests {
                 count_top += 1;
             }
         }
-        assert!(count_top > 90, "Low temp should favor top token, got {}/100", count_top);
+        assert!(
+            count_top > 90,
+            "Low temp should favor top token, got {}/100",
+            count_top
+        );
     }
 
     #[test]
@@ -279,7 +286,11 @@ mod tests {
         // top_k=2 keeps indices 1,2 (logits 10,9)
         // top_p=0.5 further limits; token 1 has ~73% probability, so it alone exceeds 0.5
         let token = sample_token(&logits, &config, &mut rng);
-        assert!(token == 1 || token == 2, "Should only pick from top-2, got {}", token);
+        assert!(
+            token == 1 || token == 2,
+            "Should only pick from top-2, got {}",
+            token
+        );
     }
 
     #[test]

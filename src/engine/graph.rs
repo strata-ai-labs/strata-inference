@@ -160,7 +160,6 @@ pub(crate) enum ParamValue {
     CacheRowOffset,
 
     // --- Prefill-specific variants ---
-
     /// Buffer of M u32 token IDs (bound as a buffer).
     PrefillTokenIds,
     /// Buffer of M u32 position IDs [0..M) (bound as a buffer).
@@ -186,11 +185,28 @@ pub(crate) enum DispatchDims {
     /// 2D: threadgroup counts and threads per threadgroup.
     D2 { gx: u32, gy: u32, tx: u32, ty: u32 },
     /// 3D: explicit threadgroups and threads.
-    D3 { gx: u32, gy: u32, gz: u32, tx: u32, ty: u32, tz: u32 },
+    D3 {
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        tx: u32,
+        ty: u32,
+        tz: u32,
+    },
     /// One threadgroup per row, with a given number of threads.
-    Rows { num_rows: u32, threads_per_group: u32 },
+    Rows {
+        num_rows: u32,
+        threads_per_group: u32,
+    },
     /// Fixed groups and threads specified directly.
-    Fixed { gx: u32, gy: u32, gz: u32, tx: u32, ty: u32, tz: u32 },
+    Fixed {
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        tx: u32,
+        ty: u32,
+        tz: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -253,51 +269,105 @@ pub(crate) fn weight_walk_order_with_factors(
 
     // Global weights
     out.push(&weights.token_embedding);
-    if let Some(ref w) = weights.position_embedding { out.push(w); }
-    if let Some(ref w) = weights.output_norm_w { out.push(w); }
-    if let Some(ref w) = weights.output_norm_b { out.push(w); }
-    if let Some(ref w) = weights.output_projection { out.push(w); }
+    if let Some(ref w) = weights.position_embedding {
+        out.push(w);
+    }
+    if let Some(ref w) = weights.output_norm_w {
+        out.push(w);
+    }
+    if let Some(ref w) = weights.output_norm_b {
+        out.push(w);
+    }
+    if let Some(ref w) = weights.output_projection {
+        out.push(w);
+    }
     // LongRoPE frequency factors: put the active factors first.
     // The graph always binds the first slot; the second is kept for potential runtime swap.
     if use_long_factors {
-        if let Some(ref w) = weights.rope_factors_long { out.push(w); }
-        if let Some(ref w) = weights.rope_factors_short { out.push(w); }
+        if let Some(ref w) = weights.rope_factors_long {
+            out.push(w);
+        }
+        if let Some(ref w) = weights.rope_factors_short {
+            out.push(w);
+        }
     } else {
-        if let Some(ref w) = weights.rope_factors_short { out.push(w); }
-        if let Some(ref w) = weights.rope_factors_long { out.push(w); }
+        if let Some(ref w) = weights.rope_factors_short {
+            out.push(w);
+        }
+        if let Some(ref w) = weights.rope_factors_long {
+            out.push(w);
+        }
     }
 
     // Per-layer weights
     for layer in &weights.layers {
-        if let Some(ref w) = layer.attn_norm_w { out.push(w); }
-        if let Some(ref w) = layer.attn_norm_b { out.push(w); }
+        if let Some(ref w) = layer.attn_norm_w {
+            out.push(w);
+        }
+        if let Some(ref w) = layer.attn_norm_b {
+            out.push(w);
+        }
         out.push(&layer.attn_q);
-        if let Some(ref w) = layer.attn_q_bias { out.push(w); }
+        if let Some(ref w) = layer.attn_q_bias {
+            out.push(w);
+        }
         out.push(&layer.attn_k);
-        if let Some(ref w) = layer.attn_k_bias { out.push(w); }
+        if let Some(ref w) = layer.attn_k_bias {
+            out.push(w);
+        }
         out.push(&layer.attn_v);
-        if let Some(ref w) = layer.attn_v_bias { out.push(w); }
+        if let Some(ref w) = layer.attn_v_bias {
+            out.push(w);
+        }
         out.push(&layer.attn_output);
-        if let Some(ref w) = layer.attn_output_bias { out.push(w); }
-        if let Some(ref w) = layer.ffn_norm_w { out.push(w); }
-        if let Some(ref w) = layer.ffn_norm_b { out.push(w); }
+        if let Some(ref w) = layer.attn_output_bias {
+            out.push(w);
+        }
+        if let Some(ref w) = layer.ffn_norm_w {
+            out.push(w);
+        }
+        if let Some(ref w) = layer.ffn_norm_b {
+            out.push(w);
+        }
         out.push(&layer.ffn_up);
-        if let Some(ref w) = layer.ffn_up_bias { out.push(w); }
+        if let Some(ref w) = layer.ffn_up_bias {
+            out.push(w);
+        }
         out.push(&layer.ffn_down);
-        if let Some(ref w) = layer.ffn_down_bias { out.push(w); }
-        if let Some(ref w) = layer.ffn_gate { out.push(w); }
+        if let Some(ref w) = layer.ffn_down_bias {
+            out.push(w);
+        }
+        if let Some(ref w) = layer.ffn_gate {
+            out.push(w);
+        }
 
         // Post-norm weights (BERT)
-        if let Some(ref w) = layer.attn_output_norm_w { out.push(w); }
-        if let Some(ref w) = layer.attn_output_norm_b { out.push(w); }
-        if let Some(ref w) = layer.ffn_output_norm_w { out.push(w); }
-        if let Some(ref w) = layer.ffn_output_norm_b { out.push(w); }
+        if let Some(ref w) = layer.attn_output_norm_w {
+            out.push(w);
+        }
+        if let Some(ref w) = layer.attn_output_norm_b {
+            out.push(w);
+        }
+        if let Some(ref w) = layer.ffn_output_norm_w {
+            out.push(w);
+        }
+        if let Some(ref w) = layer.ffn_output_norm_b {
+            out.push(w);
+        }
 
         // Per-head Q/K norms (Qwen3) and post-projection norms (GemmaEmbedding)
-        if let Some(ref w) = layer.attn_q_norm_w { out.push(w); }
-        if let Some(ref w) = layer.attn_k_norm_w { out.push(w); }
-        if let Some(ref w) = layer.attn_post_norm_w { out.push(w); }
-        if let Some(ref w) = layer.ffn_post_norm_w { out.push(w); }
+        if let Some(ref w) = layer.attn_q_norm_w {
+            out.push(w);
+        }
+        if let Some(ref w) = layer.attn_k_norm_w {
+            out.push(w);
+        }
+        if let Some(ref w) = layer.attn_post_norm_w {
+            out.push(w);
+        }
+        if let Some(ref w) = layer.ffn_post_norm_w {
+            out.push(w);
+        }
     }
 
     out
@@ -399,7 +469,14 @@ impl GraphBuilder {
                 (BufferRef::Pool(out), 2, 0),
             ],
             params: vec![(ParamValue::U32(count as u32), 3)],
-            dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: threads, ty: 1, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx: groups,
+                gy: 1,
+                gz: 1,
+                tx: threads,
+                ty: 1,
+                tz: 1,
+            },
             reads: vec![BufferRef::Pool(a), BufferRef::Pool(b)],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -429,7 +506,10 @@ impl GraphBuilder {
                 (ParamValue::U32(cols as u32), 5),
                 (ParamValue::F32(eps), 6),
             ],
-            dispatch: DispatchDims::Rows { num_rows: 1, threads_per_group },
+            dispatch: DispatchDims::Rows {
+                num_rows: 1,
+                threads_per_group,
+            },
             reads: vec![BufferRef::Pool(input), weight, bias],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -457,7 +537,10 @@ impl GraphBuilder {
                 (ParamValue::U32(cols as u32), 4),
                 (ParamValue::F32(eps), 5),
             ],
-            dispatch: DispatchDims::Rows { num_rows: 1, threads_per_group },
+            dispatch: DispatchDims::Rows {
+                num_rows: 1,
+                threads_per_group,
+            },
             reads: vec![BufferRef::Pool(input), weight],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -487,7 +570,10 @@ impl GraphBuilder {
                 (ParamValue::U32(head_dim as u32), 4),
                 (ParamValue::F32(eps), 5),
             ],
-            dispatch: DispatchDims::Rows { num_rows: num_heads as u32, threads_per_group },
+            dispatch: DispatchDims::Rows {
+                num_rows: num_heads as u32,
+                threads_per_group,
+            },
             reads: vec![BufferRef::Pool(input), weight],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -523,7 +609,14 @@ impl GraphBuilder {
                 (ParamValue::U32(n as u32), 3),
                 (ParamValue::U32(k as u32), 4),
             ],
-            dispatch: DispatchDims::Fixed { gx: threadgroups, gy: 1, gz: 1, tx: threads, ty: 1, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx: threadgroups,
+                gy: 1,
+                gz: 1,
+                tx: threads,
+                ty: 1,
+                tz: 1,
+            },
             reads: vec![weight_ref, BufferRef::Pool(input)],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -552,7 +645,14 @@ impl GraphBuilder {
                 (ParamValue::U32(k as u32), 4),
                 (ParamValue::U32(n as u32), 5),
             ],
-            dispatch: DispatchDims::Fixed { gx, gy, gz: 1, tx: 128, ty: 1, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx,
+                gy,
+                gz: 1,
+                tx: 128,
+                ty: 1,
+                tz: 1,
+            },
             reads: vec![BufferRef::Pool(input), weight_ref],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -570,13 +670,20 @@ impl GraphBuilder {
         dtype: TensorDtype,
     ) {
         let (pso, threadgroups, threads) = match dtype {
-            TensorDtype::Q8_0 => (PsoRef::QuantizedMatmulBiasQ8_0, ((n + 7) / 8) as u32, 128u32),
+            TensorDtype::Q8_0 => (
+                PsoRef::QuantizedMatmulBiasQ8_0,
+                ((n + 7) / 8) as u32,
+                128u32,
+            ),
             TensorDtype::Q4_0 => (PsoRef::QuantizedMatmulBiasQ4_0, ((n + 7) / 8) as u32, 64u32),
             TensorDtype::Q5_0 => (PsoRef::QuantizedMatmulBiasQ5_0, ((n + 7) / 8) as u32, 64u32),
             TensorDtype::Q4_K => (PsoRef::QuantizedMatmulBiasQ4K, ((n + 3) / 4) as u32, 64u32),
             TensorDtype::Q5_K => (PsoRef::QuantizedMatmulBiasQ5K, ((n + 3) / 4) as u32, 64u32),
             TensorDtype::Q6_K => (PsoRef::QuantizedMatmulBiasQ6K, ((n + 3) / 4) as u32, 64u32),
-            _ => panic!("unsupported quantized dtype for fused matmul+bias: {:?}", dtype),
+            _ => panic!(
+                "unsupported quantized dtype for fused matmul+bias: {:?}",
+                dtype
+            ),
         };
         self.ops.push(DecodeOp {
             pso,
@@ -590,7 +697,14 @@ impl GraphBuilder {
                 (ParamValue::U32(n as u32), 3),
                 (ParamValue::U32(k as u32), 4),
             ],
-            dispatch: DispatchDims::Fixed { gx: threadgroups, gy: 1, gz: 1, tx: threads, ty: 1, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx: threadgroups,
+                gy: 1,
+                gz: 1,
+                tx: threads,
+                ty: 1,
+                tz: 1,
+            },
             reads: vec![weight_ref, BufferRef::Pool(input), bias_ref],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -621,7 +735,14 @@ impl GraphBuilder {
                 (ParamValue::U32(k as u32), 4),
                 (ParamValue::U32(n as u32), 5),
             ],
-            dispatch: DispatchDims::Fixed { gx, gy, gz: 1, tx: 128, ty: 1, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx,
+                gy,
+                gz: 1,
+                tx: 128,
+                ty: 1,
+                tz: 1,
+            },
             reads: vec![BufferRef::Pool(input), weight_ref, bias_ref],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -672,12 +793,16 @@ impl GraphBuilder {
         let groups = ((count + 255) / 256) as u32;
         self.ops.push(DecodeOp {
             pso: PsoRef::Gelu,
-            bindings: vec![
-                (BufferRef::Pool(input), 0, 0),
-                (BufferRef::Pool(out), 1, 0),
-            ],
+            bindings: vec![(BufferRef::Pool(input), 0, 0), (BufferRef::Pool(out), 1, 0)],
             params: vec![(ParamValue::U32(count as u32), 2)],
-            dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: 256, ty: 1, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx: groups,
+                gy: 1,
+                gz: 1,
+                tx: 256,
+                ty: 1,
+                tz: 1,
+            },
             reads: vec![BufferRef::Pool(input)],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -694,7 +819,14 @@ impl GraphBuilder {
                 (BufferRef::Pool(out), 2, 0),
             ],
             params: vec![(ParamValue::U32(count as u32), 3)],
-            dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: 256, ty: 1, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx: groups,
+                gy: 1,
+                gz: 1,
+                tx: 256,
+                ty: 1,
+                tz: 1,
+            },
             reads: vec![BufferRef::Pool(gate), BufferRef::Pool(up)],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -711,7 +843,14 @@ impl GraphBuilder {
                 (BufferRef::Pool(out), 2, 0),
             ],
             params: vec![(ParamValue::U32(count as u32), 3)],
-            dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: 256, ty: 1, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx: groups,
+                gy: 1,
+                gz: 1,
+                tx: 256,
+                ty: 1,
+                tz: 1,
+            },
             reads: vec![BufferRef::Pool(gate), BufferRef::Pool(up)],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -722,15 +861,19 @@ impl GraphBuilder {
         let groups = ((count + 255) / 256) as u32;
         self.ops.push(DecodeOp {
             pso: PsoRef::ScaleKernel,
-            bindings: vec![
-                (BufferRef::Pool(input), 0, 0),
-                (BufferRef::Pool(out), 1, 0),
-            ],
+            bindings: vec![(BufferRef::Pool(input), 0, 0), (BufferRef::Pool(out), 1, 0)],
             params: vec![
                 (ParamValue::F32(factor), 2),
                 (ParamValue::U32(count as u32), 3),
             ],
-            dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: 256, ty: 1, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx: groups,
+                gy: 1,
+                gz: 1,
+                tx: 256,
+                ty: 1,
+                tz: 1,
+            },
             reads: vec![BufferRef::Pool(input)],
             writes: Some(BufferRef::Pool(out)),
         });
@@ -762,10 +905,7 @@ impl GraphBuilder {
         let gy = ((n_heads + 15) / 16) as u32;
         let gz = 1u32; // seq_len = 1
 
-        let mut bindings = vec![
-            (BufferRef::Pool(input), 0, 0),
-            (BufferRef::Pool(out), 1, 0),
-        ];
+        let mut bindings = vec![(BufferRef::Pool(input), 0, 0), (BufferRef::Pool(out), 1, 0)];
         if let Some(factors_ref) = rope_factors {
             bindings.push((factors_ref, 8, 0));
         }
@@ -791,7 +931,14 @@ impl GraphBuilder {
             pso,
             bindings,
             params,
-            dispatch: DispatchDims::Fixed { gx, gy, gz, tx: 16, ty: 16, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx,
+                gy,
+                gz,
+                tx: 16,
+                ty: 16,
+                tz: 1,
+            },
             reads,
             writes: Some(BufferRef::Pool(out)),
         });
@@ -808,18 +955,26 @@ impl GraphBuilder {
     ) {
         let count = kv_dim; // 1 row of kv_dim elements
         let groups = ((count + 255) / 256) as u32;
-        let pso = if kv_f16 { PsoRef::CopyF32ToF16 } else { PsoRef::CopyBuffer };
+        let pso = if kv_f16 {
+            PsoRef::CopyF32ToF16
+        } else {
+            PsoRef::CopyBuffer
+        };
         self.ops.push(DecodeOp {
             pso,
-            bindings: vec![
-                (BufferRef::Pool(src), 0, 0),
-                (kv_buf, 1, 0),
-            ],
+            bindings: vec![(BufferRef::Pool(src), 0, 0), (kv_buf, 1, 0)],
             params: vec![
                 (ParamValue::U32(count as u32), 2),
                 (ParamValue::CacheRowOffset, 3), // dest_offset = pos * kv_dim (patched at encode)
             ],
-            dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: 256, ty: 1, tz: 1 },
+            dispatch: DispatchDims::Fixed {
+                gx: groups,
+                gy: 1,
+                gz: 1,
+                tx: 256,
+                ty: 1,
+                tz: 1,
+            },
             reads: vec![BufferRef::Pool(src)],
             writes: Some(kv_buf),
         });
@@ -854,8 +1009,16 @@ impl GraphBuilder {
 
                 // Vec kernel uses v_acc[8] (max 8 dims per thread = head_dim 256).
                 // Reduce kernel uses float4 loads requiring head_dim % 4 == 0.
-                assert!(head_dim <= 256, "vec decode attention: head_dim {} exceeds max 256", head_dim);
-                assert!(head_dim % 4 == 0, "vec decode attention: head_dim {} must be divisible by 4", head_dim);
+                assert!(
+                    head_dim <= 256,
+                    "vec decode attention: head_dim {} exceeds max 256",
+                    head_dim
+                );
+                assert!(
+                    head_dim % 4 == 0,
+                    "vec decode attention: head_dim {} must be divisible by 4",
+                    head_dim
+                );
 
                 // Kernel 1: attn_decode_vec_f16
                 // Each workgroup (1 SIMD group) processes strided KV positions
@@ -877,8 +1040,12 @@ impl GraphBuilder {
                         (ParamValue::U32(swa_window), 10),
                     ],
                     dispatch: DispatchDims::Fixed {
-                        gx: num_heads as u32 * NWG, gy: 1, gz: 1,
-                        tx: 32, ty: 1, tz: 1,
+                        gx: num_heads as u32 * NWG,
+                        gy: 1,
+                        gz: 1,
+                        tx: 32,
+                        ty: 1,
+                        tz: 1,
                     },
                     reads: vec![BufferRef::Pool(q), k_cache, v_cache],
                     writes: Some(BufferRef::Pool(temp)),
@@ -888,17 +1055,18 @@ impl GraphBuilder {
                 // One threadgroup per head, 32 threads reduce NWG partial results
                 self.ops.push(DecodeOp {
                     pso: PsoRef::AttnDecodeVecReduceF16,
-                    bindings: vec![
-                        (BufferRef::Pool(temp), 0, 0),
-                        (BufferRef::Pool(out), 1, 0),
-                    ],
+                    bindings: vec![(BufferRef::Pool(temp), 0, 0), (BufferRef::Pool(out), 1, 0)],
                     params: vec![
                         (ParamValue::U32(num_heads as u32), 2),
                         (ParamValue::U32(head_dim as u32), 3),
                     ],
                     dispatch: DispatchDims::Fixed {
-                        gx: num_heads as u32, gy: 1, gz: 1,
-                        tx: 32, ty: 1, tz: 1,
+                        gx: num_heads as u32,
+                        gy: 1,
+                        gz: 1,
+                        tx: 32,
+                        ty: 1,
+                        tz: 1,
                     },
                     reads: vec![BufferRef::Pool(temp)],
                     writes: Some(BufferRef::Pool(out)),
@@ -908,7 +1076,11 @@ impl GraphBuilder {
         }
 
         // Fallback: single-kernel path (F32 or F16 without temp buffer)
-        let pso = if kv_f16 { PsoRef::GroupedAttnDecodeF16 } else { PsoRef::GroupedAttnDecode };
+        let pso = if kv_f16 {
+            PsoRef::GroupedAttnDecodeF16
+        } else {
+            PsoRef::GroupedAttnDecode
+        };
         self.ops.push(DecodeOp {
             pso,
             bindings: vec![
@@ -927,8 +1099,12 @@ impl GraphBuilder {
                 (ParamValue::U32(swa_window), 10),
             ],
             dispatch: DispatchDims::Fixed {
-                gx: num_heads as u32, gy: 1, gz: 1,
-                tx: 256, ty: 1, tz: 1,
+                gx: num_heads as u32,
+                gy: 1,
+                gz: 1,
+                tx: 256,
+                ty: 1,
+                tz: 1,
             },
             reads: vec![BufferRef::Pool(q), k_cache, v_cache],
             writes: Some(BufferRef::Pool(out)),
@@ -981,7 +1157,9 @@ impl DecodeGraph {
         // the attention dot product, so we do NOT additionally modify attn_scale here.
         // (The 0.1*ln(f)+1.0 transform only applies to YaRN with ext_factor!=0.)
         let yarn_mscale = config.rope_scaling_attn_factor;
-        let attn_scale = config.attn_scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
+        let attn_scale = config
+            .attn_scale
+            .unwrap_or(1.0 / (config.head_dim as f32).sqrt());
 
         // ===================================================================
         // Index global weights (same order as weight_walk_order)
@@ -1044,8 +1222,8 @@ impl DecodeGraph {
         // write to temp.
         let attn_temp_slot = if kv_f16 {
             const NWG: usize = 32;
-            let temp_bytes = (config.num_heads * NWG * config.head_dim
-                            + config.num_heads * NWG * 2) * f32_size;
+            let temp_bytes =
+                (config.num_heads * NWG * config.head_dim + config.num_heads * NWG * 2) * f32_size;
             Some(b.alloc_slot(temp_bytes))
         } else {
             None
@@ -1105,11 +1283,12 @@ impl DecodeGraph {
             } else {
                 config.rope_freq_base
             };
-            let layer_swa_window: u32 = if config.swa_layers.get(layer_idx).copied().unwrap_or(false) {
-                config.swa_window as u32
-            } else {
-                0
-            };
+            let layer_swa_window: u32 =
+                if config.swa_layers.get(layer_idx).copied().unwrap_or(false) {
+                    config.swa_window as u32
+                } else {
+                    0
+                };
 
             if config.pre_norm {
                 // ===========================================================
@@ -1139,28 +1318,58 @@ impl DecodeGraph {
                 // 2b. Per-head Q/K RMSNorm (Qwen3)
                 let q_out = if let Some(qn_w) = attn_q_norm_w {
                     let q_normed = b.alloc_slot(total_dim * f32_size);
-                    b.emit_per_head_rms_norm(q_proj, qn_w, q_normed, config.num_heads, config.head_dim, config.norm_eps);
+                    b.emit_per_head_rms_norm(
+                        q_proj,
+                        qn_w,
+                        q_normed,
+                        config.num_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    );
                     q_normed
-                } else { q_proj };
+                } else {
+                    q_proj
+                };
                 let k_out = if let Some(kn_w) = attn_k_norm_w {
                     let k_normed = b.alloc_slot(kv_dim * f32_size);
-                    b.emit_per_head_rms_norm(k_proj, kn_w, k_normed, config.num_kv_heads, config.head_dim, config.norm_eps);
+                    b.emit_per_head_rms_norm(
+                        k_proj,
+                        kn_w,
+                        k_normed,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    );
                     k_normed
-                } else { k_proj };
+                } else {
+                    k_proj
+                };
 
                 // 3. RoPE (if configured) — applies to Q and K only
                 let (q_final, k_final) = if config.position_type == PositionType::RoPE {
                     let q_rope = b.alloc_slot(total_dim * f32_size);
                     b.emit_rope(
-                        config.rope_neox, q_out, q_rope,
-                        config.num_heads, config.head_dim, config.rope_dim, layer_rope_base,
-                        rope_factors, yarn_mscale,
+                        config.rope_neox,
+                        q_out,
+                        q_rope,
+                        config.num_heads,
+                        config.head_dim,
+                        config.rope_dim,
+                        layer_rope_base,
+                        rope_factors,
+                        yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(kv_dim * f32_size);
                     b.emit_rope(
-                        config.rope_neox, k_out, k_rope,
-                        config.num_kv_heads, config.head_dim, config.rope_dim, layer_rope_base,
-                        rope_factors, yarn_mscale,
+                        config.rope_neox,
+                        k_out,
+                        k_rope,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        config.rope_dim,
+                        layer_rope_base,
+                        rope_factors,
+                        yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
@@ -1174,15 +1383,24 @@ impl DecodeGraph {
                 // 5. Fused grouped attention decode
                 let attn_out = b.alloc_slot(total_dim * f32_size);
                 b.emit_grouped_attn_decode(
-                    q_final, k_cache, v_cache, attn_out,
-                    config.num_heads, config.num_kv_heads, config.head_dim,
-                    attn_scale, config.attn_logit_softcap, kv_f16,
-                    attn_temp_slot, layer_swa_window,
+                    q_final,
+                    k_cache,
+                    v_cache,
+                    attn_out,
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    attn_scale,
+                    config.attn_logit_softcap,
+                    kv_f16,
+                    attn_temp_slot,
+                    layer_swa_window,
                 );
 
                 // 6. Output projection
                 let proj_raw = b.alloc_slot(h * f32_size);
-                let proj_out = b.emit_linear(attn_out, w_o, o_bias, proj_raw, h, total_dim, o_dtype);
+                let proj_out =
+                    b.emit_linear(attn_out, w_o, o_bias, proj_raw, h, total_dim, o_dtype);
 
                 // 6b. Post-attention norm (Gemma3: before residual add)
                 let proj_normed = if let Some(w) = attn_post_norm_w {
@@ -1209,9 +1427,19 @@ impl DecodeGraph {
 
                 // 8. FFN
                 let ffn_out = emit_ffn(
-                    &mut b, normed2, w_up, up_bias, w_down, down_bias, w_gate,
-                    config.activation, h, ffn_h,
-                    up_dtype, down_dtype, gate_dtype,
+                    &mut b,
+                    normed2,
+                    w_up,
+                    up_bias,
+                    w_down,
+                    down_bias,
+                    w_gate,
+                    config.activation,
+                    h,
+                    ffn_h,
+                    up_dtype,
+                    down_dtype,
+                    gate_dtype,
                 );
 
                 // 8b. Post-FFN norm (Gemma3: before residual add)
@@ -1227,7 +1455,6 @@ impl DecodeGraph {
                 let layer_out = b.alloc_slot(h * f32_size);
                 b.emit_add(residual, ffn_normed, layer_out, h);
                 current_hidden = layer_out;
-
             } else {
                 // ===========================================================
                 // Post-norm path (BERT — rare for generation but supported)
@@ -1235,7 +1462,8 @@ impl DecodeGraph {
 
                 // 1. QKV projections (no pre-norm)
                 let q_raw = b.alloc_slot(total_dim * f32_size);
-                let q_proj = b.emit_linear(current_hidden, w_q, q_bias, q_raw, total_dim, h, q_dtype);
+                let q_proj =
+                    b.emit_linear(current_hidden, w_q, q_bias, q_raw, total_dim, h, q_dtype);
 
                 let k_raw = b.alloc_slot(kv_dim * f32_size);
                 let k_proj = b.emit_linear(current_hidden, w_k, k_bias, k_raw, kv_dim, h, k_dtype);
@@ -1246,28 +1474,58 @@ impl DecodeGraph {
                 // 1b. Per-head Q/K RMSNorm (Qwen3)
                 let q_out = if let Some(qn_w) = attn_q_norm_w {
                     let q_normed = b.alloc_slot(total_dim * f32_size);
-                    b.emit_per_head_rms_norm(q_proj, qn_w, q_normed, config.num_heads, config.head_dim, config.norm_eps);
+                    b.emit_per_head_rms_norm(
+                        q_proj,
+                        qn_w,
+                        q_normed,
+                        config.num_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    );
                     q_normed
-                } else { q_proj };
+                } else {
+                    q_proj
+                };
                 let k_out = if let Some(kn_w) = attn_k_norm_w {
                     let k_normed = b.alloc_slot(kv_dim * f32_size);
-                    b.emit_per_head_rms_norm(k_proj, kn_w, k_normed, config.num_kv_heads, config.head_dim, config.norm_eps);
+                    b.emit_per_head_rms_norm(
+                        k_proj,
+                        kn_w,
+                        k_normed,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    );
                     k_normed
-                } else { k_proj };
+                } else {
+                    k_proj
+                };
 
                 // 2. RoPE (unlikely for post-norm, but be general)
                 let (q_final, k_final) = if config.position_type == PositionType::RoPE {
                     let q_rope = b.alloc_slot(total_dim * f32_size);
                     b.emit_rope(
-                        config.rope_neox, q_out, q_rope,
-                        config.num_heads, config.head_dim, config.rope_dim, layer_rope_base,
-                        rope_factors, yarn_mscale,
+                        config.rope_neox,
+                        q_out,
+                        q_rope,
+                        config.num_heads,
+                        config.head_dim,
+                        config.rope_dim,
+                        layer_rope_base,
+                        rope_factors,
+                        yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(kv_dim * f32_size);
                     b.emit_rope(
-                        config.rope_neox, k_out, k_rope,
-                        config.num_kv_heads, config.head_dim, config.rope_dim, layer_rope_base,
-                        rope_factors, yarn_mscale,
+                        config.rope_neox,
+                        k_out,
+                        k_rope,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        config.rope_dim,
+                        layer_rope_base,
+                        rope_factors,
+                        yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
@@ -1281,15 +1539,24 @@ impl DecodeGraph {
                 // 4. Fused grouped attention decode
                 let attn_out = b.alloc_slot(total_dim * f32_size);
                 b.emit_grouped_attn_decode(
-                    q_final, k_cache, v_cache, attn_out,
-                    config.num_heads, config.num_kv_heads, config.head_dim,
-                    attn_scale, config.attn_logit_softcap, kv_f16,
-                    attn_temp_slot, layer_swa_window,
+                    q_final,
+                    k_cache,
+                    v_cache,
+                    attn_out,
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    attn_scale,
+                    config.attn_logit_softcap,
+                    kv_f16,
+                    attn_temp_slot,
+                    layer_swa_window,
                 );
 
                 // 5. Output projection + residual
                 let proj_raw = b.alloc_slot(h * f32_size);
-                let proj_out = b.emit_linear(attn_out, w_o, o_bias, proj_raw, h, total_dim, o_dtype);
+                let proj_out =
+                    b.emit_linear(attn_out, w_o, o_bias, proj_raw, h, total_dim, o_dtype);
 
                 let mut residual_slot = b.alloc_slot(h * f32_size);
                 b.emit_add(current_hidden, proj_out, residual_slot, h);
@@ -1303,9 +1570,19 @@ impl DecodeGraph {
 
                 // 7. FFN
                 let ffn_out = emit_ffn(
-                    &mut b, residual_slot, w_up, up_bias, w_down, down_bias, w_gate,
-                    config.activation, h, ffn_h,
-                    up_dtype, down_dtype, gate_dtype,
+                    &mut b,
+                    residual_slot,
+                    w_up,
+                    up_bias,
+                    w_down,
+                    down_bias,
+                    w_gate,
+                    config.activation,
+                    h,
+                    ffn_h,
+                    up_dtype,
+                    down_dtype,
+                    gate_dtype,
                 );
 
                 // 8. Residual + post-FFN norm
@@ -1334,16 +1611,23 @@ impl DecodeGraph {
 
         // Logits projection: [1, hidden_size] x [vocab_size, hidden_size]^T -> [1, vocab_size]
         let proj_weight = output_proj.unwrap_or(token_emb); // tied embeddings fallback
-        // When output_projection is None (tied embeddings), the token_embedding
-        // buffer is pre-converted to F32 by generate.rs — so use F32 dtype.
-        let proj_dtype = weights.output_projection.as_ref()
+                                                            // When output_projection is None (tied embeddings), the token_embedding
+                                                            // buffer is pre-converted to F32 by generate.rs — so use F32 dtype.
+        let proj_dtype = weights
+            .output_projection
+            .as_ref()
             .map(|w| w.dtype())
             .unwrap_or(TensorDtype::F32);
 
         let logits_raw = b.alloc_slot(config.vocab_size * f32_size);
         let logits_slot = b.emit_linear(
-            current_hidden, proj_weight, None, logits_raw,
-            config.vocab_size, h, proj_dtype,
+            current_hidden,
+            proj_weight,
+            None,
+            logits_raw,
+            config.vocab_size,
+            h,
+            proj_dtype,
         );
 
         // ===================================================================
@@ -1561,7 +1845,9 @@ impl PrefillGraph {
         // LongRoPE mscale: applied inside RoPE kernel to both Q and K, so we do NOT
         // modify attn_scale here.  See DecodeGraph::build comment for details.
         let yarn_mscale = config.rope_scaling_attn_factor;
-        let attn_scale = config.attn_scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
+        let attn_scale = config
+            .attn_scale
+            .unwrap_or(1.0 / (config.head_dim as f32).sqrt());
 
         // ===================================================================
         // Index global weights (same order as weight_walk_order)
@@ -1591,7 +1877,13 @@ impl PrefillGraph {
         // Embedding scaling (element-wise, count = M * h)
         if (config.embedding_scale - 1.0).abs() > f32::EPSILON {
             let scaled = b.alloc_slot(m * h * f32_size);
-            emit_scale_multi(&mut b, current_hidden, scaled, m * h, config.embedding_scale);
+            emit_scale_multi(
+                &mut b,
+                current_hidden,
+                scaled,
+                m * h,
+                config.embedding_scale,
+            );
             current_hidden = scaled;
         }
 
@@ -1661,11 +1953,12 @@ impl PrefillGraph {
             } else {
                 config.rope_freq_base
             };
-            let layer_swa_window: u32 = if config.swa_layers.get(layer_idx).copied().unwrap_or(false) {
-                config.swa_window as u32
-            } else {
-                0
-            };
+            let layer_swa_window: u32 =
+                if config.swa_layers.get(layer_idx).copied().unwrap_or(false) {
+                    config.swa_window as u32
+                } else {
+                    0
+                };
 
             if config.pre_norm {
                 // ===========================================================
@@ -1675,9 +1968,14 @@ impl PrefillGraph {
                 // 1. Pre-attention norm [M, h] -> [M, h]
                 let normed = b.alloc_slot(m * h * f32_size);
                 emit_norm_multi(
-                    &mut b, current_hidden,
+                    &mut b,
+                    current_hidden,
                     attn_norm_w.expect("pre_norm requires attn_norm_w"),
-                    attn_norm_b, normed, h, m, config,
+                    attn_norm_b,
+                    normed,
+                    h,
+                    m,
+                    config,
                 );
 
                 // 2. QKV projections [M, h] -> [M, total_dim] / [M, kv_dim]
@@ -1693,28 +1991,62 @@ impl PrefillGraph {
                 // 2b. Per-head Q/K RMSNorm (Qwen3) — M tokens × num_heads rows
                 let q_normed = if let Some(qn_w) = attn_q_norm_w {
                     let slot = b.alloc_slot(m * total_dim * f32_size);
-                    b.emit_per_head_rms_norm(q_raw, qn_w, slot, m * config.num_heads, config.head_dim, config.norm_eps);
+                    b.emit_per_head_rms_norm(
+                        q_raw,
+                        qn_w,
+                        slot,
+                        m * config.num_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    );
                     slot
-                } else { q_raw };
+                } else {
+                    q_raw
+                };
                 let k_normed = if let Some(kn_w) = attn_k_norm_w {
                     let slot = b.alloc_slot(m * kv_dim * f32_size);
-                    b.emit_per_head_rms_norm(k_raw, kn_w, slot, m * config.num_kv_heads, config.head_dim, config.norm_eps);
+                    b.emit_per_head_rms_norm(
+                        k_raw,
+                        kn_w,
+                        slot,
+                        m * config.num_kv_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    );
                     slot
-                } else { k_raw };
+                } else {
+                    k_raw
+                };
 
                 // 3. RoPE (if configured) — multi-token, gz = M
                 let (q_final, k_final) = if config.position_type == PositionType::RoPE {
                     let q_rope = b.alloc_slot(m * total_dim * f32_size);
                     emit_rope_multi(
-                        &mut b, config.rope_neox, q_normed, q_rope,
-                        config.num_heads, config.head_dim, config.rope_dim,
-                        layer_rope_base, m, rope_factors, yarn_mscale,
+                        &mut b,
+                        config.rope_neox,
+                        q_normed,
+                        q_rope,
+                        config.num_heads,
+                        config.head_dim,
+                        config.rope_dim,
+                        layer_rope_base,
+                        m,
+                        rope_factors,
+                        yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(m * kv_dim * f32_size);
                     emit_rope_multi(
-                        &mut b, config.rope_neox, k_normed, k_rope,
-                        config.num_kv_heads, config.head_dim, config.rope_dim,
-                        layer_rope_base, m, rope_factors, yarn_mscale,
+                        &mut b,
+                        config.rope_neox,
+                        k_normed,
+                        k_rope,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        config.rope_dim,
+                        layer_rope_base,
+                        m,
+                        rope_factors,
+                        yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
@@ -1728,15 +2060,26 @@ impl PrefillGraph {
                 // 5. Batched causal attention
                 let attn_out = b.alloc_slot(m * total_dim * f32_size);
                 emit_batched_attention(
-                    &mut b, q_final, k_cache, v_cache, attn_out,
-                    config.num_heads, config.num_kv_heads, config.head_dim,
-                    attn_scale, config.attn_logit_softcap, m, kv_f16,
+                    &mut b,
+                    q_final,
+                    k_cache,
+                    v_cache,
+                    attn_out,
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    attn_scale,
+                    config.attn_logit_softcap,
+                    m,
+                    kv_f16,
                     layer_swa_window,
                 );
 
                 // 6. Output projection [M, total_dim] -> [M, h]
                 let proj_raw = b.alloc_slot(m * h * f32_size);
-                emit_linear_multi(&mut b, attn_out, w_o, o_bias, proj_raw, h, total_dim, o_dtype, m);
+                emit_linear_multi(
+                    &mut b, attn_out, w_o, o_bias, proj_raw, h, total_dim, o_dtype, m,
+                );
 
                 // 6b. Post-attention norm (Gemma3: before residual add)
                 let proj_normed = if let Some(w) = attn_post_norm_w {
@@ -1754,16 +2097,32 @@ impl PrefillGraph {
                 // 7. Pre-FFN norm [M, h] -> [M, h]
                 let normed2 = b.alloc_slot(m * h * f32_size);
                 emit_norm_multi(
-                    &mut b, residual,
+                    &mut b,
+                    residual,
                     ffn_norm_w.expect("pre_norm requires ffn_norm_w"),
-                    ffn_norm_b, normed2, h, m, config,
+                    ffn_norm_b,
+                    normed2,
+                    h,
+                    m,
+                    config,
                 );
 
                 // 8. FFN
                 let ffn_out = emit_ffn_multi(
-                    &mut b, normed2, w_up, up_bias, w_down, down_bias, w_gate,
-                    config.activation, h, ffn_h,
-                    up_dtype, down_dtype, gate_dtype, m,
+                    &mut b,
+                    normed2,
+                    w_up,
+                    up_bias,
+                    w_down,
+                    down_bias,
+                    w_gate,
+                    config.activation,
+                    h,
+                    ffn_h,
+                    up_dtype,
+                    down_dtype,
+                    gate_dtype,
+                    m,
                 );
 
                 // 8b. Post-FFN norm (Gemma3: before residual add)
@@ -1779,45 +2138,108 @@ impl PrefillGraph {
                 let layer_out = b.alloc_slot(m * h * f32_size);
                 emit_add_multi(&mut b, residual, ffn_normed, layer_out, m * h);
                 current_hidden = layer_out;
-
             } else {
                 // ===========================================================
                 // Post-norm path (BERT)
                 // ===========================================================
 
                 let q_raw = b.alloc_slot(m * total_dim * f32_size);
-                emit_linear_multi(&mut b, current_hidden, w_q, q_bias, q_raw, total_dim, h, q_dtype, m);
+                emit_linear_multi(
+                    &mut b,
+                    current_hidden,
+                    w_q,
+                    q_bias,
+                    q_raw,
+                    total_dim,
+                    h,
+                    q_dtype,
+                    m,
+                );
 
                 let k_raw = b.alloc_slot(m * kv_dim * f32_size);
-                emit_linear_multi(&mut b, current_hidden, w_k, k_bias, k_raw, kv_dim, h, k_dtype, m);
+                emit_linear_multi(
+                    &mut b,
+                    current_hidden,
+                    w_k,
+                    k_bias,
+                    k_raw,
+                    kv_dim,
+                    h,
+                    k_dtype,
+                    m,
+                );
 
                 let v_raw = b.alloc_slot(m * kv_dim * f32_size);
-                emit_linear_multi(&mut b, current_hidden, w_v, v_bias, v_raw, kv_dim, h, v_dtype, m);
+                emit_linear_multi(
+                    &mut b,
+                    current_hidden,
+                    w_v,
+                    v_bias,
+                    v_raw,
+                    kv_dim,
+                    h,
+                    v_dtype,
+                    m,
+                );
 
                 // Per-head Q/K RMSNorm (Qwen3)
                 let q_normed = if let Some(qn_w) = attn_q_norm_w {
                     let slot = b.alloc_slot(m * total_dim * f32_size);
-                    b.emit_per_head_rms_norm(q_raw, qn_w, slot, m * config.num_heads, config.head_dim, config.norm_eps);
+                    b.emit_per_head_rms_norm(
+                        q_raw,
+                        qn_w,
+                        slot,
+                        m * config.num_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    );
                     slot
-                } else { q_raw };
+                } else {
+                    q_raw
+                };
                 let k_normed = if let Some(kn_w) = attn_k_norm_w {
                     let slot = b.alloc_slot(m * kv_dim * f32_size);
-                    b.emit_per_head_rms_norm(k_raw, kn_w, slot, m * config.num_kv_heads, config.head_dim, config.norm_eps);
+                    b.emit_per_head_rms_norm(
+                        k_raw,
+                        kn_w,
+                        slot,
+                        m * config.num_kv_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    );
                     slot
-                } else { k_raw };
+                } else {
+                    k_raw
+                };
 
                 let (q_final, k_final) = if config.position_type == PositionType::RoPE {
                     let q_rope = b.alloc_slot(m * total_dim * f32_size);
                     emit_rope_multi(
-                        &mut b, config.rope_neox, q_normed, q_rope,
-                        config.num_heads, config.head_dim, config.rope_dim,
-                        layer_rope_base, m, rope_factors, yarn_mscale,
+                        &mut b,
+                        config.rope_neox,
+                        q_normed,
+                        q_rope,
+                        config.num_heads,
+                        config.head_dim,
+                        config.rope_dim,
+                        layer_rope_base,
+                        m,
+                        rope_factors,
+                        yarn_mscale,
                     );
                     let k_rope = b.alloc_slot(m * kv_dim * f32_size);
                     emit_rope_multi(
-                        &mut b, config.rope_neox, k_normed, k_rope,
-                        config.num_kv_heads, config.head_dim, config.rope_dim,
-                        layer_rope_base, m, rope_factors, yarn_mscale,
+                        &mut b,
+                        config.rope_neox,
+                        k_normed,
+                        k_rope,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        config.rope_dim,
+                        layer_rope_base,
+                        m,
+                        rope_factors,
+                        yarn_mscale,
                     );
                     (q_rope, k_rope)
                 } else {
@@ -1829,14 +2251,25 @@ impl PrefillGraph {
 
                 let attn_out = b.alloc_slot(m * total_dim * f32_size);
                 emit_batched_attention(
-                    &mut b, q_final, k_cache, v_cache, attn_out,
-                    config.num_heads, config.num_kv_heads, config.head_dim,
-                    attn_scale, config.attn_logit_softcap, m, kv_f16,
+                    &mut b,
+                    q_final,
+                    k_cache,
+                    v_cache,
+                    attn_out,
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    attn_scale,
+                    config.attn_logit_softcap,
+                    m,
+                    kv_f16,
                     layer_swa_window,
                 );
 
                 let proj_raw = b.alloc_slot(m * h * f32_size);
-                emit_linear_multi(&mut b, attn_out, w_o, o_bias, proj_raw, h, total_dim, o_dtype, m);
+                emit_linear_multi(
+                    &mut b, attn_out, w_o, o_bias, proj_raw, h, total_dim, o_dtype, m,
+                );
 
                 let mut residual_slot = b.alloc_slot(m * h * f32_size);
                 emit_add_multi(&mut b, current_hidden, proj_raw, residual_slot, m * h);
@@ -1848,9 +2281,20 @@ impl PrefillGraph {
                 }
 
                 let ffn_out = emit_ffn_multi(
-                    &mut b, residual_slot, w_up, up_bias, w_down, down_bias, w_gate,
-                    config.activation, h, ffn_h,
-                    up_dtype, down_dtype, gate_dtype, m,
+                    &mut b,
+                    residual_slot,
+                    w_up,
+                    up_bias,
+                    w_down,
+                    down_bias,
+                    w_gate,
+                    config.activation,
+                    h,
+                    ffn_h,
+                    up_dtype,
+                    down_dtype,
+                    gate_dtype,
+                    m,
                 );
 
                 let mut output = b.alloc_slot(m * h * f32_size);
@@ -1872,7 +2316,16 @@ impl PrefillGraph {
 
         if let Some(norm_w) = output_norm_w {
             let normed = b.alloc_slot(m * h * f32_size);
-            emit_norm_multi(&mut b, current_hidden, norm_w, output_norm_b, normed, h, m, config);
+            emit_norm_multi(
+                &mut b,
+                current_hidden,
+                norm_w,
+                output_norm_b,
+                normed,
+                h,
+                m,
+                config,
+            );
             current_hidden = normed;
         }
 
@@ -1886,12 +2339,16 @@ impl PrefillGraph {
                 (BufferRef::Pool(last_hidden), 1, 0),
             ],
             params: vec![
-                (ParamValue::U32(h as u32), 2),  // count = hidden_size
-                (ParamValue::U32(0), 3),          // dest_offset = 0
+                (ParamValue::U32(h as u32), 2), // count = hidden_size
+                (ParamValue::U32(0), 3),        // dest_offset = 0
             ],
             dispatch: DispatchDims::Fixed {
-                gx: ((h + 255) / 256) as u32, gy: 1, gz: 1,
-                tx: 256, ty: 1, tz: 1,
+                gx: ((h + 255) / 256) as u32,
+                gy: 1,
+                gz: 1,
+                tx: 256,
+                ty: 1,
+                tz: 1,
             },
             reads: vec![BufferRef::Pool(current_hidden)],
             writes: Some(BufferRef::Pool(last_hidden)),
@@ -1901,15 +2358,22 @@ impl PrefillGraph {
         let proj_weight = output_proj.unwrap_or(token_emb);
         // When output_projection is None (tied embeddings), the token_embedding
         // buffer is pre-converted to F32 by generate.rs — so use F32 dtype.
-        let proj_dtype = weights.output_projection.as_ref()
+        let proj_dtype = weights
+            .output_projection
+            .as_ref()
             .map(|w| w.dtype())
             .unwrap_or(TensorDtype::F32);
 
         let logits_raw = b.alloc_slot(config.vocab_size * f32_size);
         // Single-row logits projection (same as decode)
         let logits_slot = b.emit_linear(
-            last_hidden, proj_weight, None, logits_raw,
-            config.vocab_size, h, proj_dtype,
+            last_hidden,
+            proj_weight,
+            None,
+            logits_raw,
+            config.vocab_size,
+            h,
+            proj_dtype,
         );
 
         // ===================================================================
@@ -1944,10 +2408,7 @@ fn emit_embedding_lookup_multi(
 ) {
     b.ops.push(DecodeOp {
         pso: PsoRef::EmbeddingLookup,
-        bindings: vec![
-            (table, 0, 0),
-            (BufferRef::Pool(out), 2, 0),
-        ],
+        bindings: vec![(table, 0, 0), (BufferRef::Pool(out), 2, 0)],
         params: vec![
             (ParamValue::PrefillTokenIds, 1),
             (ParamValue::U32(hidden_size as u32), 3),
@@ -1974,10 +2435,7 @@ fn emit_pos_embedding_lookup_multi(
 ) {
     b.ops.push(DecodeOp {
         pso: PsoRef::EmbeddingLookup,
-        bindings: vec![
-            (table, 0, 0),
-            (BufferRef::Pool(out), 2, 0),
-        ],
+        bindings: vec![(table, 0, 0), (BufferRef::Pool(out), 2, 0)],
         params: vec![
             (ParamValue::PrefillPositionIds, 1),
             (ParamValue::U32(hidden_size as u32), 3),
@@ -2022,7 +2480,10 @@ fn emit_norm_multi(
                     (ParamValue::U32(cols as u32), 5),
                     (ParamValue::F32(config.norm_eps), 6),
                 ],
-                dispatch: DispatchDims::Rows { num_rows: n_tokens as u32, threads_per_group },
+                dispatch: DispatchDims::Rows {
+                    num_rows: n_tokens as u32,
+                    threads_per_group,
+                },
                 reads: vec![BufferRef::Pool(input), weight, bias_ref],
                 writes: Some(BufferRef::Pool(out)),
             });
@@ -2040,7 +2501,10 @@ fn emit_norm_multi(
                     (ParamValue::U32(cols as u32), 4),
                     (ParamValue::F32(config.norm_eps), 5),
                 ],
-                dispatch: DispatchDims::Rows { num_rows: n_tokens as u32, threads_per_group },
+                dispatch: DispatchDims::Rows {
+                    num_rows: n_tokens as u32,
+                    threads_per_group,
+                },
                 reads: vec![BufferRef::Pool(input), weight],
                 writes: Some(BufferRef::Pool(out)),
             });
@@ -2072,7 +2536,10 @@ fn emit_rms_norm_multi(
             (ParamValue::U32(cols as u32), 4),
             (ParamValue::F32(eps), 5),
         ],
-        dispatch: DispatchDims::Rows { num_rows: n_tokens as u32, threads_per_group },
+        dispatch: DispatchDims::Rows {
+            num_rows: n_tokens as u32,
+            threads_per_group,
+        },
         reads: vec![BufferRef::Pool(input), weight],
         writes: Some(BufferRef::Pool(out)),
     });
@@ -2111,7 +2578,14 @@ fn emit_linear_multi(
                         (ParamValue::U32(k as u32), 4),
                         (ParamValue::U32(n as u32), 5),
                     ],
-                    dispatch: DispatchDims::Fixed { gx, gy, gz: 1, tx: 128, ty: 1, tz: 1 },
+                    dispatch: DispatchDims::Fixed {
+                        gx,
+                        gy,
+                        gz: 1,
+                        tx: 128,
+                        ty: 1,
+                        tz: 1,
+                    },
                     reads: vec![BufferRef::Pool(input), weight_ref, bias],
                     writes: Some(BufferRef::Pool(out)),
                 });
@@ -2130,7 +2604,14 @@ fn emit_linear_multi(
                         (ParamValue::U32(k as u32), 4),
                         (ParamValue::U32(n as u32), 5),
                     ],
-                    dispatch: DispatchDims::Fixed { gx, gy, gz: 1, tx: 128, ty: 1, tz: 1 },
+                    dispatch: DispatchDims::Fixed {
+                        gx,
+                        gy,
+                        gz: 1,
+                        tx: 128,
+                        ty: 1,
+                        tz: 1,
+                    },
                     reads: vec![BufferRef::Pool(input), weight_ref],
                     writes: Some(BufferRef::Pool(out)),
                 });
@@ -2140,12 +2621,26 @@ fn emit_linear_multi(
             // Single-row quantized matmul: optimized fused dequant+dot for M=1.
             if let Some(bias) = bias_ref {
                 let (pso, threadgroups, threads) = match dtype {
-                    TensorDtype::Q8_0 => (PsoRef::QuantizedMatmulBiasQ8_0, ((n + 7) / 8) as u32, 128u32),
-                    TensorDtype::Q4_0 => (PsoRef::QuantizedMatmulBiasQ4_0, ((n + 7) / 8) as u32, 64u32),
-                    TensorDtype::Q5_0 => (PsoRef::QuantizedMatmulBiasQ5_0, ((n + 7) / 8) as u32, 64u32),
-                    TensorDtype::Q4_K => (PsoRef::QuantizedMatmulBiasQ4K, ((n + 3) / 4) as u32, 64u32),
-                    TensorDtype::Q5_K => (PsoRef::QuantizedMatmulBiasQ5K, ((n + 3) / 4) as u32, 64u32),
-                    TensorDtype::Q6_K => (PsoRef::QuantizedMatmulBiasQ6K, ((n + 3) / 4) as u32, 64u32),
+                    TensorDtype::Q8_0 => (
+                        PsoRef::QuantizedMatmulBiasQ8_0,
+                        ((n + 7) / 8) as u32,
+                        128u32,
+                    ),
+                    TensorDtype::Q4_0 => {
+                        (PsoRef::QuantizedMatmulBiasQ4_0, ((n + 7) / 8) as u32, 64u32)
+                    }
+                    TensorDtype::Q5_0 => {
+                        (PsoRef::QuantizedMatmulBiasQ5_0, ((n + 7) / 8) as u32, 64u32)
+                    }
+                    TensorDtype::Q4_K => {
+                        (PsoRef::QuantizedMatmulBiasQ4K, ((n + 3) / 4) as u32, 64u32)
+                    }
+                    TensorDtype::Q5_K => {
+                        (PsoRef::QuantizedMatmulBiasQ5K, ((n + 3) / 4) as u32, 64u32)
+                    }
+                    TensorDtype::Q6_K => {
+                        (PsoRef::QuantizedMatmulBiasQ6K, ((n + 3) / 4) as u32, 64u32)
+                    }
                     _ => panic!("unsupported quantized dtype: {:?}", dtype),
                 };
                 b.ops.push(DecodeOp {
@@ -2160,13 +2655,22 @@ fn emit_linear_multi(
                         (ParamValue::U32(n as u32), 3),
                         (ParamValue::U32(k as u32), 4),
                     ],
-                    dispatch: DispatchDims::Fixed { gx: threadgroups, gy: 1, gz: 1, tx: threads, ty: 1, tz: 1 },
+                    dispatch: DispatchDims::Fixed {
+                        gx: threadgroups,
+                        gy: 1,
+                        gz: 1,
+                        tx: threads,
+                        ty: 1,
+                        tz: 1,
+                    },
                     reads: vec![weight_ref, BufferRef::Pool(input), bias],
                     writes: Some(BufferRef::Pool(out)),
                 });
             } else {
                 let (pso, threadgroups, threads) = match dtype {
-                    TensorDtype::Q8_0 => (PsoRef::QuantizedMatmulQ8_0, ((n + 7) / 8) as u32, 128u32),
+                    TensorDtype::Q8_0 => {
+                        (PsoRef::QuantizedMatmulQ8_0, ((n + 7) / 8) as u32, 128u32)
+                    }
                     TensorDtype::Q4_0 => (PsoRef::QuantizedMatmulQ4_0, ((n + 7) / 8) as u32, 64u32),
                     TensorDtype::Q5_0 => (PsoRef::QuantizedMatmulQ5_0, ((n + 7) / 8) as u32, 64u32),
                     TensorDtype::Q4_K => (PsoRef::QuantizedMatmulQ4K, ((n + 3) / 4) as u32, 64u32),
@@ -2185,7 +2689,14 @@ fn emit_linear_multi(
                         (ParamValue::U32(n as u32), 3),
                         (ParamValue::U32(k as u32), 4),
                     ],
-                    dispatch: DispatchDims::Fixed { gx: threadgroups, gy: 1, gz: 1, tx: threads, ty: 1, tz: 1 },
+                    dispatch: DispatchDims::Fixed {
+                        gx: threadgroups,
+                        gy: 1,
+                        gz: 1,
+                        tx: threads,
+                        ty: 1,
+                        tz: 1,
+                    },
                     reads: vec![weight_ref, BufferRef::Pool(input)],
                     writes: Some(BufferRef::Pool(out)),
                 });
@@ -2222,7 +2733,14 @@ fn emit_linear_multi(
                         (ParamValue::U32(k as u32), 4),
                         (ParamValue::U32(n as u32), 5),
                     ],
-                    dispatch: DispatchDims::Fixed { gx, gy, gz: 1, tx: 128, ty: 1, tz: 1 },
+                    dispatch: DispatchDims::Fixed {
+                        gx,
+                        gy,
+                        gz: 1,
+                        tx: 128,
+                        ty: 1,
+                        tz: 1,
+                    },
                     reads: vec![weight_ref, BufferRef::Pool(input), bias],
                     writes: Some(BufferRef::Pool(out)),
                 });
@@ -2248,7 +2766,14 @@ fn emit_linear_multi(
                         (ParamValue::U32(k as u32), 4),
                         (ParamValue::U32(n as u32), 5),
                     ],
-                    dispatch: DispatchDims::Fixed { gx, gy, gz: 1, tx: 128, ty: 1, tz: 1 },
+                    dispatch: DispatchDims::Fixed {
+                        gx,
+                        gy,
+                        gz: 1,
+                        tx: 128,
+                        ty: 1,
+                        tz: 1,
+                    },
                     reads: vec![weight_ref, BufferRef::Pool(input)],
                     writes: Some(BufferRef::Pool(out)),
                 });
@@ -2275,7 +2800,14 @@ fn emit_add_multi(
             (BufferRef::Pool(out), 2, 0),
         ],
         params: vec![(ParamValue::U32(count as u32), 3)],
-        dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: threads, ty: 1, tz: 1 },
+        dispatch: DispatchDims::Fixed {
+            gx: groups,
+            gy: 1,
+            gz: 1,
+            tx: threads,
+            ty: 1,
+            tz: 1,
+        },
         reads: vec![BufferRef::Pool(a), BufferRef::Pool(b_slot)],
         writes: Some(BufferRef::Pool(out)),
     });
@@ -2292,15 +2824,19 @@ fn emit_scale_multi(
     let groups = ((count + 255) / 256) as u32;
     b.ops.push(DecodeOp {
         pso: PsoRef::ScaleKernel,
-        bindings: vec![
-            (BufferRef::Pool(input), 0, 0),
-            (BufferRef::Pool(out), 1, 0),
-        ],
+        bindings: vec![(BufferRef::Pool(input), 0, 0), (BufferRef::Pool(out), 1, 0)],
         params: vec![
             (ParamValue::F32(factor), 2),
             (ParamValue::U32(count as u32), 3),
         ],
-        dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: 256, ty: 1, tz: 1 },
+        dispatch: DispatchDims::Fixed {
+            gx: groups,
+            gy: 1,
+            gz: 1,
+            tx: 256,
+            ty: 1,
+            tz: 1,
+        },
         reads: vec![BufferRef::Pool(input)],
         writes: Some(BufferRef::Pool(out)),
     });
@@ -2332,10 +2868,7 @@ fn emit_rope_multi(
     let gy = ((n_heads + 15) / 16) as u32;
     let gz = ((n_tokens + 0) / 1) as u32; // 1 group per token in z
 
-    let mut bindings = vec![
-        (BufferRef::Pool(input), 0, 0),
-        (BufferRef::Pool(out), 1, 0),
-    ];
+    let mut bindings = vec![(BufferRef::Pool(input), 0, 0), (BufferRef::Pool(out), 1, 0)];
     if let Some(factors_ref) = rope_factors {
         bindings.push((factors_ref, 8, 0));
     }
@@ -2361,7 +2894,14 @@ fn emit_rope_multi(
         pso,
         bindings,
         params,
-        dispatch: DispatchDims::Fixed { gx, gy, gz, tx: 16, ty: 16, tz: 1 },
+        dispatch: DispatchDims::Fixed {
+            gx,
+            gy,
+            gz,
+            tx: 16,
+            ty: 16,
+            tz: 1,
+        },
         reads,
         writes: Some(BufferRef::Pool(out)),
     });
@@ -2378,20 +2918,28 @@ fn emit_copy_to_cache_multi(
 ) {
     let count = n_tokens * kv_dim;
     let groups = ((count + 255) / 256) as u32;
-    let pso = if kv_f16 { PsoRef::CopyF32ToF16 } else { PsoRef::CopyBuffer };
+    let pso = if kv_f16 {
+        PsoRef::CopyF32ToF16
+    } else {
+        PsoRef::CopyBuffer
+    };
     b.ops.push(DecodeOp {
         pso,
-        bindings: vec![
-            (BufferRef::Pool(src), 0, 0),
-            (kv_buf, 1, 0),
-        ],
+        bindings: vec![(BufferRef::Pool(src), 0, 0), (kv_buf, 1, 0)],
         params: vec![
             (ParamValue::U32(count as u32), 2),
             // dest_offset = pos_offset * kv_dim (always 0 for initial prefill,
             // but using a fixed U32(0) here since the plan only supports pos_offset=0)
             (ParamValue::U32(0), 3),
         ],
-        dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: 256, ty: 1, tz: 1 },
+        dispatch: DispatchDims::Fixed {
+            gx: groups,
+            gy: 1,
+            gz: 1,
+            tx: 256,
+            ty: 1,
+            tz: 1,
+        },
         reads: vec![BufferRef::Pool(src)],
         writes: Some(kv_buf),
     });
@@ -2413,7 +2961,11 @@ fn emit_batched_attention(
     kv_f16: bool,
     swa_window: u32,
 ) {
-    let pso = if kv_f16 { PsoRef::BatchedCausalAttentionF16 } else { PsoRef::BatchedCausalAttention };
+    let pso = if kv_f16 {
+        PsoRef::BatchedCausalAttentionF16
+    } else {
+        PsoRef::BatchedCausalAttention
+    };
     // gid = q_idx * num_heads + h, so dispatch n_tokens * num_heads groups
     b.ops.push(DecodeOp {
         pso,
@@ -2428,15 +2980,19 @@ fn emit_batched_attention(
             (ParamValue::U32(num_kv_heads as u32), 5),
             (ParamValue::U32(head_dim as u32), 6),
             (ParamValue::PrefillNTokens, 7),   // n_tokens = M
-            (ParamValue::PrefillTotalLen, 8),   // total_len = pos_offset + M
-            (ParamValue::PrefillPosOffset, 9),  // pos_offset = 0 for initial prefill
+            (ParamValue::PrefillTotalLen, 8),  // total_len = pos_offset + M
+            (ParamValue::PrefillPosOffset, 9), // pos_offset = 0 for initial prefill
             (ParamValue::F32(attn_scale), 10),
             (ParamValue::F32(softcap), 11),
             (ParamValue::U32(swa_window), 12),
         ],
         dispatch: DispatchDims::Fixed {
-            gx: (n_tokens * num_heads) as u32, gy: 1, gz: 1,
-            tx: 256, ty: 1, tz: 1,
+            gx: (n_tokens * num_heads) as u32,
+            gy: 1,
+            gz: 1,
+            tx: 256,
+            ty: 1,
+            tz: 1,
         },
         reads: vec![BufferRef::Pool(q), k_cache, v_cache],
         writes: Some(BufferRef::Pool(out)),
@@ -2485,13 +3041,22 @@ fn emit_ffn_multi(
                     (BufferRef::Pool(activated), 2, 0),
                 ],
                 params: vec![(ParamValue::U32(count as u32), 3)],
-                dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: 256, ty: 1, tz: 1 },
+                dispatch: DispatchDims::Fixed {
+                    gx: groups,
+                    gy: 1,
+                    gz: 1,
+                    tx: 256,
+                    ty: 1,
+                    tz: 1,
+                },
                 reads: vec![BufferRef::Pool(gate_raw), BufferRef::Pool(up_raw)],
                 writes: Some(BufferRef::Pool(activated)),
             });
 
             let down_raw = b.alloc_slot(m * h * f32_size);
-            emit_linear_multi(b, activated, w_down, down_bias, down_raw, h, ffn_h, down_dtype, m);
+            emit_linear_multi(
+                b, activated, w_down, down_bias, down_raw, h, ffn_h, down_dtype, m,
+            );
             down_raw
         }
         Activation::GeGLU => {
@@ -2515,13 +3080,22 @@ fn emit_ffn_multi(
                     (BufferRef::Pool(activated), 2, 0),
                 ],
                 params: vec![(ParamValue::U32(count as u32), 3)],
-                dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: 256, ty: 1, tz: 1 },
+                dispatch: DispatchDims::Fixed {
+                    gx: groups,
+                    gy: 1,
+                    gz: 1,
+                    tx: 256,
+                    ty: 1,
+                    tz: 1,
+                },
                 reads: vec![BufferRef::Pool(gate_raw), BufferRef::Pool(up_raw)],
                 writes: Some(BufferRef::Pool(activated)),
             });
 
             let down_raw = b.alloc_slot(m * h * f32_size);
-            emit_linear_multi(b, activated, w_down, down_bias, down_raw, h, ffn_h, down_dtype, m);
+            emit_linear_multi(
+                b, activated, w_down, down_bias, down_raw, h, ffn_h, down_dtype, m,
+            );
             down_raw
         }
         Activation::GELU => {
@@ -2538,13 +3112,22 @@ fn emit_ffn_multi(
                     (BufferRef::Pool(activated), 1, 0),
                 ],
                 params: vec![(ParamValue::U32(count as u32), 2)],
-                dispatch: DispatchDims::Fixed { gx: groups, gy: 1, gz: 1, tx: 256, ty: 1, tz: 1 },
+                dispatch: DispatchDims::Fixed {
+                    gx: groups,
+                    gy: 1,
+                    gz: 1,
+                    tx: 256,
+                    ty: 1,
+                    tz: 1,
+                },
                 reads: vec![BufferRef::Pool(up_raw)],
                 writes: Some(BufferRef::Pool(activated)),
             });
 
             let down_raw = b.alloc_slot(m * h * f32_size);
-            emit_linear_multi(b, activated, w_down, down_bias, down_raw, h, ffn_h, down_dtype, m);
+            emit_linear_multi(
+                b, activated, w_down, down_bias, down_raw, h, ffn_h, down_dtype, m,
+            );
             down_raw
         }
     }
@@ -2567,7 +3150,11 @@ mod tests {
                 let block_size = dtype.block_size();
                 let block_bytes = dtype.block_byte_size();
                 let n_blocks = (count + block_size - 1) / block_size;
-                DeviceTensor::new(Tensor::from_quantized(shape, dtype, vec![0u8; n_blocks * block_bytes]))
+                DeviceTensor::new(Tensor::from_quantized(
+                    shape,
+                    dtype,
+                    vec![0u8; n_blocks * block_bytes],
+                ))
             }
         }
     }
@@ -2804,7 +3391,8 @@ mod tests {
         //   Post-layer: layer_norm(final) + matmul(logits) = 2 ops
         //   Total = 3 + 12*14 + 2 = 173
         assert_eq!(
-            graph.ops.len(), 173,
+            graph.ops.len(),
+            173,
             "GPT-2 12-layer should have exactly 173 ops, got {}",
             graph.ops.len()
         );
@@ -2833,7 +3421,12 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, false);
 
         // 3 + 1*14 + 2 = 19 ops (fused matmul+bias eliminates 6 add_bias)
-        assert_eq!(graph.ops.len(), 19, "GPT-2 1-layer: expected 19 ops, got {}", graph.ops.len());
+        assert_eq!(
+            graph.ops.len(),
+            19,
+            "GPT-2 1-layer: expected 19 ops, got {}",
+            graph.ops.len()
+        );
 
         // Verify first three ops are embedding_lookup, embedding_lookup(pos), add
         assert_op_pso(&graph, 0, PsoRef::EmbeddingLookup);
@@ -2841,12 +3434,24 @@ mod tests {
         assert_op_pso(&graph, 2, PsoRef::AddTensor);
 
         // First embedding lookup should use TokenId (token embedding)
-        let has_token_id = graph.ops[0].params.iter().any(|(p, _)| matches!(p, ParamValue::TokenId));
-        assert!(has_token_id, "Token embedding lookup should use TokenId param");
+        let has_token_id = graph.ops[0]
+            .params
+            .iter()
+            .any(|(p, _)| matches!(p, ParamValue::TokenId));
+        assert!(
+            has_token_id,
+            "Token embedding lookup should use TokenId param"
+        );
 
         // Second embedding lookup should use PositionIdBuffer (position embedding)
-        let has_pos_id = graph.ops[1].params.iter().any(|(p, _)| matches!(p, ParamValue::PositionIdBuffer));
-        assert!(has_pos_id, "Position embedding lookup should use PositionIdBuffer param");
+        let has_pos_id = graph.ops[1]
+            .params
+            .iter()
+            .any(|(p, _)| matches!(p, ParamValue::PositionIdBuffer));
+        assert!(
+            has_pos_id,
+            "Position embedding lookup should use PositionIdBuffer param"
+        );
 
         // Verify the layer starts with LayerNorm (pre-norm GPT-2)
         assert_op_pso(&graph, 3, PsoRef::LayerNorm);
@@ -2865,7 +3470,7 @@ mod tests {
 
         // Output projection + residual (fused matmul+bias)
         assert_op_pso(&graph, 10, PsoRef::QuantizedMatmulBiasQ8_0); // O+bias
-        assert_op_pso(&graph, 11, PsoRef::AddTensor);                // residual
+        assert_op_pso(&graph, 11, PsoRef::AddTensor); // residual
 
         // FFN pre-norm
         assert_op_pso(&graph, 12, PsoRef::LayerNorm);
@@ -2874,7 +3479,7 @@ mod tests {
         assert_op_pso(&graph, 13, PsoRef::QuantizedMatmulBiasQ8_0); // up+bias
         assert_op_pso(&graph, 14, PsoRef::Gelu);
         assert_op_pso(&graph, 15, PsoRef::QuantizedMatmulBiasQ8_0); // down+bias
-        assert_op_pso(&graph, 16, PsoRef::AddTensor);                // FFN residual
+        assert_op_pso(&graph, 16, PsoRef::AddTensor); // FFN residual
 
         // Post-layer: final norm + logits
         assert_op_pso(&graph, 17, PsoRef::LayerNorm);
@@ -2947,7 +3552,8 @@ mod tests {
         //   Post-layer: rms_norm(final) + matmul(logits) = 2 ops
         //   Total = 1 + 22*17 + 2 = 377
         assert_eq!(
-            graph.ops.len(), 377,
+            graph.ops.len(),
+            377,
             "LLaMA 22-layer should have exactly 377 ops, got {}",
             graph.ops.len()
         );
@@ -2971,7 +3577,12 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, false);
 
         // 1 + 1*17 + 2 = 20 ops
-        assert_eq!(graph.ops.len(), 20, "LLaMA 1-layer: expected 20 ops, got {}", graph.ops.len());
+        assert_eq!(
+            graph.ops.len(),
+            20,
+            "LLaMA 1-layer: expected 20 ops, got {}",
+            graph.ops.len()
+        );
 
         // Embedding lookup (token only, no position)
         assert_op_pso(&graph, 0, PsoRef::EmbeddingLookup);
@@ -3137,7 +3748,8 @@ mod tests {
         //   Post-layer: rms_norm(final) + matmul(logits) = 2 ops
         //   Total = 1 + 32*17 + 2 = 547
         assert_eq!(
-            graph.ops.len(), 547,
+            graph.ops.len(),
+            547,
             "Phi-3 32-layer should have exactly 547 ops, got {}",
             graph.ops.len()
         );
@@ -3159,7 +3771,12 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, false);
 
         // 1 + 1*17 + 2 = 20 ops
-        assert_eq!(graph.ops.len(), 20, "Phi-3 1-layer: expected 20 ops, got {}", graph.ops.len());
+        assert_eq!(
+            graph.ops.len(),
+            20,
+            "Phi-3 1-layer: expected 20 ops, got {}",
+            graph.ops.len()
+        );
 
         // Embedding lookup
         assert_op_pso(&graph, 0, PsoRef::EmbeddingLookup);
@@ -3246,9 +3863,13 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, false);
         let walked = weight_walk_order(&weights);
 
-        let max_weight_idx = graph.ops.iter()
+        let max_weight_idx = graph
+            .ops
+            .iter()
             .flat_map(|op| {
-                op.bindings.iter().map(|(br, _, _)| br)
+                op.bindings
+                    .iter()
+                    .map(|(br, _, _)| br)
                     .chain(op.reads.iter())
             })
             .filter_map(|br| match br {
@@ -3309,7 +3930,10 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, false);
 
         // Find copy_buffer ops (should be at indices 7, 8 in GPT-2 1-layer with fused bias)
-        let copy_ops: Vec<usize> = graph.ops.iter().enumerate()
+        let copy_ops: Vec<usize> = graph
+            .ops
+            .iter()
+            .enumerate()
             .filter(|(_, op)| op.pso == PsoRef::CopyBuffer)
             .map(|(i, _)| i)
             .collect();
@@ -3323,8 +3947,14 @@ mod tests {
             assert!(matches!(op.bindings[1].0, BufferRef::KvCache(_)));
             assert_eq!(op.bindings[1].1, 1);
             // Should have CacheRowOffset param at binding 3
-            let has_offset = op.params.iter().any(|(p, b)| matches!(p, ParamValue::CacheRowOffset) && *b == 3);
-            assert!(has_offset, "copy_buffer should have CacheRowOffset at binding 3");
+            let has_offset = op
+                .params
+                .iter()
+                .any(|(p, b)| matches!(p, ParamValue::CacheRowOffset) && *b == 3);
+            assert!(
+                has_offset,
+                "copy_buffer should have CacheRowOffset at binding 3"
+            );
         }
     }
 
@@ -3334,13 +3964,21 @@ mod tests {
         let weights = gpt2_weights(&config);
         let graph = DecodeGraph::build(&config, &weights, false);
 
-        let attn_op = graph.ops.iter()
+        let attn_op = graph
+            .ops
+            .iter()
             .find(|op| op.pso == PsoRef::GroupedAttnDecode)
             .expect("Should have a grouped_attn_decode op");
 
         // Should have TotalLen param at binding 7
-        let has_total_len = attn_op.params.iter().any(|(p, b)| matches!(p, ParamValue::TotalLen) && *b == 7);
-        assert!(has_total_len, "grouped_attn should have TotalLen at binding 7");
+        let has_total_len = attn_op
+            .params
+            .iter()
+            .any(|(p, b)| matches!(p, ParamValue::TotalLen) && *b == 7);
+        assert!(
+            has_total_len,
+            "grouped_attn should have TotalLen at binding 7"
+        );
 
         // Should bind Q(pool) at 0, K_cache at 1, V_cache at 2, out(pool) at 3
         assert_eq!(attn_op.bindings.len(), 4);
@@ -3370,13 +4008,19 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, true);
 
         // Should have vec + reduce ops, NOT the old single-kernel F16 path
-        let vec_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let vec_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::AttnDecodeVecF16)
             .collect();
-        let reduce_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let reduce_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
             .collect();
-        let old_f16_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let old_f16_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::GroupedAttnDecodeF16)
             .collect();
 
@@ -3391,13 +4035,22 @@ mod tests {
         let weights = llama_weights(&config);
         let graph = DecodeGraph::build(&config, &weights, true);
 
-        let vec_op = graph.ops.iter()
+        let vec_op = graph
+            .ops
+            .iter()
             .find(|op| op.pso == PsoRef::AttnDecodeVecF16)
             .expect("Should have a vec decode op");
 
         // Dispatch: gx = num_heads * NWG = 32 * 32 = 1024, tx = 32
         match vec_op.dispatch {
-            DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } => {
+            DispatchDims::Fixed {
+                gx,
+                gy,
+                gz,
+                tx,
+                ty,
+                tz,
+            } => {
                 assert_eq!(gx, 32 * 32, "gx should be num_heads * NWG");
                 assert_eq!(gy, 1);
                 assert_eq!(gz, 1);
@@ -3415,13 +4068,22 @@ mod tests {
         let weights = llama_weights(&config);
         let graph = DecodeGraph::build(&config, &weights, true);
 
-        let reduce_op = graph.ops.iter()
+        let reduce_op = graph
+            .ops
+            .iter()
             .find(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
             .expect("Should have a reduce op");
 
         // Dispatch: gx = num_heads = 32, tx = 32
         match reduce_op.dispatch {
-            DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } => {
+            DispatchDims::Fixed {
+                gx,
+                gy,
+                gz,
+                tx,
+                ty,
+                tz,
+            } => {
                 assert_eq!(gx, 32, "gx should be num_heads");
                 assert_eq!(gy, 1);
                 assert_eq!(gz, 1);
@@ -3439,27 +4101,51 @@ mod tests {
         let weights = llama_weights(&config);
         let graph = DecodeGraph::build(&config, &weights, true);
 
-        let vec_op = graph.ops.iter()
+        let vec_op = graph
+            .ops
+            .iter()
             .find(|op| op.pso == PsoRef::AttnDecodeVecF16)
             .expect("Should have a vec decode op");
 
         // Vec kernel bindings: Q(pool), K_cache, V_cache, temp(pool)
         assert_eq!(vec_op.bindings.len(), 4);
-        assert!(matches!(vec_op.bindings[0].0, BufferRef::Pool(_)), "binding 0 should be Q (pool)");
-        assert!(matches!(vec_op.bindings[1].0, BufferRef::KvCache(_)), "binding 1 should be K cache");
-        assert!(matches!(vec_op.bindings[2].0, BufferRef::KvCache(_)), "binding 2 should be V cache");
-        assert!(matches!(vec_op.bindings[3].0, BufferRef::Pool(_)), "binding 3 should be temp (pool)");
+        assert!(
+            matches!(vec_op.bindings[0].0, BufferRef::Pool(_)),
+            "binding 0 should be Q (pool)"
+        );
+        assert!(
+            matches!(vec_op.bindings[1].0, BufferRef::KvCache(_)),
+            "binding 1 should be K cache"
+        );
+        assert!(
+            matches!(vec_op.bindings[2].0, BufferRef::KvCache(_)),
+            "binding 2 should be V cache"
+        );
+        assert!(
+            matches!(vec_op.bindings[3].0, BufferRef::Pool(_)),
+            "binding 3 should be temp (pool)"
+        );
 
         // Should have TotalLen at binding 7
-        let has_total_len = vec_op.params.iter()
+        let has_total_len = vec_op
+            .params
+            .iter()
             .any(|(p, b)| matches!(p, ParamValue::TotalLen) && *b == 7);
-        assert!(has_total_len, "vec kernel should have TotalLen at binding 7");
+        assert!(
+            has_total_len,
+            "vec kernel should have TotalLen at binding 7"
+        );
 
         // Check num_heads param at binding 4
-        let num_heads_param = vec_op.params.iter()
+        let num_heads_param = vec_op
+            .params
+            .iter()
             .find(|(_, b)| *b == 4)
             .expect("Should have param at binding 4");
-        assert!(matches!(num_heads_param.0, ParamValue::U32(32)), "num_heads should be 32");
+        assert!(
+            matches!(num_heads_param.0, ParamValue::U32(32)),
+            "num_heads should be 32"
+        );
     }
 
     #[test]
@@ -3468,25 +4154,43 @@ mod tests {
         let weights = llama_weights(&config);
         let graph = DecodeGraph::build(&config, &weights, true);
 
-        let reduce_op = graph.ops.iter()
+        let reduce_op = graph
+            .ops
+            .iter()
             .find(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
             .expect("Should have a reduce op");
 
         // Reduce kernel bindings: temp(pool), output(pool)
         assert_eq!(reduce_op.bindings.len(), 2);
-        assert!(matches!(reduce_op.bindings[0].0, BufferRef::Pool(_)), "binding 0 should be temp (pool)");
-        assert!(matches!(reduce_op.bindings[1].0, BufferRef::Pool(_)), "binding 1 should be output (pool)");
+        assert!(
+            matches!(reduce_op.bindings[0].0, BufferRef::Pool(_)),
+            "binding 0 should be temp (pool)"
+        );
+        assert!(
+            matches!(reduce_op.bindings[1].0, BufferRef::Pool(_)),
+            "binding 1 should be output (pool)"
+        );
 
         // Check that num_heads is at binding 2, head_dim at binding 3
-        let num_heads_param = reduce_op.params.iter()
+        let num_heads_param = reduce_op
+            .params
+            .iter()
             .find(|(_, b)| *b == 2)
             .expect("Should have param at binding 2");
-        assert!(matches!(num_heads_param.0, ParamValue::U32(32)), "num_heads should be 32");
+        assert!(
+            matches!(num_heads_param.0, ParamValue::U32(32)),
+            "num_heads should be 32"
+        );
 
-        let head_dim_param = reduce_op.params.iter()
+        let head_dim_param = reduce_op
+            .params
+            .iter()
             .find(|(_, b)| *b == 3)
             .expect("Should have param at binding 3");
-        assert!(matches!(head_dim_param.0, ParamValue::U32(64)), "head_dim should be 64");
+        assert!(
+            matches!(head_dim_param.0, ParamValue::U32(64)),
+            "head_dim should be 64"
+        );
     }
 
     #[test]
@@ -3495,21 +4199,31 @@ mod tests {
         let weights = llama_weights(&config);
         let graph = DecodeGraph::build(&config, &weights, true);
 
-        let vec_op = graph.ops.iter()
+        let vec_op = graph
+            .ops
+            .iter()
             .find(|op| op.pso == PsoRef::AttnDecodeVecF16)
             .expect("Should have a vec decode op");
-        let reduce_op = graph.ops.iter()
+        let reduce_op = graph
+            .ops
+            .iter()
             .find(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
             .expect("Should have a reduce op");
 
         // Vec writes to temp (binding 3), reduce reads from temp (binding 0)
         let vec_temp = vec_op.bindings[3].0;
         let reduce_temp = reduce_op.bindings[0].0;
-        assert_eq!(vec_temp, reduce_temp, "vec and reduce should share the same temp buffer slot");
+        assert_eq!(
+            vec_temp, reduce_temp,
+            "vec and reduce should share the same temp buffer slot"
+        );
 
         // Vec output (temp) should NOT be the same as reduce output
         let reduce_out = reduce_op.bindings[1].0;
-        assert_ne!(reduce_temp, reduce_out, "temp and output should be different slots");
+        assert_ne!(
+            reduce_temp, reduce_out,
+            "temp and output should be different slots"
+        );
     }
 
     #[test]
@@ -3519,18 +4233,30 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, true);
 
         // Find the indices of vec and reduce ops
-        let vec_idx = graph.ops.iter().position(|op| op.pso == PsoRef::AttnDecodeVecF16)
+        let vec_idx = graph
+            .ops
+            .iter()
+            .position(|op| op.pso == PsoRef::AttnDecodeVecF16)
             .expect("Should have vec op");
-        let reduce_idx = graph.ops.iter().position(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
+        let reduce_idx = graph
+            .ops
+            .iter()
+            .position(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
             .expect("Should have reduce op");
 
         // Reduce must come after vec
-        assert!(reduce_idx == vec_idx + 1, "reduce should immediately follow vec");
+        assert!(
+            reduce_idx == vec_idx + 1,
+            "reduce should immediately follow vec"
+        );
 
         // There should be a barrier between vec and reduce (reduce reads temp that vec wrote)
-        assert!(graph.barriers.contains(&reduce_idx),
+        assert!(
+            graph.barriers.contains(&reduce_idx),
             "barrier should be inserted before reduce op (index {}), barriers: {:?}",
-            reduce_idx, graph.barriers);
+            reduce_idx,
+            graph.barriers
+        );
     }
 
     #[test]
@@ -3539,7 +4265,9 @@ mod tests {
         let weights = llama_weights(&config);
         let graph = DecodeGraph::build(&config, &weights, true);
 
-        let vec_op = graph.ops.iter()
+        let vec_op = graph
+            .ops
+            .iter()
             .find(|op| op.pso == PsoRef::AttnDecodeVecF16)
             .expect("Should have a vec decode op");
 
@@ -3549,8 +4277,11 @@ mod tests {
             // Expected: (num_heads * NWG * head_dim + num_heads * NWG * 2) * sizeof(f32)
             // = (32 * 32 * 64 + 32 * 32 * 2) * 4 = (65536 + 2048) * 4 = 270336
             let expected = (32 * 32 * 64 + 32 * 32 * 2) * 4;
-            assert_eq!(temp_bytes, expected,
-                "temp buffer should be {} bytes, got {}", expected, temp_bytes);
+            assert_eq!(
+                temp_bytes, expected,
+                "temp buffer should be {} bytes, got {}",
+                expected, temp_bytes
+            );
         } else {
             panic!("vec binding 3 should be a pool slot");
         }
@@ -3566,7 +4297,10 @@ mod tests {
         let weights = llama_weights(&config);
         let graph = DecodeGraph::build(&config, &weights, true);
 
-        let vec_ops: Vec<(usize, &DecodeOp)> = graph.ops.iter().enumerate()
+        let vec_ops: Vec<(usize, &DecodeOp)> = graph
+            .ops
+            .iter()
+            .enumerate()
             .filter(|(_, op)| op.pso == PsoRef::AttnDecodeVecF16)
             .collect();
         assert_eq!(vec_ops.len(), 2, "Should have 2 vec ops for 2 layers");
@@ -3574,7 +4308,10 @@ mod tests {
         // Both vec ops should write to the same temp slot
         let temp1 = vec_ops[0].1.bindings[3].0;
         let temp2 = vec_ops[1].1.bindings[3].0;
-        assert_eq!(temp1, temp2, "Both layers should reuse the same temp buffer slot");
+        assert_eq!(
+            temp1, temp2,
+            "Both layers should reuse the same temp buffer slot"
+        );
     }
 
     #[test]
@@ -3584,13 +4321,25 @@ mod tests {
         let weights = llama_weights(&config);
         let graph = DecodeGraph::build(&config, &weights, false);
 
-        let vec_count = graph.ops.iter().filter(|op| op.pso == PsoRef::AttnDecodeVecF16).count();
-        let reduce_count = graph.ops.iter().filter(|op| op.pso == PsoRef::AttnDecodeVecReduceF16).count();
+        let vec_count = graph
+            .ops
+            .iter()
+            .filter(|op| op.pso == PsoRef::AttnDecodeVecF16)
+            .count();
+        let reduce_count = graph
+            .ops
+            .iter()
+            .filter(|op| op.pso == PsoRef::AttnDecodeVecReduceF16)
+            .count();
         assert_eq!(vec_count, 0, "F32 path should not emit vec ops");
         assert_eq!(reduce_count, 0, "F32 path should not emit reduce ops");
 
         // Should use the old single-kernel path
-        let old_count = graph.ops.iter().filter(|op| op.pso == PsoRef::GroupedAttnDecode).count();
+        let old_count = graph
+            .ops
+            .iter()
+            .filter(|op| op.pso == PsoRef::GroupedAttnDecode)
+            .count();
         assert_eq!(old_count, 1, "F32 path should use GroupedAttnDecode");
     }
 
@@ -3600,14 +4349,18 @@ mod tests {
         let weights = llama_weights(&config);
         let graph = DecodeGraph::build(&config, &weights, false);
 
-        let rope_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let rope_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::RopeNorm)
             .collect();
         assert_eq!(rope_ops.len(), 2); // Q and K
 
         // Q rope: n_heads=32, head_dim=64, rope_dim=64, half_rope=32
         match rope_ops[0].dispatch {
-            DispatchDims::Fixed { gx, gy, gz, tx, ty, .. } => {
+            DispatchDims::Fixed {
+                gx, gy, gz, tx, ty, ..
+            } => {
                 assert_eq!(gx, (32 + 15) / 16); // half_rope / 16 = 2
                 assert_eq!(gy, (32 + 15) / 16); // num_heads(32) / 16 = 2
                 assert_eq!(gz, 1); // seq_len = 1
@@ -3627,7 +4380,10 @@ mod tests {
         }
 
         // Should have PositionId at binding 2 (as bytes, not buffer)
-        let has_pos = rope_ops[0].params.iter().any(|(p, b)| matches!(p, ParamValue::PositionId) && *b == 2);
+        let has_pos = rope_ops[0]
+            .params
+            .iter()
+            .any(|(p, b)| matches!(p, ParamValue::PositionId) && *b == 2);
         assert!(has_pos, "RoPE should have PositionId at binding 2");
     }
 
@@ -3666,9 +4422,13 @@ mod tests {
 
         // The graph builder should have consumed exactly as many weights
         // as weight_walk_order returns
-        let max_weight_idx = graph.ops.iter()
+        let max_weight_idx = graph
+            .ops
+            .iter()
             .flat_map(|op| {
-                op.bindings.iter().map(|(br, _, _)| br)
+                op.bindings
+                    .iter()
+                    .map(|(br, _, _)| br)
                     .chain(op.reads.iter())
             })
             .filter_map(|br| match br {
@@ -3697,7 +4457,12 @@ mod tests {
         // Per layer: attn_norm_w + attn_norm_b + Q + Q_bias + K + K_bias + V + V_bias
         //   + O + O_bias + ffn_norm_w + ffn_norm_b + up + up_bias + down + down_bias = 16
         // Total: 4 + 12*16 = 196
-        assert_eq!(walked.len(), 196, "GPT-2 should walk 196 weights, got {}", walked.len());
+        assert_eq!(
+            walked.len(),
+            196,
+            "GPT-2 should walk 196 weights, got {}",
+            walked.len()
+        );
     }
 
     #[test]
@@ -3709,7 +4474,12 @@ mod tests {
         // LLaMA global: token_emb + output_norm_w = 2
         // Per layer: attn_norm_w + Q + K + V + O + ffn_norm_w + up + down + gate = 9
         // Total: 2 + 22*9 = 200
-        assert_eq!(walked.len(), 200, "LLaMA should walk 200 weights, got {}", walked.len());
+        assert_eq!(
+            walked.len(),
+            200,
+            "LLaMA should walk 200 weights, got {}",
+            walked.len()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3738,7 +4508,10 @@ mod tests {
             assert!(
                 graph.barriers[i] > graph.barriers[i - 1],
                 "Barriers should be sorted: [{}]={} <= [{}]={}",
-                i - 1, graph.barriers[i - 1], i, graph.barriers[i]
+                i - 1,
+                graph.barriers[i - 1],
+                i,
+                graph.barriers[i]
             );
         }
     }
@@ -3756,7 +4529,9 @@ mod tests {
         assert!(
             reduction_pct > 10.0,
             "Expected >10% barrier reduction, got {:.1}% ({} barriers / {} ops)",
-            reduction_pct, graph.barriers.len(), graph.ops.len()
+            reduction_pct,
+            graph.barriers.len(),
+            graph.ops.len()
         );
     }
 
@@ -3773,7 +4548,12 @@ mod tests {
 
         // With embedding_scale != 1.0: embedding_lookup + scale + ... layer ... + norm + logits
         // = 1 + 1 + 17 + 2 = 21
-        assert_eq!(graph.ops.len(), 21, "With scale: expected 21 ops, got {}", graph.ops.len());
+        assert_eq!(
+            graph.ops.len(),
+            21,
+            "With scale: expected 21 ops, got {}",
+            graph.ops.len()
+        );
         assert_op_pso(&graph, 0, PsoRef::EmbeddingLookup);
         assert_op_pso(&graph, 1, PsoRef::ScaleKernel);
         assert_op_pso(&graph, 2, PsoRef::RmsNorm); // layer starts
@@ -3820,9 +4600,13 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, false);
 
         // Collect all KvCache references
-        let kv_indices: Vec<u16> = graph.ops.iter()
+        let kv_indices: Vec<u16> = graph
+            .ops
+            .iter()
             .flat_map(|op| {
-                op.bindings.iter().map(|(br, _, _)| br)
+                op.bindings
+                    .iter()
+                    .map(|(br, _, _)| br)
                     .chain(op.reads.iter())
                     .chain(op.writes.iter())
             })
@@ -3835,7 +4619,8 @@ mod tests {
         // Should cover indices 0..num_layers*2
         let max_kv = kv_indices.iter().max().copied().unwrap_or(0);
         assert_eq!(
-            max_kv as usize, (config.num_layers * 2) - 1,
+            max_kv as usize,
+            (config.num_layers * 2) - 1,
             "Max KV cache index should be num_layers*2-1"
         );
 
@@ -3843,8 +4628,16 @@ mod tests {
         for layer in 0..config.num_layers {
             let k_idx = (layer * 2) as u16;
             let v_idx = (layer * 2 + 1) as u16;
-            assert!(kv_indices.contains(&k_idx), "Missing K cache for layer {}", layer);
-            assert!(kv_indices.contains(&v_idx), "Missing V cache for layer {}", layer);
+            assert!(
+                kv_indices.contains(&k_idx),
+                "Missing K cache for layer {}",
+                layer
+            );
+            assert!(
+                kv_indices.contains(&v_idx),
+                "Missing V cache for layer {}",
+                layer
+            );
         }
     }
 
@@ -3884,9 +4677,12 @@ mod tests {
         let expected_per_layer = 8 + 6;
         let expected_total = 3 + config.num_layers * expected_per_layer + 3;
         assert_eq!(
-            graph.ops.len(), expected_total,
+            graph.ops.len(),
+            expected_total,
             "GPT-2 1-layer M={} should have {} ops, got {}",
-            m, expected_total, graph.ops.len()
+            m,
+            expected_total,
+            graph.ops.len()
         );
 
         assert!(graph.logits_count == config.vocab_size);
@@ -3910,14 +4706,20 @@ mod tests {
         let expected_per_layer = 10 + 7;
         let expected_total = 1 + config.num_layers * expected_per_layer + 3;
         assert_eq!(
-            graph.ops.len(), expected_total,
+            graph.ops.len(),
+            expected_total,
             "LLaMA 1-layer M={} should have {} ops, got {}",
-            m, expected_total, graph.ops.len()
+            m,
+            expected_total,
+            graph.ops.len()
         );
 
         // Should have RoPE but no LayerNorm
         assert_eq!(count_prefill_pso(&graph, PsoRef::LayerNorm), 0);
-        assert!(count_prefill_pso(&graph, PsoRef::RopeNorm) > 0 || count_prefill_pso(&graph, PsoRef::RopeNeox) > 0);
+        assert!(
+            count_prefill_pso(&graph, PsoRef::RopeNorm) > 0
+                || count_prefill_pso(&graph, PsoRef::RopeNeox) > 0
+        );
         assert!(count_prefill_pso(&graph, PsoRef::SwiGlu) > 0);
         assert_eq!(count_prefill_pso(&graph, PsoRef::Gelu), 0);
     }
@@ -3953,7 +4755,11 @@ mod tests {
                 (PsoRef::GroupedAttnDecode, PsoRef::BatchedCausalAttention) => {}
                 (PsoRef::GroupedAttnDecodeF16, PsoRef::BatchedCausalAttentionF16) => {}
                 _ => {
-                    assert_eq!(d, p, "Op[{}] PSO mismatch: decode={:?}, prefill={:?}", i, d, p);
+                    assert_eq!(
+                        d, p,
+                        "Op[{}] PSO mismatch: decode={:?}, prefill={:?}",
+                        i, d, p
+                    );
                 }
             }
         }
@@ -3971,26 +4777,39 @@ mod tests {
         let graph = PrefillGraph::build(&config, &weights, m, false);
 
         // GPT-2 has bias, so uses BatchedMatmulBiasQ8_0 (1 dispatch per linear).
-        let batched_ops: Vec<(usize, &DecodeOp)> = graph.ops.iter().enumerate()
+        let batched_ops: Vec<(usize, &DecodeOp)> = graph
+            .ops
+            .iter()
+            .enumerate()
             .filter(|(_, op)| op.pso == PsoRef::BatchedMatmulBiasQ8_0)
             .collect();
 
         // GPT-2 1-layer: Q, K, V, O, up, down = 6 linears × 1 dispatch each = 6
         assert_eq!(
-            batched_ops.len(), 6,
+            batched_ops.len(),
+            6,
             "Expected 6 BatchedMatmulBiasQ8_0 ops (6 linears × 1 dispatch), got {}",
             batched_ops.len()
         );
 
         // Each op should have 3 params: M(3), K(4), N(5)
         for (i, (_, op)) in batched_ops.iter().enumerate() {
-            assert_eq!(op.params.len(), 3, "Op {} should have 3 params (M, K, N)", i);
+            assert_eq!(
+                op.params.len(),
+                3,
+                "Op {} should have 3 params (M, K, N)",
+                i
+            );
         }
 
         // Bias binding should be at index 6 (batched kernel layout)
         for (i, (_, op)) in batched_ops.iter().enumerate() {
             let bias_binding = op.bindings.iter().find(|(_, idx, _)| *idx == 6);
-            assert!(bias_binding.is_some(), "Op {} should have bias at binding index 6", i);
+            assert!(
+                bias_binding.is_some(),
+                "Op {} should have bias at binding index 6",
+                i
+            );
         }
 
         // Input/output bindings should have zero offset (entire M×K / M×N buffer)
@@ -4017,13 +4836,25 @@ mod tests {
         let f32_attn_count = count_prefill_pso(&graph_f32, PsoRef::BatchedCausalAttention);
         let f16_attn_count = count_prefill_pso(&graph_f16, PsoRef::BatchedCausalAttentionF16);
 
-        assert_eq!(f32_attn_count, 1, "F32 graph should have 1 BatchedCausalAttention");
-        assert_eq!(f16_attn_count, 1, "F16 graph should have 1 BatchedCausalAttentionF16");
+        assert_eq!(
+            f32_attn_count, 1,
+            "F32 graph should have 1 BatchedCausalAttention"
+        );
+        assert_eq!(
+            f16_attn_count, 1,
+            "F16 graph should have 1 BatchedCausalAttentionF16"
+        );
 
         // F32 graph should NOT have F16 attention
-        assert_eq!(count_prefill_pso(&graph_f32, PsoRef::BatchedCausalAttentionF16), 0);
+        assert_eq!(
+            count_prefill_pso(&graph_f32, PsoRef::BatchedCausalAttentionF16),
+            0
+        );
         // F16 graph should NOT have F32 attention
-        assert_eq!(count_prefill_pso(&graph_f16, PsoRef::BatchedCausalAttention), 0);
+        assert_eq!(
+            count_prefill_pso(&graph_f16, PsoRef::BatchedCausalAttention),
+            0
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4037,7 +4868,9 @@ mod tests {
         let m = 7;
         let graph = PrefillGraph::build(&config, &weights, m, false);
 
-        let attn_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let attn_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::BatchedCausalAttention)
             .collect();
 
@@ -4046,8 +4879,12 @@ mod tests {
 
         // Dispatch should be: gx = M * num_heads, gy = 1, gz = 1, tx = 256
         if let DispatchDims::Fixed { gx, gy, gz, tx, .. } = attn.dispatch {
-            assert_eq!(gx, (m * config.num_heads) as u32,
-                "Attention dispatch gx should be M*num_heads={}", m * config.num_heads);
+            assert_eq!(
+                gx,
+                (m * config.num_heads) as u32,
+                "Attention dispatch gx should be M*num_heads={}",
+                m * config.num_heads
+            );
             assert_eq!(gy, 1);
             assert_eq!(gz, 1);
             assert_eq!(tx, 256);
@@ -4056,12 +4893,30 @@ mod tests {
         }
 
         // Should have PrefillNTokens, PrefillTotalLen, PrefillPosOffset params
-        let has_n_tokens = attn.params.iter().any(|(p, _)| matches!(p, ParamValue::PrefillNTokens));
-        let has_total_len = attn.params.iter().any(|(p, _)| matches!(p, ParamValue::PrefillTotalLen));
-        let has_pos_offset = attn.params.iter().any(|(p, _)| matches!(p, ParamValue::PrefillPosOffset));
-        assert!(has_n_tokens, "Batched attention missing PrefillNTokens param");
-        assert!(has_total_len, "Batched attention missing PrefillTotalLen param");
-        assert!(has_pos_offset, "Batched attention missing PrefillPosOffset param");
+        let has_n_tokens = attn
+            .params
+            .iter()
+            .any(|(p, _)| matches!(p, ParamValue::PrefillNTokens));
+        let has_total_len = attn
+            .params
+            .iter()
+            .any(|(p, _)| matches!(p, ParamValue::PrefillTotalLen));
+        let has_pos_offset = attn
+            .params
+            .iter()
+            .any(|(p, _)| matches!(p, ParamValue::PrefillPosOffset));
+        assert!(
+            has_n_tokens,
+            "Batched attention missing PrefillNTokens param"
+        );
+        assert!(
+            has_total_len,
+            "Batched attention missing PrefillTotalLen param"
+        );
+        assert!(
+            has_pos_offset,
+            "Batched attention missing PrefillPosOffset param"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4111,7 +4966,11 @@ mod tests {
             // Verify count = h
             let count_param = extraction.params.iter().find(|(_, idx)| *idx == 2).unwrap();
             if let ParamValue::U32(count) = count_param.0 {
-                assert_eq!(count, h as u32, "M={}: extraction count should be h={}", m, h);
+                assert_eq!(
+                    count, h as u32,
+                    "M={}: extraction count should be h={}",
+                    m, h
+                );
             } else {
                 panic!("M={}: extraction count param should be U32", m);
             }
@@ -4140,22 +4999,40 @@ mod tests {
         let graph_f16 = PrefillGraph::build(&config, &weights, m, true);
 
         // F32 cache: KV writes use CopyBuffer (2 per layer: K, V)
-        let f32_copy_count = graph_f32.ops.iter()
-            .filter(|op| op.pso == PsoRef::CopyBuffer && op.writes.iter().any(|w| matches!(w, BufferRef::KvCache(_))))
+        let f32_copy_count = graph_f32
+            .ops
+            .iter()
+            .filter(|op| {
+                op.pso == PsoRef::CopyBuffer
+                    && op.writes.iter().any(|w| matches!(w, BufferRef::KvCache(_)))
+            })
             .count();
-        assert_eq!(f32_copy_count, 2, "F32 KV: should have 2 CopyBuffer ops for KV cache");
+        assert_eq!(
+            f32_copy_count, 2,
+            "F32 KV: should have 2 CopyBuffer ops for KV cache"
+        );
 
         // F16 cache: KV writes use CopyF32ToF16
-        let f16_copy_count = graph_f16.ops.iter()
+        let f16_copy_count = graph_f16
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::CopyF32ToF16)
             .count();
         assert_eq!(f16_copy_count, 2, "F16 KV: should have 2 CopyF32ToF16 ops");
 
         // F16 graph should NOT have CopyBuffer writing to KvCache
-        let f16_plain_copy_to_kv = graph_f16.ops.iter()
-            .filter(|op| op.pso == PsoRef::CopyBuffer && op.writes.iter().any(|w| matches!(w, BufferRef::KvCache(_))))
+        let f16_plain_copy_to_kv = graph_f16
+            .ops
+            .iter()
+            .filter(|op| {
+                op.pso == PsoRef::CopyBuffer
+                    && op.writes.iter().any(|w| matches!(w, BufferRef::KvCache(_)))
+            })
             .count();
-        assert_eq!(f16_plain_copy_to_kv, 0, "F16: CopyBuffer should not write to KV cache");
+        assert_eq!(
+            f16_plain_copy_to_kv, 0,
+            "F16: CopyBuffer should not write to KV cache"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4176,7 +5053,8 @@ mod tests {
         assert!(
             total_m4 > total_m1,
             "M=4 total buffer ({}) should be larger than M=1 ({})",
-            total_m4, total_m1
+            total_m4,
+            total_m1
         );
 
         // The hidden state slot should be exactly M * h * 4 bytes
@@ -4187,7 +5065,9 @@ mod tests {
         assert!(
             graph_m4.slot_sizes.iter().any(|&s| s == expected_hidden_m4),
             "M=4: expected at least one slot of size {} (4*{}*4), found sizes: {:?}",
-            expected_hidden_m4, h, &graph_m4.slot_sizes[..graph_m4.slot_sizes.len().min(10)]
+            expected_hidden_m4,
+            h,
+            &graph_m4.slot_sizes[..graph_m4.slot_sizes.len().min(10)]
         );
     }
 
@@ -4203,7 +5083,9 @@ mod tests {
         let walked = weight_walk_order(&weights);
         let graph = PrefillGraph::build(&config, &weights, 8, false);
 
-        let max_weight_idx = graph.ops.iter()
+        let max_weight_idx = graph
+            .ops
+            .iter()
             .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br))
             .filter_map(|br| match br {
                 BufferRef::Weight(idx) => Some(*idx as usize),
@@ -4215,7 +5097,8 @@ mod tests {
         assert!(
             max_weight_idx < walked.len(),
             "Prefill graph references weight index {} but only {} walked",
-            max_weight_idx, walked.len()
+            max_weight_idx,
+            walked.len()
         );
     }
 
@@ -4228,7 +5111,9 @@ mod tests {
         let prefill = PrefillGraph::build(&config, &weights, 4, false);
 
         // Both should reference the same set of weight indices
-        let decode_weights: std::collections::BTreeSet<u16> = decode.ops.iter()
+        let decode_weights: std::collections::BTreeSet<u16> = decode
+            .ops
+            .iter()
             .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br))
             .filter_map(|br| match br {
                 BufferRef::Weight(idx) => Some(*idx),
@@ -4236,7 +5121,9 @@ mod tests {
             })
             .collect();
 
-        let prefill_weights: std::collections::BTreeSet<u16> = prefill.ops.iter()
+        let prefill_weights: std::collections::BTreeSet<u16> = prefill
+            .ops
+            .iter()
             .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br))
             .filter_map(|br| match br {
                 BufferRef::Weight(idx) => Some(*idx),
@@ -4268,7 +5155,12 @@ mod tests {
 
         // All barrier indices should be within op range
         for &b in &graph.barriers {
-            assert!(b < graph.ops.len(), "Barrier index {} out of range ({})", b, graph.ops.len());
+            assert!(
+                b < graph.ops.len(),
+                "Barrier index {} out of range ({})",
+                b,
+                graph.ops.len()
+            );
         }
 
         // Barriers should be sorted
@@ -4280,7 +5172,8 @@ mod tests {
         assert!(
             graph.barriers.len() < graph.ops.len(),
             "Barriers ({}) should be fewer than ops ({})",
-            graph.barriers.len(), graph.ops.len()
+            graph.barriers.len(),
+            graph.ops.len()
         );
     }
 
@@ -4295,22 +5188,36 @@ mod tests {
         let m = 6;
         let graph = PrefillGraph::build(&config, &weights, m, false);
 
-        let rope_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let rope_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::RopeNorm || op.pso == PsoRef::RopeNeox)
             .collect();
 
         // LLaMA 1-layer should have 2 RoPE ops per layer (Q and K)
-        assert_eq!(rope_ops.len(), 2, "Expected 2 RoPE ops, got {}", rope_ops.len());
+        assert_eq!(
+            rope_ops.len(),
+            2,
+            "Expected 2 RoPE ops, got {}",
+            rope_ops.len()
+        );
 
         for rope in &rope_ops {
             if let DispatchDims::Fixed { gz, .. } = rope.dispatch {
-                assert_eq!(gz, m as u32, "RoPE dispatch gz should be M={}, got {}", m, gz);
+                assert_eq!(
+                    gz, m as u32,
+                    "RoPE dispatch gz should be M={}, got {}",
+                    m, gz
+                );
             } else {
                 panic!("Expected Fixed dispatch for RoPE");
             }
 
             // Should have PrefillPosOffset param
-            let has_pos = rope.params.iter().any(|(p, _)| matches!(p, ParamValue::PrefillPosOffset));
+            let has_pos = rope
+                .params
+                .iter()
+                .any(|(p, _)| matches!(p, ParamValue::PrefillPosOffset));
             assert!(has_pos, "RoPE should have PrefillPosOffset param");
         }
     }
@@ -4375,7 +5282,9 @@ mod tests {
         let graph = PrefillGraph::build(&config, &weights, m, false);
 
         // Find MatmulTransposeBias ops (F32 path)
-        let f32_matmul_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let f32_matmul_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::MatmulTransposeBias || op.pso == PsoRef::MatmulTranspose)
             .collect();
 
@@ -4387,7 +5296,11 @@ mod tests {
         for op in &f32_matmul_ops {
             if let DispatchDims::Fixed { gy, .. } = op.dispatch {
                 let expected_gy = ((m + 31) / 32) as u32;
-                assert_eq!(gy, expected_gy, "F32 matmul gy should be ceil(M/32)={}", expected_gy);
+                assert_eq!(
+                    gy, expected_gy,
+                    "F32 matmul gy should be ceil(M/32)={}",
+                    expected_gy
+                );
             }
         }
 
@@ -4416,21 +5329,33 @@ mod tests {
         let emb_op = &graph.ops[0];
 
         // Should bind PrefillTokenIds (buffer of M token IDs)
-        let has_prefill_token_ids = emb_op.params.iter()
+        let has_prefill_token_ids = emb_op
+            .params
+            .iter()
             .any(|(p, _)| matches!(p, ParamValue::PrefillTokenIds));
-        assert!(has_prefill_token_ids, "Token embedding should use PrefillTokenIds");
+        assert!(
+            has_prefill_token_ids,
+            "Token embedding should use PrefillTokenIds"
+        );
 
         // Should have PrefillNTokens param
-        let has_n_tokens = emb_op.params.iter()
+        let has_n_tokens = emb_op
+            .params
+            .iter()
             .any(|(p, _)| matches!(p, ParamValue::PrefillNTokens));
         assert!(has_n_tokens, "Token embedding should use PrefillNTokens");
 
         // GPT-2 has position embedding (op 1)
         assert_prefill_op_pso(&graph, 1, PsoRef::EmbeddingLookup);
         let pos_op = &graph.ops[1];
-        let has_prefill_pos_ids = pos_op.params.iter()
+        let has_prefill_pos_ids = pos_op
+            .params
+            .iter()
             .any(|(p, _)| matches!(p, ParamValue::PrefillPositionIds));
-        assert!(has_prefill_pos_ids, "Position embedding should use PrefillPositionIds");
+        assert!(
+            has_prefill_pos_ids,
+            "Position embedding should use PrefillPositionIds"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4444,12 +5369,18 @@ mod tests {
         let m = 12;
         let graph = PrefillGraph::build(&config, &weights, m, false);
 
-        let norm_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let norm_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::LayerNorm || op.pso == PsoRef::RmsNorm)
             .collect();
 
         // GPT-2 1-layer: 2 LayerNorm per layer + 1 final = 3 norms
-        assert!(norm_ops.len() >= 3, "Expected at least 3 norm ops, got {}", norm_ops.len());
+        assert!(
+            norm_ops.len() >= 3,
+            "Expected at least 3 norm ops, got {}",
+            norm_ops.len()
+        );
 
         // Norms dispatched with Rows variant should have num_rows = M
         for op in &norm_ops {
@@ -4476,28 +5407,55 @@ mod tests {
         let mut graph = PrefillGraph::build(&config, &weights, 4, false);
 
         // Count EmbeddingLookup ops referencing Weight(0)
-        let before_count = graph.ops.iter()
+        let before_count = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::EmbeddingLookup)
-            .filter(|op| op.bindings.iter().any(|(br, idx, _)| *br == BufferRef::Weight(0) && *idx == 0))
+            .filter(|op| {
+                op.bindings
+                    .iter()
+                    .any(|(br, idx, _)| *br == BufferRef::Weight(0) && *idx == 0)
+            })
             .count();
-        assert!(before_count > 0, "Should have EmbeddingLookup ops using Weight(0)");
+        assert!(
+            before_count > 0,
+            "Should have EmbeddingLookup ops using Weight(0)"
+        );
 
         // Patch Weight(0) -> Weight(99)
         patch_ops(&mut graph.ops, BufferRef::Weight(0), BufferRef::Weight(99));
 
         // After patching, no EmbeddingLookup should reference Weight(0)
-        let after_count = graph.ops.iter()
+        let after_count = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::EmbeddingLookup)
-            .filter(|op| op.bindings.iter().any(|(br, idx, _)| *br == BufferRef::Weight(0) && *idx == 0))
+            .filter(|op| {
+                op.bindings
+                    .iter()
+                    .any(|(br, idx, _)| *br == BufferRef::Weight(0) && *idx == 0)
+            })
             .count();
-        assert_eq!(after_count, 0, "After patching, no EmbeddingLookup should use Weight(0)");
+        assert_eq!(
+            after_count, 0,
+            "After patching, no EmbeddingLookup should use Weight(0)"
+        );
 
         // Should now reference Weight(99)
-        let patched_count = graph.ops.iter()
+        let patched_count = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::EmbeddingLookup)
-            .filter(|op| op.bindings.iter().any(|(br, idx, _)| *br == BufferRef::Weight(99) && *idx == 0))
+            .filter(|op| {
+                op.bindings
+                    .iter()
+                    .any(|(br, idx, _)| *br == BufferRef::Weight(99) && *idx == 0)
+            })
             .count();
-        assert_eq!(patched_count, before_count, "Patched ops should now use Weight(99)");
+        assert_eq!(
+            patched_count, before_count,
+            "Patched ops should now use Weight(99)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4510,9 +5468,13 @@ mod tests {
         let weights = gpt2_weights(&config);
         let graph = PrefillGraph::build(&config, &weights, 8, false);
 
-        let kv_indices: Vec<u16> = graph.ops.iter()
+        let kv_indices: Vec<u16> = graph
+            .ops
+            .iter()
             .flat_map(|op| {
-                op.bindings.iter().map(|(br, _, _)| br)
+                op.bindings
+                    .iter()
+                    .map(|(br, _, _)| br)
                     .chain(op.reads.iter())
                     .chain(op.writes.iter())
             })
@@ -4524,15 +5486,24 @@ mod tests {
 
         let max_kv = kv_indices.iter().max().copied().unwrap_or(0);
         assert_eq!(
-            max_kv as usize, (config.num_layers * 2) - 1,
+            max_kv as usize,
+            (config.num_layers * 2) - 1,
             "Max KV cache index should be num_layers*2-1"
         );
 
         for layer in 0..config.num_layers {
             let k_idx = (layer * 2) as u16;
             let v_idx = (layer * 2 + 1) as u16;
-            assert!(kv_indices.contains(&k_idx), "Missing K cache for layer {}", layer);
-            assert!(kv_indices.contains(&v_idx), "Missing V cache for layer {}", layer);
+            assert!(
+                kv_indices.contains(&k_idx),
+                "Missing K cache for layer {}",
+                layer
+            );
+            assert!(
+                kv_indices.contains(&v_idx),
+                "Missing V cache for layer {}",
+                layer
+            );
         }
     }
 
@@ -4548,19 +5519,24 @@ mod tests {
         let graph = PrefillGraph::build(&config, &weights, m, false);
 
         // LLaMA uses Q8_0 without bias → BatchedMatmulQ8_0 (1 dispatch per linear)
-        let batched_nobias: Vec<&DecodeOp> = graph.ops.iter()
+        let batched_nobias: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::BatchedMatmulQ8_0)
             .collect();
 
         // LLaMA 1-layer: Q, K, V, O, gate, up, down = 7 linears × 1 dispatch = 7
         assert_eq!(
-            batched_nobias.len(), 7,
+            batched_nobias.len(),
+            7,
             "Expected 7 BatchedMatmulQ8_0 ops (7 linears × 1 dispatch), got {}",
             batched_nobias.len()
         );
 
         // No bias ops should exist
-        let bias_count: usize = graph.ops.iter()
+        let bias_count: usize = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::BatchedMatmulBiasQ8_0)
             .count();
         assert_eq!(bias_count, 0, "LLaMA should have no bias matmul ops");
@@ -4568,10 +5544,19 @@ mod tests {
         // Each no-bias op should NOT have a binding at index 6 (no bias buffer)
         for (i, op) in batched_nobias.iter().enumerate() {
             let has_bias_binding = op.bindings.iter().any(|(_, idx, _)| *idx == 6);
-            assert!(!has_bias_binding, "No-bias op {} should not have binding at index 6", i);
+            assert!(
+                !has_bias_binding,
+                "No-bias op {} should not have binding at index 6",
+                i
+            );
 
             // Should have 3 bindings: weights(0), input(1), output(2)
-            assert_eq!(op.bindings.len(), 3, "No-bias op {} should have 3 bindings", i);
+            assert_eq!(
+                op.bindings.len(),
+                3,
+                "No-bias op {} should have 3 bindings",
+                i
+            );
 
             // Should have 3 params: M(3), K(4), N(5)
             assert_eq!(op.params.len(), 3, "No-bias op {} should have 3 params", i);
@@ -4596,7 +5581,9 @@ mod tests {
         // M=1: uses single-row kernels (optimized fused dequant+dot)
         {
             let graph = PrefillGraph::build(&config, &weights, 1, false);
-            let single_row_ops: usize = graph.ops.iter()
+            let single_row_ops: usize = graph
+                .ops
+                .iter()
                 .filter(|op| op.pso == PsoRef::QuantizedMatmulBiasQ8_0)
                 .count();
             assert_eq!(
@@ -4611,7 +5598,9 @@ mod tests {
         // M>1: uses batched GEMM (single dispatch per linear)
         for m in [32, 33] {
             let graph = PrefillGraph::build(&config, &weights, m, false);
-            let batched_ops: usize = graph.ops.iter()
+            let batched_ops: usize = graph
+                .ops
+                .iter()
                 .filter(|op| op.pso == PsoRef::BatchedMatmulBiasQ8_0)
                 .count();
 
@@ -4623,9 +5612,12 @@ mod tests {
 
             let expected_total = pre + config.num_layers * (non_matmul + num_linears) + post;
             assert_eq!(
-                graph.ops.len(), expected_total,
+                graph.ops.len(),
+                expected_total,
                 "M={}: expected {} total ops, got {}",
-                m, expected_total, graph.ops.len()
+                m,
+                expected_total,
+                graph.ops.len()
             );
         }
     }
@@ -4697,20 +5689,34 @@ mod tests {
         let q8_ops = count_prefill_pso(&graph, PsoRef::BatchedMatmulQ8_0);
 
         // Q, K, V, O, gate, up, down = 7 linears × 1 dispatch = 7
-        assert_eq!(q4k_ops, 7, "Q4_K weights should produce 7 BatchedMatmulQ4K ops, got {}", q4k_ops);
-        assert_eq!(q8_ops, 0, "Q4_K weights should produce 0 BatchedMatmulQ8_0 ops");
+        assert_eq!(
+            q4k_ops, 7,
+            "Q4_K weights should produce 7 BatchedMatmulQ4K ops, got {}",
+            q4k_ops
+        );
+        assert_eq!(
+            q8_ops, 0,
+            "Q4_K weights should produce 0 BatchedMatmulQ8_0 ops"
+        );
 
         // Per-layer: 10 non-matmul ops + 7 batched matmul ops
         let expected_per_layer = 10 + 7;
         let expected_total = 1 + config.num_layers * expected_per_layer + 3;
         assert_eq!(
-            graph.ops.len(), expected_total,
+            graph.ops.len(),
+            expected_total,
             "Q4_K LLaMA M={} should have {} ops, got {}",
-            m, expected_total, graph.ops.len()
+            m,
+            expected_total,
+            graph.ops.len()
         );
 
         // Verify batched kernel uses 128 threads (tiled GEMM)
-        let q4k_op = graph.ops.iter().find(|op| op.pso == PsoRef::BatchedMatmulQ4K).unwrap();
+        let q4k_op = graph
+            .ops
+            .iter()
+            .find(|op| op.pso == PsoRef::BatchedMatmulQ4K)
+            .unwrap();
         if let DispatchDims::Fixed { tx, .. } = q4k_op.dispatch {
             assert_eq!(tx, 128, "Batched Q4_K matmul should use 128 threads");
         }
@@ -4725,16 +5731,27 @@ mod tests {
         // Verify that M=1 prefill has exactly 1 more op than decode
         // regardless of quant type (Q8_0 or K-quant)
         for (name, config, weights) in [
-            ("GPT-2 Q8_0", gpt2_1layer_config(), gpt2_weights(&gpt2_1layer_config())),
-            ("LLaMA Q8_0", llama_1layer_config(), llama_weights(&llama_1layer_config())),
+            (
+                "GPT-2 Q8_0",
+                gpt2_1layer_config(),
+                gpt2_weights(&gpt2_1layer_config()),
+            ),
+            (
+                "LLaMA Q8_0",
+                llama_1layer_config(),
+                llama_weights(&llama_1layer_config()),
+            ),
         ] {
             let decode = DecodeGraph::build(&config, &weights, false);
             let prefill = PrefillGraph::build(&config, &weights, 1, false);
 
             assert_eq!(
-                prefill.ops.len(), decode.ops.len() + 1,
+                prefill.ops.len(),
+                decode.ops.len() + 1,
                 "{}: M=1 prefill ({}) should have exactly 1 more op than decode ({})",
-                name, prefill.ops.len(), decode.ops.len()
+                name,
+                prefill.ops.len(),
+                decode.ops.len()
             );
         }
     }
@@ -4764,9 +5781,12 @@ mod tests {
         let expected_per_layer = 17;
         let expected_total = 1 + config.num_layers * expected_per_layer + 3;
         assert_eq!(
-            graph.ops.len(), expected_total,
+            graph.ops.len(),
+            expected_total,
             "Phi-3 1-layer M={} should have {} ops, got {}",
-            m, expected_total, graph.ops.len()
+            m,
+            expected_total,
+            graph.ops.len()
         );
 
         // Should use NeoX-style RoPE (not RopeNorm)
@@ -4809,15 +5829,35 @@ mod tests {
         // Both should reference the same weights in the same walk order
         let walked = weight_walk_order(&weights);
 
-        let decode_max = decode.ops.iter()
-            .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br).chain(op.reads.iter()))
-            .filter_map(|br| match br { BufferRef::Weight(i) => Some(*i as usize), _ => None })
+        let decode_max = decode
+            .ops
+            .iter()
+            .flat_map(|op| {
+                op.bindings
+                    .iter()
+                    .map(|(br, _, _)| br)
+                    .chain(op.reads.iter())
+            })
+            .filter_map(|br| match br {
+                BufferRef::Weight(i) => Some(*i as usize),
+                _ => None,
+            })
             .max()
             .unwrap_or(0);
 
-        let prefill_max = prefill.ops.iter()
-            .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br).chain(op.reads.iter()))
-            .filter_map(|br| match br { BufferRef::Weight(i) => Some(*i as usize), _ => None })
+        let prefill_max = prefill
+            .ops
+            .iter()
+            .flat_map(|op| {
+                op.bindings
+                    .iter()
+                    .map(|(br, _, _)| br)
+                    .chain(op.reads.iter())
+            })
+            .filter_map(|br| match br {
+                BufferRef::Weight(i) => Some(*i as usize),
+                _ => None,
+            })
             .max()
             .unwrap_or(0);
 
@@ -4828,7 +5868,8 @@ mod tests {
         assert!(
             prefill_max < walked.len(),
             "Weight index {} out of bounds (walked {} weights)",
-            prefill_max, walked.len()
+            prefill_max,
+            walked.len()
         );
     }
 
@@ -4839,13 +5880,15 @@ mod tests {
         let m = 13;
         let graph = PrefillGraph::build(&config, &weights, m, false);
 
-        let h = config.hidden_size;          // 2048
+        let h = config.hidden_size; // 2048
         let kv_dim = config.num_kv_heads * config.head_dim; // 4 * 64 = 256
-        let total_dim = config.num_heads * config.head_dim;  // 32 * 64 = 2048
-        let ffn = config.ffn_hidden;          // 5632
+        let total_dim = config.num_heads * config.head_dim; // 32 * 64 = 2048
+        let ffn = config.ffn_hidden; // 5632
 
         // Collect all batched matmul ops
-        let batched_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let batched_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::BatchedMatmulQ8_0)
             .collect();
 
@@ -4858,11 +5901,21 @@ mod tests {
         let expected_gy = ((m + 63) / 64) as u32; // ceil(M/BBM)
         for (linear_idx, &expected_n) in expected_n_dims.iter().enumerate() {
             let op = batched_ops[linear_idx];
-            if let DispatchDims::Fixed { gx, gy, gz, tx, ty, tz } = op.dispatch {
+            if let DispatchDims::Fixed {
+                gx,
+                gy,
+                gz,
+                tx,
+                ty,
+                tz,
+            } = op.dispatch
+            {
                 let expected_gx = ((expected_n + 31) / 32) as u32; // ceil(N/BBN)
-                assert_eq!(gx, expected_gx,
+                assert_eq!(
+                    gx, expected_gx,
                     "Linear {} (N={}): gx should be ceil({}/32)={}, got {}",
-                    linear_idx, expected_n, expected_n, expected_gx, gx);
+                    linear_idx, expected_n, expected_n, expected_gx, gx
+                );
                 assert_eq!(gy, expected_gy, "Batched dispatch gy should be ceil(M/64)");
                 assert_eq!(gz, 1);
                 assert_eq!(tx, 128);
@@ -4875,8 +5928,11 @@ mod tests {
             // Verify N param (binding 5) matches expected_n
             let n_param = op.params.iter().find(|(_, idx)| *idx == 5).unwrap();
             if let ParamValue::U32(n_val) = n_param.0 {
-                assert_eq!(n_val, expected_n as u32,
-                    "Linear {}: N param should be {}, got {}", linear_idx, expected_n, n_val);
+                assert_eq!(
+                    n_val, expected_n as u32,
+                    "Linear {}: N param should be {}, got {}",
+                    linear_idx, expected_n, n_val
+                );
             }
         }
     }
@@ -4982,8 +6038,12 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, false);
 
         // LLaMA-like 1-layer baseline: 20 ops. With per-head Q/K norms: +2 RmsNorm = 22.
-        assert_eq!(graph.ops.len(), 22,
-            "Qwen3 1-layer decode: expected 22 ops (20 + 2 per-head norms), got {}", graph.ops.len());
+        assert_eq!(
+            graph.ops.len(),
+            22,
+            "Qwen3 1-layer decode: expected 22 ops (20 + 2 per-head norms), got {}",
+            graph.ops.len()
+        );
 
         // Op sequence: embed(0), norm(1), Q(2), K(3), V(4),
         //   Q_norm(5), K_norm(6), RoPE_Q(7), RoPE_K(8), ...
@@ -5002,10 +6062,16 @@ mod tests {
         let q_rows = q_norm_op.params.iter().find(|(_, idx)| *idx == 3).unwrap();
         let q_cols = q_norm_op.params.iter().find(|(_, idx)| *idx == 4).unwrap();
         if let (ParamValue::U32(rows), ParamValue::U32(cols)) = (q_rows.0, q_cols.0) {
-            assert_eq!(rows, config.num_heads as u32,
-                "Q per-head norm rows should be num_heads={}, got {}", config.num_heads, rows);
-            assert_eq!(cols, config.head_dim as u32,
-                "Q per-head norm cols should be head_dim={}, got {}", config.head_dim, cols);
+            assert_eq!(
+                rows, config.num_heads as u32,
+                "Q per-head norm rows should be num_heads={}, got {}",
+                config.num_heads, rows
+            );
+            assert_eq!(
+                cols, config.head_dim as u32,
+                "Q per-head norm cols should be head_dim={}, got {}",
+                config.head_dim, cols
+            );
         } else {
             panic!("Q norm params should be U32");
         }
@@ -5015,10 +6081,16 @@ mod tests {
         let k_rows = k_norm_op.params.iter().find(|(_, idx)| *idx == 3).unwrap();
         let k_cols = k_norm_op.params.iter().find(|(_, idx)| *idx == 4).unwrap();
         if let (ParamValue::U32(rows), ParamValue::U32(cols)) = (k_rows.0, k_cols.0) {
-            assert_eq!(rows, config.num_kv_heads as u32,
-                "K per-head norm rows should be num_kv_heads={}, got {}", config.num_kv_heads, rows);
-            assert_eq!(cols, config.head_dim as u32,
-                "K per-head norm cols should be head_dim={}, got {}", config.head_dim, cols);
+            assert_eq!(
+                rows, config.num_kv_heads as u32,
+                "K per-head norm rows should be num_kv_heads={}, got {}",
+                config.num_kv_heads, rows
+            );
+            assert_eq!(
+                cols, config.head_dim as u32,
+                "K per-head norm cols should be head_dim={}, got {}",
+                config.head_dim, cols
+            );
         } else {
             panic!("K norm params should be U32");
         }
@@ -5037,39 +6109,63 @@ mod tests {
         let llama_cfg = llama_1layer_config();
         let llama_wts = llama_weights(&llama_cfg);
         let llama_graph = PrefillGraph::build(&llama_cfg, &llama_wts, m, false);
-        let qwen3_rms_count = graph.ops.iter().filter(|op| op.pso == PsoRef::RmsNorm).count();
-        let llama_rms_count = llama_graph.ops.iter().filter(|op| op.pso == PsoRef::RmsNorm).count();
-        assert_eq!(qwen3_rms_count, llama_rms_count + 2,
+        let qwen3_rms_count = graph
+            .ops
+            .iter()
+            .filter(|op| op.pso == PsoRef::RmsNorm)
+            .count();
+        let llama_rms_count = llama_graph
+            .ops
+            .iter()
+            .filter(|op| op.pso == PsoRef::RmsNorm)
+            .count();
+        assert_eq!(
+            qwen3_rms_count,
+            llama_rms_count + 2,
             "Qwen3 prefill should have 2 more RmsNorm ops than LLaMA: {} vs {}",
-            qwen3_rms_count, llama_rms_count);
+            qwen3_rms_count,
+            llama_rms_count
+        );
 
         // Find the per-head Q norm op: it should have rows = m * num_heads
         // It comes after the 3 QKV matmuls and pre-attn norm
-        let per_head_rms_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let per_head_rms_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| {
-                if op.pso != PsoRef::RmsNorm { return false; }
+                if op.pso != PsoRef::RmsNorm {
+                    return false;
+                }
                 // Per-head norms have rows = m * num_heads or m * num_kv_heads,
                 // NOT rows = m (regular layer norms have rows = m).
                 let rows_param = op.params.iter().find(|(_, idx)| *idx == 3);
                 if let Some((ParamValue::U32(rows), _)) = rows_param {
-                    *rows != m as u32  // exclude regular layer norms
+                    *rows != m as u32 // exclude regular layer norms
                 } else {
                     false
                 }
             })
             .collect();
 
-        assert_eq!(per_head_rms_ops.len(), 2,
-            "Should have exactly 2 per-head RmsNorm ops, got {}", per_head_rms_ops.len());
+        assert_eq!(
+            per_head_rms_ops.len(),
+            2,
+            "Should have exactly 2 per-head RmsNorm ops, got {}",
+            per_head_rms_ops.len()
+        );
 
         // Q norm: rows = m * num_heads, cols = head_dim
         let q_norm = per_head_rms_ops[0];
         let q_rows = q_norm.params.iter().find(|(_, idx)| *idx == 3).unwrap();
         let q_cols = q_norm.params.iter().find(|(_, idx)| *idx == 4).unwrap();
         if let (ParamValue::U32(rows), ParamValue::U32(cols)) = (q_rows.0, q_cols.0) {
-            assert_eq!(rows, (m * config.num_heads) as u32,
+            assert_eq!(
+                rows,
+                (m * config.num_heads) as u32,
                 "Prefill Q norm rows should be m*num_heads={}, got {}",
-                m * config.num_heads, rows);
+                m * config.num_heads,
+                rows
+            );
             assert_eq!(cols, config.head_dim as u32);
         }
 
@@ -5078,9 +6174,13 @@ mod tests {
         let k_rows = k_norm.params.iter().find(|(_, idx)| *idx == 3).unwrap();
         let k_cols = k_norm.params.iter().find(|(_, idx)| *idx == 4).unwrap();
         if let (ParamValue::U32(rows), ParamValue::U32(cols)) = (k_rows.0, k_cols.0) {
-            assert_eq!(rows, (m * config.num_kv_heads) as u32,
+            assert_eq!(
+                rows,
+                (m * config.num_kv_heads) as u32,
                 "Prefill K norm rows should be m*num_kv_heads={}, got {}",
-                m * config.num_kv_heads, rows);
+                m * config.num_kv_heads,
+                rows
+            );
             assert_eq!(cols, config.head_dim as u32);
         }
     }
@@ -5093,9 +6193,16 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, false);
 
         // Should be exactly 3 RmsNorm ops: pre-attn, pre-ffn, final output
-        let rms_count = graph.ops.iter().filter(|op| op.pso == PsoRef::RmsNorm).count();
-        assert_eq!(rms_count, 3,
-            "LLaMA without per-head norms should have 3 RmsNorm ops, got {}", rms_count);
+        let rms_count = graph
+            .ops
+            .iter()
+            .filter(|op| op.pso == PsoRef::RmsNorm)
+            .count();
+        assert_eq!(
+            rms_count, 3,
+            "LLaMA without per-head norms should have 3 RmsNorm ops, got {}",
+            rms_count
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5113,8 +6220,11 @@ mod tests {
         let walk_true = weight_walk_order_with_factors(&weights, true);
 
         // Same total count regardless of factor selection
-        assert_eq!(walk_false.len(), walk_true.len(),
-            "Walk order length should not change with use_long_factors");
+        assert_eq!(
+            walk_false.len(),
+            walk_true.len(),
+            "Walk order length should not change with use_long_factors"
+        );
 
         // Find rope factor positions by scanning for the known factor tensors.
         // Use raw pointer identity to distinguish short vs long DeviceTensors.
@@ -5128,29 +6238,49 @@ mod tests {
             p == short_ptr || p == long_ptr
         };
 
-        let pos_in_false: Vec<usize> = walk_false.iter().enumerate()
+        let pos_in_false: Vec<usize> = walk_false
+            .iter()
+            .enumerate()
             .filter(|(_, w)| is_factor(w))
             .map(|(i, _)| i)
             .collect();
-        let pos_in_true: Vec<usize> = walk_true.iter().enumerate()
+        let pos_in_true: Vec<usize> = walk_true
+            .iter()
+            .enumerate()
             .filter(|(_, w)| is_factor(w))
             .map(|(i, _)| i)
             .collect();
 
-        assert_eq!(pos_in_false.len(), 2, "Both factors should be in walk order");
+        assert_eq!(
+            pos_in_false.len(),
+            2,
+            "Both factors should be in walk order"
+        );
         assert_eq!(pos_in_true.len(), 2);
 
         // use_long_factors=false: short first, long second
         let p0f = walk_false[pos_in_false[0]] as *const crate::backend::DeviceTensor;
         let p1f = walk_false[pos_in_false[1]] as *const crate::backend::DeviceTensor;
-        assert_eq!(p0f, short_ptr, "use_long_factors=false should place short factors first");
-        assert_eq!(p1f, long_ptr, "use_long_factors=false should place long factors second");
+        assert_eq!(
+            p0f, short_ptr,
+            "use_long_factors=false should place short factors first"
+        );
+        assert_eq!(
+            p1f, long_ptr,
+            "use_long_factors=false should place long factors second"
+        );
 
         // use_long_factors=true: long first, short second
         let p0t = walk_true[pos_in_true[0]] as *const crate::backend::DeviceTensor;
         let p1t = walk_true[pos_in_true[1]] as *const crate::backend::DeviceTensor;
-        assert_eq!(p0t, long_ptr, "use_long_factors=true should place long factors first");
-        assert_eq!(p1t, short_ptr, "use_long_factors=true should place short factors second");
+        assert_eq!(
+            p0t, long_ptr,
+            "use_long_factors=true should place long factors first"
+        );
+        assert_eq!(
+            p1t, short_ptr,
+            "use_long_factors=true should place short factors second"
+        );
     }
 
     #[test]
@@ -5168,8 +6298,11 @@ mod tests {
 
         // Pointers should be identical since there's nothing to reorder.
         for (i, (a, b)) in walk_false.iter().zip(walk_true.iter()).enumerate() {
-            assert!(std::ptr::eq(*a, *b),
-                "Walk order entry {} should be identical when no rope factors exist", i);
+            assert!(
+                std::ptr::eq(*a, *b),
+                "Walk order entry {} should be identical when no rope factors exist",
+                i
+            );
         }
     }
 
@@ -5187,24 +6320,52 @@ mod tests {
             let decode = DecodeGraph::build(&config, &weights, false);
             let prefill = PrefillGraph::build(&config, &weights, 4, false);
 
-            let decode_max = decode.ops.iter()
-                .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br).chain(op.reads.iter()))
-                .filter_map(|br| match br { BufferRef::Weight(i) => Some(*i as usize), _ => None })
+            let decode_max = decode
+                .ops
+                .iter()
+                .flat_map(|op| {
+                    op.bindings
+                        .iter()
+                        .map(|(br, _, _)| br)
+                        .chain(op.reads.iter())
+                })
+                .filter_map(|br| match br {
+                    BufferRef::Weight(i) => Some(*i as usize),
+                    _ => None,
+                })
                 .max()
                 .unwrap_or(0);
 
-            let prefill_max = prefill.ops.iter()
-                .flat_map(|op| op.bindings.iter().map(|(br, _, _)| br).chain(op.reads.iter()))
-                .filter_map(|br| match br { BufferRef::Weight(i) => Some(*i as usize), _ => None })
+            let prefill_max = prefill
+                .ops
+                .iter()
+                .flat_map(|op| {
+                    op.bindings
+                        .iter()
+                        .map(|(br, _, _)| br)
+                        .chain(op.reads.iter())
+                })
+                .filter_map(|br| match br {
+                    BufferRef::Weight(i) => Some(*i as usize),
+                    _ => None,
+                })
                 .max()
                 .unwrap_or(0);
 
-            assert!(decode_max < walked.len(),
+            assert!(
+                decode_max < walked.len(),
                 "use_long_factors={}: decode weight index {} out of bounds (walked {})",
-                use_long, decode_max, walked.len());
-            assert!(prefill_max < walked.len(),
+                use_long,
+                decode_max,
+                walked.len()
+            );
+            assert!(
+                prefill_max < walked.len(),
                 "use_long_factors={}: prefill weight index {} out of bounds (walked {})",
-                use_long, prefill_max, walked.len());
+                use_long,
+                prefill_max,
+                walked.len()
+            );
         }
     }
 
@@ -5219,16 +6380,26 @@ mod tests {
         let graph = DecodeGraph::build(&config, &weights, false);
 
         // Find the weight index used by RopeNeoxFactors ops
-        let rope_factor_ops: Vec<&DecodeOp> = graph.ops.iter()
+        let rope_factor_ops: Vec<&DecodeOp> = graph
+            .ops
+            .iter()
             .filter(|op| op.pso == PsoRef::RopeNeoxFactors)
             .collect();
-        assert_eq!(rope_factor_ops.len(), 2, "Should have 2 RopeNeoxFactors ops (Q+K)");
+        assert_eq!(
+            rope_factor_ops.len(),
+            2,
+            "Should have 2 RopeNeoxFactors ops (Q+K)"
+        );
 
         // All RopeNeoxFactors ops should reference the same factor weight index
-        let factor_weight_indices: Vec<u16> = rope_factor_ops.iter()
-            .flat_map(|op| op.bindings.iter().filter_map(|(br, _, _)| {
-                match br { BufferRef::Weight(i) => Some(*i), _ => None }
-            }))
+        let factor_weight_indices: Vec<u16> = rope_factor_ops
+            .iter()
+            .flat_map(|op| {
+                op.bindings.iter().filter_map(|(br, _, _)| match br {
+                    BufferRef::Weight(i) => Some(*i),
+                    _ => None,
+                })
+            })
             .collect();
 
         // The factor binding should be the FIRST factor slot (active),
@@ -5236,9 +6407,11 @@ mod tests {
         // token_emb(0) + output_norm_w(1) = first factor at index 2
         let expected_first_factor_idx: u16 = 2;
         for &idx in &factor_weight_indices {
-            assert_eq!(idx, expected_first_factor_idx,
+            assert_eq!(
+                idx, expected_first_factor_idx,
                 "RoPE factor ops should bind first factor slot (index {}), got {}",
-                expected_first_factor_idx, idx);
+                expected_first_factor_idx, idx
+            );
         }
     }
 }

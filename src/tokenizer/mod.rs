@@ -64,10 +64,7 @@ pub fn encode_batch(
 ///   padding positions.
 ///
 /// If `sequences` is empty, returns empty vectors.
-pub fn pad_sequences(
-    sequences: &[Vec<u32>],
-    pad_id: u32,
-) -> (Vec<Vec<u32>>, Vec<Vec<u8>>) {
+pub fn pad_sequences(sequences: &[Vec<u32>], pad_id: u32) -> (Vec<Vec<u32>>, Vec<Vec<u8>>) {
     if sequences.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -106,16 +103,12 @@ pub fn pad_sequences(
 /// Requires the `tokenizer.ggml.tokens` string array to be present. Optional
 /// keys (`tokenizer.ggml.scores`, `tokenizer.ggml.merges`, etc.) are read when
 /// available and default to empty/absent otherwise.
-pub fn create_tokenizer_from_gguf(
-    gguf: &GgufFile,
-) -> Result<Box<dyn Tokenizer>, InferenceError> {
+pub fn create_tokenizer_from_gguf(gguf: &GgufFile) -> Result<Box<dyn Tokenizer>, InferenceError> {
     // Read the token list (required)
     let tokens: Vec<String> = gguf
         .get_str_array("tokenizer.ggml.tokens")
         .ok_or_else(|| {
-            InferenceError::Tokenizer(
-                "missing required key: tokenizer.ggml.tokens".to_string(),
-            )
+            InferenceError::Tokenizer("missing required key: tokenizer.ggml.tokens".to_string())
         })?
         .into_iter()
         .map(|s| s.to_string())
@@ -198,14 +191,28 @@ pub fn create_tokenizer_from_gguf(
             // BPE models: check pre-tokenizer type (llama.cpp llama-vocab.cpp:1868-1999)
             matches!(
                 pre_type.as_deref(),
-                Some("llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1"
-                    | "pixtral" | "midm-2.0" | "lfm2" | "tekken" | "chameleon")
+                Some(
+                    "llama3"
+                        | "llama-v3"
+                        | "llama-bpe"
+                        | "falcon3"
+                        | "falcon-h1"
+                        | "pixtral"
+                        | "midm-2.0"
+                        | "lfm2"
+                        | "tekken"
+                        | "chameleon"
+                )
             )
         } else {
             true // SPM/llama defaults to true
         };
-        let add_bos = gguf.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(default_add_bos);
-        let add_eos = gguf.get_bool("tokenizer.ggml.add_eos_token").unwrap_or(false);
+        let add_bos = gguf
+            .get_bool("tokenizer.ggml.add_bos_token")
+            .unwrap_or(default_add_bos);
+        let add_eos = gguf
+            .get_bool("tokenizer.ggml.add_eos_token")
+            .unwrap_or(false);
         // SentencePiece models default to adding space prefix (leading underline).
         // Gemma models set this to false.
         let add_space_prefix = gguf
@@ -251,12 +258,12 @@ mod tests {
         fn new() -> Self {
             Self {
                 vocab: vec![
-                    "<pad>".to_string(),  // 0
-                    "<bos>".to_string(),  // 1
-                    "<eos>".to_string(),  // 2
-                    "hello".to_string(),  // 3
-                    "world".to_string(),  // 4
-                    "foo".to_string(),    // 5
+                    "<pad>".to_string(), // 0
+                    "<bos>".to_string(), // 1
+                    "<eos>".to_string(), // 2
+                    "hello".to_string(), // 3
+                    "world".to_string(), // 4
+                    "foo".to_string(),   // 5
                 ],
             }
         }
@@ -336,8 +343,8 @@ mod tests {
     #[test]
     fn test_pad_sequences_basic() {
         let sequences = vec![
-            vec![1, 3, 4, 2],  // length 4
-            vec![1, 5, 2],     // length 3
+            vec![1, 3, 4, 2], // length 4
+            vec![1, 5, 2],    // length 3
         ];
         let (padded, masks) = pad_sequences(&sequences, 0);
 
@@ -383,9 +390,9 @@ mod tests {
     #[test]
     fn test_pad_sequences_varied_lengths() {
         let sequences = vec![
-            vec![1],           // length 1
-            vec![1, 2, 3, 4],  // length 4
-            vec![1, 2],        // length 2
+            vec![1],          // length 1
+            vec![1, 2, 3, 4], // length 4
+            vec![1, 2],       // length 2
         ];
         let (padded, masks) = pad_sequences(&sequences, 0);
 
@@ -520,15 +527,19 @@ mod tests {
     // create_tokenizer_from_gguf tests with synthetic GGUF data
     // ====================================================================
 
+    use crate::gguf::GgufFile;
     use std::io::Write;
     use tempfile::NamedTempFile;
-    use crate::gguf::GgufFile;
 
     const GGUF_MAGIC: u32 = 0x4655_4747;
 
     fn align_offset(offset: u64, alignment: u64) -> u64 {
         let remainder = offset % alignment;
-        if remainder == 0 { offset } else { offset + (alignment - remainder) }
+        if remainder == 0 {
+            offset
+        } else {
+            offset + (alignment - remainder)
+        }
     }
 
     fn build_gguf_bytes(kv_pairs: &[(&str, &[u8])]) -> Vec<u8> {
@@ -601,10 +612,7 @@ mod tests {
     }
 
     fn open_gguf_from_kv(kv_pairs: &[(&str, Vec<u8>)]) -> (GgufFile, NamedTempFile) {
-        let refs: Vec<(&str, &[u8])> = kv_pairs
-            .iter()
-            .map(|(k, v)| (*k, v.as_slice()))
-            .collect();
+        let refs: Vec<(&str, &[u8])> = kv_pairs.iter().map(|(k, v)| (*k, v.as_slice())).collect();
         let bytes = build_gguf_bytes(&refs);
         let file = write_temp_gguf(&bytes);
         let gguf = GgufFile::open(file.path()).expect("failed to open temp GGUF");
@@ -615,10 +623,14 @@ mod tests {
     fn test_create_tokenizer_from_gguf_bpe() {
         let kv = vec![
             ("tokenizer.ggml.model", kv_string("llama")),
-            ("tokenizer.ggml.tokens", kv_str_array(&[
-                "<pad>", "<bos>", "<eos>", "\u{2581}hello", "\u{2581}world",
-            ])),
-            ("tokenizer.ggml.scores", kv_f32_array(&[0.0, 0.0, 0.0, -1.0, -2.0])),
+            (
+                "tokenizer.ggml.tokens",
+                kv_str_array(&["<pad>", "<bos>", "<eos>", "\u{2581}hello", "\u{2581}world"]),
+            ),
+            (
+                "tokenizer.ggml.scores",
+                kv_f32_array(&[0.0, 0.0, 0.0, -1.0, -2.0]),
+            ),
             ("tokenizer.ggml.bos_token_id", kv_u32(1)),
             ("tokenizer.ggml.eos_token_id", kv_u32(2)),
             ("tokenizer.ggml.add_bos_token", kv_bool(true)),
@@ -636,9 +648,10 @@ mod tests {
     fn test_create_tokenizer_from_gguf_wordpiece() {
         let kv = vec![
             ("tokenizer.ggml.model", kv_string("bert")),
-            ("tokenizer.ggml.tokens", kv_str_array(&[
-                "[PAD]", "[UNK]", "[CLS]", "[SEP]", "hello", "world",
-            ])),
+            (
+                "tokenizer.ggml.tokens",
+                kv_str_array(&["[PAD]", "[UNK]", "[CLS]", "[SEP]", "hello", "world"]),
+            ),
         ];
         let (gguf, _tmp) = open_gguf_from_kv(&kv);
 
@@ -689,11 +702,10 @@ mod tests {
     #[test]
     fn test_create_tokenizer_from_gguf_defaults_to_bpe() {
         // No tokenizer.ggml.model key → defaults to "llama" (BPE)
-        let kv = vec![
-            ("tokenizer.ggml.tokens", kv_str_array(&[
-                "<pad>", "<bos>", "<eos>", "a", "b",
-            ])),
-        ];
+        let kv = vec![(
+            "tokenizer.ggml.tokens",
+            kv_str_array(&["<pad>", "<bos>", "<eos>", "a", "b"]),
+        )];
         let (gguf, _tmp) = open_gguf_from_kv(&kv);
 
         let tok = create_tokenizer_from_gguf(&gguf).unwrap();
@@ -707,9 +719,10 @@ mod tests {
         // BERT tokens in non-standard positions
         let kv = vec![
             ("tokenizer.ggml.model", kv_string("bert")),
-            ("tokenizer.ggml.tokens", kv_str_array(&[
-                "a", "b", "[UNK]", "[PAD]", "[CLS]", "[SEP]", "hello",
-            ])),
+            (
+                "tokenizer.ggml.tokens",
+                kv_str_array(&["a", "b", "[UNK]", "[PAD]", "[CLS]", "[SEP]", "hello"]),
+            ),
         ];
         let (gguf, _tmp) = open_gguf_from_kv(&kv);
 

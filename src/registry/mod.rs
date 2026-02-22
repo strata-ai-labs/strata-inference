@@ -123,9 +123,10 @@ impl ModelRegistry {
             .iter()
             .filter_map(|entry| {
                 // Find the first locally-present variant
-                let local_variant = entry.variants.iter().find(|v| {
-                    self.models_dir.join(v.hf_file).exists()
-                });
+                let local_variant = entry
+                    .variants
+                    .iter()
+                    .find(|v| self.models_dir.join(v.hf_file).exists());
                 local_variant.map(|v| self.entry_to_info(entry, v.name))
             })
             .collect()
@@ -214,7 +215,10 @@ impl ModelRegistry {
     }
 
     /// Parse a model name string into a catalog entry and optional quant override.
-    fn parse_name<'a>(&self, name: &'a str) -> Result<(&'static CatalogEntry, Option<&'a str>), InferenceError> {
+    fn parse_name<'a>(
+        &self,
+        name: &'a str,
+    ) -> Result<(&'static CatalogEntry, Option<&'a str>), InferenceError> {
         let parts: Vec<&str> = name.split(':').collect();
 
         catalog::find_entry_by_parts(&parts).ok_or_else(|| {
@@ -314,7 +318,11 @@ mod tests {
         assert!(msg.contains(".gguf"), "Error: {}", msg);
         assert!(msg.contains("huggingface.co"), "Error: {}", msg);
         // Error should contain the model's expected file size
-        assert!(msg.contains("MB") || msg.contains("GB"), "Should show size: {}", msg);
+        assert!(
+            msg.contains("MB") || msg.contains("GB"),
+            "Should show size: {}",
+            msg
+        );
     }
 
     #[test]
@@ -464,7 +472,11 @@ mod tests {
         // resolve("tinyllama") without quant override → looks for default (q4_k_m) → not found
         let err = registry.resolve("tinyllama").unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("not found locally"), "Should fail for default quant: {}", msg);
+        assert!(
+            msg.contains("not found locally"),
+            "Should fail for default quant: {}",
+            msg
+        );
 
         // But explicit q8_0 should work
         let path = registry.resolve("tinyllama:q8_0").unwrap();
@@ -516,7 +528,11 @@ mod tests {
         std::fs::write(dir.path().join(q8_variant.hf_file), b"fake").unwrap();
 
         let local = registry.list_local();
-        assert_eq!(local.len(), 1, "Should find tinyllama via non-default q8_0 variant");
+        assert_eq!(
+            local.len(),
+            1,
+            "Should find tinyllama via non-default q8_0 variant"
+        );
         assert_eq!(local[0].name, "tinyllama");
         assert!(local[0].is_local);
     }
@@ -630,10 +646,7 @@ mod tests {
         let unique_path = format!("/tmp/test-strata-models-{}", std::process::id());
         std::env::set_var(key, &unique_path);
         let registry = ModelRegistry::new();
-        assert_eq!(
-            registry.models_dir(),
-            Path::new(&unique_path)
-        );
+        assert_eq!(registry.models_dir(), Path::new(&unique_path));
 
         // Restore
         match original {
@@ -660,7 +673,7 @@ mod tests {
         // Restore
         match original {
             Some(val) => std::env::set_var(key, val),
-            None => {}, // already removed
+            None => {} // already removed
         }
     }
 
