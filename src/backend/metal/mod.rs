@@ -1574,7 +1574,9 @@ impl ComputeBackend for MetalBackend {
         head_dim: usize,
         attn_scale: f32,
         softcap: f32,
+        _swa_window: usize,
     ) -> DeviceTensor {
+        // Note: SWA not yet implemented in Metal kernel — handled by graph path on Metal.
         assert!(
             head_dim <= 256,
             "grouped_attention_decode: head_dim {} exceeds max threadgroup size 256",
@@ -1627,7 +1629,9 @@ impl ComputeBackend for MetalBackend {
         head_dim: usize,
         attn_scale: f32,
         softcap: f32,
+        _swa_window: usize,
     ) -> DeviceTensor {
+        // Note: SWA not yet implemented in Metal kernel — handled by graph path on Metal.
         assert!(
             head_dim <= 256,
             "batched_causal_attention: head_dim {} exceeds max threadgroup size 256",
@@ -2779,6 +2783,7 @@ mod tests {
             head_dim,
             attn_scale,
             0.0,
+            0,
         );
 
         let result_data = metal.download(&result);
@@ -2866,6 +2871,7 @@ mod tests {
             head_dim,
             attn_scale,
             0.0,
+            0,
         );
 
         let result_data = metal.download(&result);
@@ -2955,6 +2961,7 @@ mod tests {
             head_dim,
             attn_scale,
             softcap,
+            0,
         );
 
         let result_data = metal.download(&result);
@@ -3044,6 +3051,7 @@ mod tests {
             head_dim,
             attn_scale,
             0.0,
+            0,
         );
 
         let result_data = metal.download(&result);

@@ -147,6 +147,10 @@ pub trait ComputeBackend: Send + Sync {
         false
     }
 
+    /// Synchronize the device (wait for all pending GPU work to complete).
+    /// Default is no-op for CPU backends.
+    fn sync_device(&self) {}
+
     /// Upload a host tensor to the device.
     fn upload(&self, tensor: &Tensor) -> DeviceTensor;
 
@@ -258,6 +262,91 @@ pub trait ComputeBackend: Send + Sync {
         rope_dim: usize,
     ) -> (DeviceTensor, DeviceTensor);
 
+    /// NeoX-style RoPE with per-dimension LongRoPE frequency factors and mscale.
+    ///
+    /// Same as `rope_neox` but divides theta by `factors[i]` and scales cos/sin by `mscale`:
+    ///   theta[i] = pos * freq_base^(-2i/rope_dim) / factors[i]
+    ///   cos_theta = cos(theta) * mscale
+    ///   sin_theta = sin(theta) * mscale
+    ///
+    /// Default implementation downloads to CPU and re-uploads (slow for GPU backends).
+    /// GPU backends should override with a native kernel.
+    fn rope_neox_with_factors(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        pos_offset: usize,
+        freq_base: f32,
+        head_dim: usize,
+        rope_dim: usize,
+        factors: &[f32],
+        mscale: f32,
+    ) -> (DeviceTensor, DeviceTensor) {
+        // Default: CPU fallback — download, compute, re-upload
+        let half_rope_dim = rope_dim / 2;
+        assert_eq!(factors.len(), half_rope_dim);
+
+        let q_host = self.download(q);
+        let k_host = self.download(k);
+        let q_data = q_host.as_f32();
+        let k_data = k_host.as_f32();
+        let q_shape = q.shape();
+        let k_shape = k.shape();
+
+        let seq_len = q_shape[0];
+        let total_dim = q_shape[1];
+        let n_heads = total_dim / head_dim;
+        let k_total_dim = k_shape[1];
+        let k_n_heads = k_total_dim / head_dim;
+
+        let inv_ndims = -1.0f32 / rope_dim as f32;
+        let mut freqs = vec![0.0f32; half_rope_dim];
+        for i in 0..half_rope_dim {
+            freqs[i] = freq_base.powf(inv_ndims * (2 * i) as f32) / factors[i];
+        }
+
+        let mut q_rot = q_data.to_vec();
+        let mut k_rot = k_data.to_vec();
+
+        for pos in 0..seq_len {
+            let abs_pos = (pos + pos_offset) as f32;
+            for head in 0..n_heads {
+                let offset = pos * total_dim + head * head_dim;
+                for i in 0..half_rope_dim {
+                    let theta = abs_pos * freqs[i];
+                    let cos_theta = theta.cos() * mscale;
+                    let sin_theta = theta.sin() * mscale;
+                    let q0 = q_data[offset + i];
+                    let q1 = q_data[offset + i + half_rope_dim];
+                    q_rot[offset + i] = q0 * cos_theta - q1 * sin_theta;
+                    q_rot[offset + i + half_rope_dim] = q0 * sin_theta + q1 * cos_theta;
+                }
+            }
+            for head in 0..k_n_heads {
+                let offset = pos * k_total_dim + head * head_dim;
+                for i in 0..half_rope_dim {
+                    let theta = abs_pos * freqs[i];
+                    let cos_theta = theta.cos() * mscale;
+                    let sin_theta = theta.sin() * mscale;
+                    let k0 = k_data[offset + i];
+                    let k1 = k_data[offset + i + half_rope_dim];
+                    k_rot[offset + i] = k0 * cos_theta - k1 * sin_theta;
+                    k_rot[offset + i + half_rope_dim] = k0 * sin_theta + k1 * cos_theta;
+                }
+            }
+        }
+
+        use crate::tensor::Tensor;
+        let q_tensor = Tensor::new(q_shape.to_vec(), q_rot);
+        let k_tensor = Tensor::new(k_shape.to_vec(), k_rot);
+
+        if self.is_gpu() {
+            (self.upload(&q_tensor), self.upload(&k_tensor))
+        } else {
+            (DeviceTensor::new(q_tensor), DeviceTensor::new(k_tensor))
+        }
+    }
+
     /// Copy src rows into dest at a row offset.
     ///
     /// dest must be pre-allocated as `[max_rows, cols]`.
@@ -273,6 +362,7 @@ pub trait ComputeBackend: Send + Sync {
     /// - `q`: `[1, num_heads * head_dim]`
     /// - `k`: `[max_len, num_kv_heads * head_dim]` (GPU KV cache, read first `total_len` rows)
     /// - `v`: `[max_len, num_kv_heads * head_dim]` (GPU KV cache, read first `total_len` rows)
+    /// - `swa_window`: sliding window size (0 = full attention)
     ///
     /// Returns: `[1, num_heads * head_dim]`
     fn grouped_attention_decode(
@@ -286,6 +376,7 @@ pub trait ComputeBackend: Send + Sync {
         head_dim: usize,
         attn_scale: f32,
         softcap: f32,
+        swa_window: usize,
     ) -> DeviceTensor;
 
     /// Batched causal attention for multi-token prefill.
@@ -297,8 +388,10 @@ pub trait ComputeBackend: Send + Sync {
     /// - `k_cache`: `[max_len, num_kv_heads * head_dim]` (GPU KV cache, read first `total_len` rows)
     /// - `v_cache`: `[max_len, num_kv_heads * head_dim]` (GPU KV cache, read first `total_len` rows)
     /// - `pos_offset`: absolute position of the first query token in the sequence
+    /// - `swa_window`: sliding window size (0 = full attention)
     ///
-    /// Causal mask: query[i] attends to positions [0, pos_offset + i].
+    /// Causal mask: query[i] attends to positions [0, pos_offset + i],
+    /// further clamped to [max(0, pos_offset + i + 1 - swa_window), pos_offset + i] when swa_window > 0.
     ///
     /// Returns: `[n_tokens, num_heads * head_dim]`
     ///
@@ -316,6 +409,7 @@ pub trait ComputeBackend: Send + Sync {
         _head_dim: usize,
         _attn_scale: f32,
         _softcap: f32,
+        _swa_window: usize,
     ) -> DeviceTensor {
         panic!("batched_causal_attention is only supported on GPU backends");
     }

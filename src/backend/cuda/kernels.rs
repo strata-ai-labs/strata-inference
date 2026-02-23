@@ -2820,11 +2820,12 @@ EMBD_DONE:
     .param .u32 param_head_dim,
     .param .u32 param_total_len,
     .param .f32 param_attn_scale,
-    .param .f32 param_softcap
+    .param .f32 param_softcap,
+    .param .u32 param_swa_window
 )
 {
     .reg .u64 %rd<16>;
-    .reg .u32 %r<30>;
+    .reg .u32 %r<32>;
     .reg .f32 %f<24>;
     .reg .pred %p<8>;
     .shared .align 4 .f32 sdata[256];
@@ -2839,6 +2840,7 @@ EMBD_DONE:
     ld.param.u32 %r3, [param_total_len];
     ld.param.f32 %f0, [param_attn_scale];
     ld.param.f32 %f1, [param_softcap];
+    ld.param.u32 %r28, [param_swa_window];
 
     // h = blockIdx.x
     mov.u32 %r4, %ctaid.x;
@@ -2873,12 +2875,25 @@ EMBD_DONE:
     mov.f32 %f6, 0f40000000;          // 2.0
     mov.f32 %f7, 0f3F800000;          // 1.0
 
+    // SWA: min_attend = (swa_window == 0) ? 0 : max(0, total_len - swa_window)
+    // For single-token decode, query is at position total_len - 1.
+    setp.eq.u32 %p0, %r28, 0;
+    @%p0 mov.u32 %r29, 0;
+    @!%p0 sub.u32 %r29, %r3, %r28;
+    // Clamp to 0 if underflow (total_len < swa_window)
+    setp.gt.u32 %p0, %r29, %r3;      // if underflowed (unsigned wrap)
+    @%p0 mov.u32 %r29, 0;
+
     // ---- Pass 1: find global max of attention scores ----
     mov.f32 %f8, 0fFF800000;          // local_max = -inf
     mov.u32 %r11, %r5;                // j = lid
 GAD_MAX_LOOP:
     setp.ge.u32 %p0, %r11, %r3;
     @%p0 bra GAD_MAX_REDUCE;
+
+    // SWA: skip positions before sliding window
+    setp.lt.u32 %p0, %r11, %r29;
+    @%p0 bra GAD_MAX_SKIP;
 
     // dot = sum(q_head[d] * K[j * kv_dim + kv_off + d])
     mov.f32 %f9, 0f00000000;
@@ -2918,6 +2933,7 @@ GAD_DOT1_END:
 GAD_NOSC1:
 
     max.f32 %f8, %f8, %f9;
+GAD_MAX_SKIP:
     add.u32 %r11, %r11, %r6;
     bra GAD_MAX_LOOP;
 GAD_MAX_REDUCE:
@@ -2967,6 +2983,9 @@ GAD_TILE:
     add.u32 %r11, %r20, %r5;          // j = tile + lid
     mov.f32 %f16, 0f00000000;         // w = 0
     setp.ge.u32 %p3, %r11, %r3;
+    @%p3 bra GAD_STORE_W;
+    // SWA: skip positions before sliding window
+    setp.lt.u32 %p3, %r11, %r29;
     @%p3 bra GAD_STORE_W;
 
     // dot product Q . K[j]
@@ -3135,11 +3154,12 @@ GAD_EXIT:
     .param .u32 param_total_len,
     .param .u32 param_pos_offset,
     .param .f32 param_attn_scale,
-    .param .f32 param_softcap
+    .param .f32 param_softcap,
+    .param .u32 param_swa_window
 )
 {
     .reg .u64 %rd<20>;
-    .reg .u32 %r<35>;
+    .reg .u32 %r<37>;
     .reg .f32 %f<28>;
     .reg .pred %p<10>;
     .shared .align 4 .f32 sdata[256];
@@ -3156,6 +3176,7 @@ GAD_EXIT:
     ld.param.u32 %r5, [param_pos_offset];
     ld.param.f32 %f0, [param_attn_scale];
     ld.param.f32 %f1, [param_softcap];
+    ld.param.u32 %r35, [param_swa_window];
 
     // gid = blockIdx.x
     mov.u32 %r6, %ctaid.x;
@@ -3194,6 +3215,14 @@ GAD_EXIT:
     add.u32 %r15, %r15, 1;              // pos_offset + q_idx + 1
     min.u32 %r15, %r15, %r4;            // max_attend
 
+    // SWA: min_attend = (swa_window == 0) ? 0 : max(0, max_attend - swa_window)
+    setp.eq.u32 %p0, %r35, 0;
+    @%p0 mov.u32 %r36, 0;
+    @!%p0 sub.u32 %r36, %r15, %r35;
+    // Clamp to 0 if underflow (max_attend < swa_window)
+    setp.gt.u32 %p0, %r36, %r15;        // unsigned wrap check
+    @%p0 mov.u32 %r36, 0;
+
     // q_head = Q + q_idx * total_dim + h * head_dim (byte offset)
     mul.lo.u32 %r16, %r9, %r13;
     mul.lo.u32 %r17, %r10, %r2;
@@ -3222,6 +3251,9 @@ BCA_TILE:
     add.u32 %r19, %r18, %r7;            // j = tile + lid
     mov.f32 %f11, 0fFF800000;           // score = -inf (masked by default)
     setp.ge.u32 %p2, %r19, %r15;
+    @%p2 bra BCA_STORE_SCORE;
+    // SWA: skip positions before sliding window
+    setp.lt.u32 %p2, %r19, %r36;
     @%p2 bra BCA_STORE_SCORE;
 
     // dot = sum(q_head[d] * K[j * kv_dim + kv_off + d])
@@ -3729,6 +3761,296 @@ DQ5K_SCALE_DONE:
     ret;
 }
 
+// -------------------------------------------------------------------------
+// rope_neox_with_factors: NeoX-style RoPE with per-dimension frequency
+// factors and magnitude scale (LongRoPE).
+//
+// Same as rope_neox but:
+//   freq[i] = freq_base^(-2*i/rope_dim) / factors[i]
+//   cos/sin are scaled by mscale
+//
+// Parameters:
+//   input      (.u64)  [seq_len, n_heads * head_dim]
+//   output     (.u64)  [seq_len, n_heads * head_dim]
+//   factors    (.u64)  [rope_dim/2] f32 frequency divisors
+//   pos_offset (.u32)
+//   freq_base  (.f32)
+//   head_dim   (.u32)
+//   rope_dim   (.u32)
+//   n_heads    (.u32)
+//   seq_len    (.u32)
+//   mscale     (.f32)
+//
+// Grid:  (ceil(rope_dim/2 / 32), ceil(n_heads / 4), seq_len)
+// Block: (32, 4, 1)
+// -------------------------------------------------------------------------
+.visible .entry rope_neox_with_factors(
+    .param .u64 param_input,
+    .param .u64 param_output,
+    .param .u64 param_factors,
+    .param .u32 param_pos_offset,
+    .param .f32 param_freq_base,
+    .param .u32 param_head_dim,
+    .param .u32 param_rope_dim,
+    .param .u32 param_n_heads,
+    .param .u32 param_seq_len,
+    .param .f32 param_mscale
+)
+{
+    .reg .u64 %rd<14>;
+    .reg .u32 %r<22>;
+    .reg .f32 %f<22>;
+    .reg .pred %p<3>;
+
+    ld.param.u64 %rd0, [param_input];
+    ld.param.u64 %rd1, [param_output];
+    ld.param.u64 %rd2, [param_factors];
+    ld.param.u32 %r0, [param_pos_offset];
+    ld.param.f32 %f0, [param_freq_base];
+    ld.param.u32 %r1, [param_head_dim];
+    ld.param.u32 %r2, [param_rope_dim];
+    ld.param.u32 %r3, [param_n_heads];
+    ld.param.u32 %r4, [param_seq_len];
+    ld.param.f32 %f20, [param_mscale];
+
+    // pair_idx = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mul.lo.u32 %r5, %r5, %r6;
+    mov.u32 %r7, %tid.x;
+    add.u32 %r5, %r5, %r7;       // pair_idx (i)
+
+    // head_idx = blockIdx.y * blockDim.y + threadIdx.y
+    mov.u32 %r8, %ctaid.y;
+    mov.u32 %r9, %ntid.y;
+    mul.lo.u32 %r8, %r8, %r9;
+    mov.u32 %r10, %tid.y;
+    add.u32 %r8, %r8, %r10;      // head_idx
+
+    // seq_idx = blockIdx.z
+    mov.u32 %r11, %ctaid.z;
+
+    // Bounds check: pair_idx < rope_dim/2, head_idx < n_heads
+    shr.u32 %r12, %r2, 1;         // half_rope = rope_dim / 2
+    setp.ge.u32 %p0, %r5, %r12;
+    @%p0 bra ROPEF_DONE;
+    setp.ge.u32 %p1, %r8, %r3;
+    @%p1 bra ROPEF_DONE;
+
+    // Compute base frequency: freq_base^(-2*i / rope_dim)
+    shl.b32 %r14, %r5, 1;         // 2 * pair_idx
+    cvt.rn.f32.u32 %f1, %r14;
+    cvt.rn.f32.u32 %f2, %r2;      // rope_dim
+    div.approx.f32 %f3, %f1, %f2;
+    neg.f32 %f3, %f3;
+    lg2.approx.f32 %f4, %f0;
+    mul.rn.f32 %f3, %f3, %f4;
+    ex2.approx.f32 %f5, %f3;      // freq_base^(-2i/rope_dim)
+
+    // Load factors[pair_idx] and divide: freq = base_freq / factor
+    mul.wide.u32 %rd3, %r5, 4;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.global.f32 %f6, [%rd4];    // factors[pair_idx]
+    div.approx.f32 %f5, %f5, %f6; // freq / factor
+
+    // theta = (pos_offset + seq_idx) * freq
+    add.u32 %r13, %r0, %r11;      // pos = pos_offset + seq_idx
+    cvt.rn.f32.u32 %f7, %r13;
+    mul.rn.f32 %f8, %f7, %f5;     // theta
+
+    // cos/sin with mscale
+    cos.approx.f32 %f9, %f8;
+    sin.approx.f32 %f10, %f8;
+    mul.rn.f32 %f9, %f9, %f20;    // cos * mscale
+    mul.rn.f32 %f10, %f10, %f20;  // sin * mscale
+
+    // Base offset: (seq_idx * n_heads + head_idx) * head_dim
+    mul.lo.u32 %r15, %r11, %r3;
+    add.u32 %r15, %r15, %r8;
+    mul.lo.u32 %r15, %r15, %r1;
+
+    // NeoX pairing: (x[base + i], x[base + i + half_rope])
+    add.u32 %r16, %r15, %r5;      // base + i
+    add.u32 %r17, %r16, %r12;     // base + i + half_rope
+
+    // Input addresses
+    mul.wide.u32 %rd5, %r16, 4;
+    add.u64 %rd6, %rd0, %rd5;     // &input[base + i]
+    mul.wide.u32 %rd7, %r17, 4;
+    add.u64 %rd8, %rd0, %rd7;     // &input[base + i + half]
+
+    // Output addresses
+    add.u64 %rd9, %rd1, %rd5;     // &output[base + i]
+    add.u64 %rd10, %rd1, %rd7;    // &output[base + i + half]
+
+    // Load from input
+    ld.global.f32 %f11, [%rd6];
+    ld.global.f32 %f12, [%rd8];
+
+    // Rotate (NeoX style: first half paired with second half)
+    mul.rn.f32 %f13, %f11, %f9;
+    mul.rn.f32 %f14, %f12, %f10;
+    sub.rn.f32 %f15, %f13, %f14;  // x0*cos - x1*sin
+
+    mul.rn.f32 %f16, %f11, %f10;
+    mul.rn.f32 %f17, %f12, %f9;
+    add.rn.f32 %f18, %f16, %f17;  // x0*sin + x1*cos
+
+    // Store to output
+    st.global.f32 [%rd9], %f15;
+    st.global.f32 [%rd10], %f18;
+ROPEF_DONE:
+    ret;
+}
+
+// -------------------------------------------------------------------------
+// dequant_q8_0: Expand Q8_0 quantized weights to F32
+//
+// Q8_0 format: blocks of 32 elements, each block = 1 f16 scale + 32 int8
+// values = 34 bytes. val[i] = scale * quant[i]
+//
+// Grid:  (N, blocks_per_row, 1)
+// Block: (32, 1, 1) - one thread per element in block
+// -------------------------------------------------------------------------
+.visible .entry dequant_q8_0(
+    .param .u64 param_weights,
+    .param .u64 param_output,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .u64 %rd<8>;
+    .reg .u32 %r<16>;
+    .reg .f32 %f<4>;
+    .reg .f16 %h0;
+    .reg .pred %p0;
+
+    ld.param.u64 %rd0, [param_weights];
+    ld.param.u64 %rd1, [param_output];
+    ld.param.u32 %r0, [param_N];
+    ld.param.u32 %r1, [param_K];
+
+    mov.u32 %r2, %tid.x;          // tid (0-31)
+    mov.u32 %r3, %ctaid.x;        // row index
+    mov.u32 %r4, %ctaid.y;        // block index within row
+
+    // blocks_per_row = K / 32
+    shr.u32 %r5, %r1, 5;
+    // bytes_per_row = blocks_per_row * 34
+    mul.lo.u32 %r6, %r5, 34;
+
+    // Block address: weights + row * bytes_per_row + block * 34
+    mul.lo.u32 %r7, %r3, %r6;
+    mul.lo.u32 %r8, %r4, 34;
+    add.u32 %r7, %r7, %r8;
+    cvt.u64.u32 %rd2, %r7;
+    add.u64 %rd2, %rd0, %rd2;     // &block
+
+    // Load f16 scale (2 bytes at offset 0)
+    ld.global.b16 %h0, [%rd2];
+    cvt.f32.f16 %f0, %h0;         // scale as f32
+
+    // Load int8 quant value at offset 2 + tid
+    add.u32 %r9, %r2, 2;
+    cvt.u64.u32 %rd3, %r9;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.global.s8 %r10, [%rd4];    // signed int8
+
+    // Dequantize: val = scale * quant
+    cvt.rn.f32.s32 %f1, %r10;
+    mul.rn.f32 %f2, %f0, %f1;
+
+    // Write output[row * K + block * 32 + tid]
+    mul.lo.u32 %r11, %r3, %r1;
+    shl.b32 %r12, %r4, 5;
+    add.u32 %r11, %r11, %r12;
+    add.u32 %r11, %r11, %r2;
+    mul.wide.u32 %rd5, %r11, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    st.global.f32 [%rd6], %f2;
+
+    ret;
+}
+
+// -------------------------------------------------------------------------
+// dequant_q4_0: Expand Q4_0 quantized weights to F32
+//
+// Q4_0 format: blocks of 32 elements, each block = 1 f16 scale + 16 bytes
+// packed 4-bit = 18 bytes. val[i] = scale * (nibble - 8)
+//
+// Grid:  (N, blocks_per_row, 1)
+// Block: (32, 1, 1) - one thread per element in block
+// -------------------------------------------------------------------------
+.visible .entry dequant_q4_0(
+    .param .u64 param_weights,
+    .param .u64 param_output,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .u64 %rd<8>;
+    .reg .u32 %r<18>;
+    .reg .f32 %f<4>;
+    .reg .f16 %h0;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd0, [param_weights];
+    ld.param.u64 %rd1, [param_output];
+    ld.param.u32 %r0, [param_N];
+    ld.param.u32 %r1, [param_K];
+
+    mov.u32 %r2, %tid.x;          // tid (0-31)
+    mov.u32 %r3, %ctaid.x;        // row index
+    mov.u32 %r4, %ctaid.y;        // block index within row
+
+    // blocks_per_row = K / 32
+    shr.u32 %r5, %r1, 5;
+    // bytes_per_row = blocks_per_row * 18
+    mul.lo.u32 %r6, %r5, 18;
+
+    // Block address: weights + row * bytes_per_row + block * 18
+    mul.lo.u32 %r7, %r3, %r6;
+    mul.lo.u32 %r8, %r4, 18;
+    add.u32 %r7, %r7, %r8;
+    cvt.u64.u32 %rd2, %r7;
+    add.u64 %rd2, %rd0, %rd2;     // &block
+
+    // Load f16 scale (2 bytes at offset 0)
+    ld.global.b16 %h0, [%rd2];
+    cvt.f32.f16 %f0, %h0;         // scale as f32
+
+    // Each thread handles one of 32 elements.
+    // Bytes are packed: byte[i/2] contains nibble for element i (low) and i+1 (high).
+    // Byte offset within data section: tid / 2
+    shr.u32 %r9, %r2, 1;          // byte_idx = tid / 2
+    add.u32 %r9, %r9, 2;          // offset past f16 scale
+    cvt.u64.u32 %rd3, %r9;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.global.u8 %r10, [%rd4];
+
+    // Extract nibble: low nibble for even tid, high nibble for odd tid
+    and.b32 %r11, %r2, 1;
+    setp.eq.u32 %p0, %r11, 0;
+    @%p0 and.b32 %r12, %r10, 0xF;
+    @!%p0 shr.u32 %r12, %r10, 4;
+
+    // Dequantize: val = scale * (nibble - 8)
+    sub.u32 %r13, %r12, 8;
+    cvt.rn.f32.s32 %f1, %r13;
+    mul.rn.f32 %f2, %f0, %f1;
+
+    // Write output[row * K + block * 32 + tid]
+    mul.lo.u32 %r14, %r3, %r1;
+    shl.b32 %r15, %r4, 5;
+    add.u32 %r14, %r14, %r15;
+    add.u32 %r14, %r14, %r2;
+    mul.wide.u32 %rd5, %r14, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    st.global.f32 [%rd6], %f2;
+
+    ret;
+}
+
 "#,
     "\0"
 );
@@ -3796,6 +4118,9 @@ mod tests {
             "dequant_q4_k",
             "dequant_q5_k",
             "dequant_q6_k",
+            "rope_neox_with_factors",
+            "dequant_q8_0",
+            "dequant_q4_0",
         ];
         for name in &new_kernels {
             let entry = format!(".visible .entry {}(", name);
@@ -3806,8 +4131,9 @@ mod tests {
     #[test]
     fn ptx_module_total_kernel_count() {
         let count = PTX_MODULE.matches(".visible .entry ").count();
-        // 9 ported + 14 new + 1 batched_causal_attention + 3 Q4_K/Q5_K/Q6_K + 3 dequant = 30 kernels
-        assert_eq!(count, 30, "Expected 30 kernels, found {}", count);
+        // 9 ported + 14 new + 1 batched_causal_attention + 3 Q4_K/Q5_K/Q6_K + 3 dequant
+        // + 1 rope_neox_with_factors + 2 dequant_q8_0/q4_0 = 33 kernels
+        assert_eq!(count, 33, "Expected 33 kernels, found {}", count);
     }
 
     #[test]

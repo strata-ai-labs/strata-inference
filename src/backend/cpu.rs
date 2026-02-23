@@ -1360,6 +1360,7 @@ impl ComputeBackend for CpuBackend {
         head_dim: usize,
         attn_scale: f32,
         softcap: f32,
+        swa_window: usize,
     ) -> DeviceTensor {
         let q_data = q.as_tensor().as_f32();
         let k_data = k.as_tensor().as_f32();
@@ -1368,6 +1369,13 @@ impl ComputeBackend for CpuBackend {
         let total_dim = num_heads * head_dim;
         let heads_per_kv = num_heads / num_kv_heads;
 
+        // SWA: min_attend = (swa_window == 0) ? 0 : max(0, total_len - swa_window)
+        let min_attend = if swa_window == 0 {
+            0
+        } else {
+            total_len.saturating_sub(swa_window)
+        };
+
         let mut output = vec![0.0f32; total_dim];
 
         for h in 0..num_heads {
@@ -1375,10 +1383,10 @@ impl ComputeBackend for CpuBackend {
             let q_offset = h * head_dim;
 
             // Compute attention scores: dot(q_head, k[j, kv_head]) * scale
-            let mut scores = vec![0.0f32; total_len];
+            let mut scores = vec![f32::NEG_INFINITY; total_len];
             let mut max_score = f32::NEG_INFINITY;
 
-            for j in 0..total_len {
+            for j in min_attend..total_len {
                 let k_offset = j * kv_dim + kv_head * head_dim;
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
@@ -3589,6 +3597,7 @@ mod tests {
             head_dim,
             1.0 / (head_dim as f32).sqrt(),
             0.0,
+            0,
         );
 
         assert_eq!(result.shape(), &[1, 4]);
@@ -3640,6 +3649,7 @@ mod tests {
             head_dim,
             1.0 / (head_dim as f32).sqrt(),
             0.0,
+            0,
         );
 
         assert_eq!(result.shape(), &[1, 8]);
@@ -3680,6 +3690,7 @@ mod tests {
             head_dim,
             1.0,
             0.0,
+            0,
         );
         let out_no_cap = b.download(&result_no_cap).as_f32().to_vec();
 
@@ -3694,6 +3705,7 @@ mod tests {
             head_dim,
             1.0,
             1.0,
+            0,
         );
         let out_cap = b.download(&result_cap).as_f32().to_vec();
 
@@ -3717,7 +3729,7 @@ mod tests {
         let k = dt(Tensor::new(vec![1, 4], vec![0.5, 0.5, 0.5, 0.5]));
         let v = dt(Tensor::new(vec![1, 4], vec![10.0, 20.0, 30.0, 40.0]));
 
-        let result = b.grouped_attention_decode(&q, &k, &v, 1, 2, 2, 2, 1.0 / (2.0f32).sqrt(), 0.0);
+        let result = b.grouped_attention_decode(&q, &k, &v, 1, 2, 2, 2, 1.0 / (2.0f32).sqrt(), 0.0, 0);
 
         let out = b.download(&result).as_f32().to_vec();
         // With a single position, output should equal V (softmax = 1.0)

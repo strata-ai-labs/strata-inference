@@ -116,6 +116,9 @@ pub struct CudaBackend {
     fn_dequant_q4_k: CUfunction,
     fn_dequant_q5_k: CUfunction,
     fn_dequant_q6_k: CUfunction,
+    fn_rope_neox_with_factors: CUfunction,
+    fn_dequant_q8_0: CUfunction,
+    fn_dequant_q4_0: CUfunction,
 }
 
 // SAFETY: All CUDA function handles are process-global, and the Driver API is
@@ -205,8 +208,11 @@ impl CudaBackend {
         let fn_dequant_q4_k = get_fn!("dequant_q4_k");
         let fn_dequant_q5_k = get_fn!("dequant_q5_k");
         let fn_dequant_q6_k = get_fn!("dequant_q6_k");
+        let fn_rope_neox_with_factors = get_fn!("rope_neox_with_factors");
+        let fn_dequant_q8_0 = get_fn!("dequant_q8_0");
+        let fn_dequant_q4_0 = get_fn!("dequant_q4_0");
 
-        debug!("CudaBackend initialized with 30 kernel functions");
+        debug!("CudaBackend initialized with 33 kernel functions");
 
         Ok(Self {
             api,
@@ -244,6 +250,9 @@ impl CudaBackend {
             fn_dequant_q4_k,
             fn_dequant_q5_k,
             fn_dequant_q6_k,
+            fn_rope_neox_with_factors,
+            fn_dequant_q8_0,
+            fn_dequant_q4_0,
         })
     }
 
@@ -402,13 +411,13 @@ impl CudaBackend {
     }
 
     // -----------------------------------------------------------------------
-    // GPU dequant dispatch — expands Q4_K/Q5_K/Q6_K to F32 on GPU
+    // GPU dequant dispatch — expands quantized weights to F32 on GPU
     // -----------------------------------------------------------------------
 
     /// Launch a GPU dequant kernel to expand quantized weights to F32.
     ///
-    /// Grid: (n_rows, blocks_per_row, 1), Block: (256, 1, 1).
-    /// Each thread dequantizes one element and writes to the output buffer.
+    /// Q4_K/Q5_K/Q6_K: Grid (n_rows, blocks_per_row, 1), Block (256, 1, 1)
+    /// Q8_0/Q4_0:      Grid (n_rows, blocks_per_row, 1), Block (32, 1, 1)
     fn launch_dequant(
         &self,
         dtype: TensorDtype,
@@ -417,14 +426,16 @@ impl CudaBackend {
         n_rows: usize,
         k: usize,
     ) {
-        let func = match dtype {
-            TensorDtype::Q4_K => self.fn_dequant_q4_k,
-            TensorDtype::Q5_K => self.fn_dequant_q5_k,
-            TensorDtype::Q6_K => self.fn_dequant_q6_k,
+        let (func, block_size) = match dtype {
+            TensorDtype::Q4_K => (self.fn_dequant_q4_k, 256),
+            TensorDtype::Q5_K => (self.fn_dequant_q5_k, 256),
+            TensorDtype::Q6_K => (self.fn_dequant_q6_k, 256),
+            TensorDtype::Q8_0 => (self.fn_dequant_q8_0, 32),
+            TensorDtype::Q4_0 => (self.fn_dequant_q4_0, 32),
             _ => panic!("launch_dequant: unsupported dtype {:?}", dtype),
         };
 
-        let blocks_per_row = (k / 256) as u32;
+        let blocks_per_row = (k / block_size) as u32;
         let mut p_w = weights_ptr;
         let mut p_out = output_ptr;
         let mut p_n = n_rows as u32;
@@ -438,7 +449,7 @@ impl CudaBackend {
         ];
 
         let grid = (n_rows as u32, blocks_per_row, 1);
-        let block = (256, 1, 1);
+        let block = (block_size as u32, 1, 1);
         unsafe {
             self.launch(func, grid, block, 0, &mut params);
         }
@@ -514,6 +525,79 @@ impl CudaBackend {
 
         Self::wrap(out_buf, vec![seq_len, total_cols], TensorDtype::F32)
     }
+
+    /// Dispatch `rope_neox_with_factors` kernel on a single tensor.
+    ///
+    /// Same as `dispatch_rope` but with additional `factors` buffer and `mscale` param.
+    unsafe fn dispatch_rope_with_factors(
+        &self,
+        input_dt: &DeviceTensor,
+        factors_buf: &CudaBuffer,
+        pos_offset: usize,
+        freq_base: f32,
+        head_dim: usize,
+        rope_dim: usize,
+        mscale: f32,
+    ) -> DeviceTensor {
+        let shape = input_dt.shape();
+        let seq_len = shape[0];
+        let total_cols = shape[1];
+        let n_heads = total_cols / head_dim;
+        let half_rope = rope_dim / 2;
+
+        let count = seq_len * total_cols;
+        let out_buf = match self.alloc_zeros_f32(count) {
+            Ok(buf) => buf,
+            Err(e) => panic!("CUDA: rope_neox_with_factors alloc failed: {}", e),
+        };
+
+        let in_buf = Self::get_buf(input_dt);
+
+        // Copy input to output first so non-rotated dims are preserved
+        if rope_dim < head_dim {
+            let bytesize = count * std::mem::size_of::<f32>();
+            let _ = self.copy_device_to_device(out_buf.ptr, in_buf.ptr, bytesize);
+        }
+
+        let mut p_in = in_buf.ptr;
+        let mut p_out = out_buf.ptr;
+        let mut p_factors = factors_buf.ptr;
+        let mut p_pos_offset = pos_offset as u32;
+        let mut p_freq_base = freq_base;
+        let mut p_head_dim = head_dim as u32;
+        let mut p_rope_dim = rope_dim as u32;
+        let mut p_n_heads = n_heads as u32;
+        let mut p_seq_len = seq_len as u32;
+        let mut p_mscale = mscale;
+
+        let mut params: [*mut c_void; 10] = [
+            &mut p_in as *mut _ as *mut c_void,
+            &mut p_out as *mut _ as *mut c_void,
+            &mut p_factors as *mut _ as *mut c_void,
+            &mut p_pos_offset as *mut _ as *mut c_void,
+            &mut p_freq_base as *mut _ as *mut c_void,
+            &mut p_head_dim as *mut _ as *mut c_void,
+            &mut p_rope_dim as *mut _ as *mut c_void,
+            &mut p_n_heads as *mut _ as *mut c_void,
+            &mut p_seq_len as *mut _ as *mut c_void,
+            &mut p_mscale as *mut _ as *mut c_void,
+        ];
+
+        // 3D grid: (ceil(half_rope/32), ceil(n_heads/4), seq_len)
+        let gx = Self::div_ceil(half_rope as u32, 32);
+        let gy = Self::div_ceil(n_heads as u32, 4);
+        let gz = seq_len as u32;
+
+        self.launch(
+            self.fn_rope_neox_with_factors,
+            (gx, gy, gz),
+            (32, 4, 1),
+            0,
+            &mut params,
+        );
+
+        Self::wrap(out_buf, vec![seq_len, total_cols], TensorDtype::F32)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +607,10 @@ impl CudaBackend {
 impl ComputeBackend for CudaBackend {
     fn is_gpu(&self) -> bool {
         true
+    }
+
+    fn sync_device(&self) {
+        self.sync();
     }
 
     fn upload(&self, tensor: &Tensor) -> DeviceTensor {
@@ -823,7 +911,55 @@ impl ComputeBackend for CudaBackend {
         let w_buf = Self::get_buf(weights);
         let in_buf = Self::get_buf(input);
 
-        // === Cache check: all quantized types benefit from cached F32 + cuBLAS ===
+        // === M=1 fast path: use native quantized kernels directly ===
+        // For single-token decode (memory-bandwidth-bound), reading quantized
+        // weights (4.5 bits/weight for Q4_K) is ~7x less bandwidth than reading
+        // the F32 dequant cache (32 bits/weight). This is the critical path for
+        // autoregressive generation speed.
+        if m == 1 {
+            // Only use native kernels for block quant types (Q4_K/Q5_K/Q6_K) which
+            // have optimized vectorized kernels. Q8_0/Q4_0 native kernels use scalar
+            // inner loops and are much slower than F32 cache + cuBLAS sgemm.
+            let func = match dtype {
+                TensorDtype::Q4_K => Some(self.fn_quantized_matmul_q4_k),
+                TensorDtype::Q5_K => Some(self.fn_quantized_matmul_q5_k),
+                TensorDtype::Q6_K => Some(self.fn_quantized_matmul_q6_k),
+                _ => None,
+            };
+            if let Some(func) = func {
+                let out = match self.alloc_zeros_f32(n) {
+                    Ok(buf) => buf,
+                    Err(e) => panic!("CUDA: quantized_matmul M=1 alloc failed: {}", e),
+                };
+
+                let mut p_w = w_buf.ptr;
+                let mut p_in = in_buf.ptr;
+                let mut p_out = out.ptr;
+                let mut p_n = n as u32;
+                let mut p_k = k as u32;
+
+                // Kernel signature: (weights, input, output, N, K)
+                // M is implicit via grid.y = 1
+                let mut params: [*mut c_void; 5] = [
+                    &mut p_w as *mut _ as *mut c_void,
+                    &mut p_in as *mut _ as *mut c_void,
+                    &mut p_out as *mut _ as *mut c_void,
+                    &mut p_n as *mut _ as *mut c_void,
+                    &mut p_k as *mut _ as *mut c_void,
+                ];
+
+                // Grid: (N, 1, 1), Block: (256, 1, 1) — one block per output element
+                let grid = (n as u32, 1, 1);
+                let block = (256, 1, 1);
+                unsafe {
+                    self.launch(func, grid, block, 0, &mut params);
+                }
+
+                return Self::wrap(out, vec![1, n], TensorDtype::F32);
+            }
+        }
+
+        // === Cache check: M>1 prefill benefits from cached F32 + cuBLAS ===
         let w_ptr = w_buf.ptr;
         {
             let cache = self.dequant_cache.lock().unwrap();
@@ -832,8 +968,16 @@ impl ComputeBackend for CudaBackend {
             }
         }
 
-        // === Try GPU dequant for Q4_K/Q5_K/Q6_K (has native dequant kernels) ===
-        if matches!(dtype, TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K) {
+        // === Try GPU dequant + cache for all quantized types ===
+        // All types now have native GPU dequant kernels — no CPU round-trip needed.
+        if matches!(
+            dtype,
+            TensorDtype::Q4_K
+                | TensorDtype::Q5_K
+                | TensorDtype::Q6_K
+                | TensorDtype::Q8_0
+                | TensorDtype::Q4_0
+        ) {
             if let Ok(f32_buf) = self.alloc_zeros_f32(n * k) {
                 trace!(m, k, n, ?dtype, "CUDA quantized_matmul: GPU dequant + cuBLAS");
                 self.launch_dequant(dtype, w_buf.ptr, f32_buf.ptr, n, k);
@@ -847,13 +991,20 @@ impl ComputeBackend for CudaBackend {
             // Don't set a global flag; smaller weights may still fit.
         }
 
-        // === Try CPU dequant + cache for Q8_0/Q4_0 and other quantized types ===
+        // === CPU dequant fallback for types without GPU dequant (e.g., Q5_0) ===
         if dtype.is_quantized()
-            && !matches!(dtype, TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K)
+            && !matches!(
+                dtype,
+                TensorDtype::Q4_K
+                    | TensorDtype::Q5_K
+                    | TensorDtype::Q6_K
+                    | TensorDtype::Q8_0
+                    | TensorDtype::Q4_0
+            )
         {
             if let Ok(_test) = self.alloc_zeros_f32(n * k) {
                 drop(_test);
-                tracing::info!(?dtype, n, k, "CUDA: caching dequantized weights as F32");
+                tracing::info!(?dtype, n, k, "CUDA: CPU dequant + cache for unsupported GPU type");
                 let weights_host = self.download(weights);
                 let weights_f32 = weights_host.to_f32();
                 let weights_f32_dev = self.upload(&weights_f32);
@@ -1501,8 +1652,15 @@ impl ComputeBackend for CudaBackend {
                 }
             }
 
-            // Try GPU dequant for supported types
-            if matches!(dtype, TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K) {
+            // Try GPU dequant for supported types (all types with GPU dequant kernels)
+            if matches!(
+                dtype,
+                TensorDtype::Q4_K
+                    | TensorDtype::Q5_K
+                    | TensorDtype::Q6_K
+                    | TensorDtype::Q8_0
+                    | TensorDtype::Q4_0
+            ) {
                 if let Ok(f32_buf) = self.alloc_zeros_f32(vocab_size * hidden_size) {
                     self.launch_dequant(dtype, w_ptr, f32_buf.ptr, vocab_size, hidden_size);
                     let f32_dt = Self::wrap(f32_buf, vec![vocab_size, hidden_size], TensorDtype::F32);
@@ -1759,6 +1917,61 @@ impl ComputeBackend for CudaBackend {
         (q_out, k_out)
     }
 
+    fn rope_neox_with_factors(
+        &self,
+        q: &DeviceTensor,
+        k: &DeviceTensor,
+        pos_offset: usize,
+        freq_base: f32,
+        head_dim: usize,
+        rope_dim: usize,
+        factors: &[f32],
+        mscale: f32,
+    ) -> (DeviceTensor, DeviceTensor) {
+        let half_rope = rope_dim / 2;
+        assert_eq!(
+            factors.len(),
+            half_rope,
+            "rope_neox_with_factors: factors.len() ({}) != rope_dim/2 ({})",
+            factors.len(),
+            half_rope
+        );
+        assert!(head_dim > 0);
+        assert!(rope_dim <= head_dim);
+        assert!(rope_dim % 2 == 0);
+
+        // Upload factors to GPU
+        let factors_buf = match self.upload_f32(factors) {
+            Ok(buf) => buf,
+            Err(e) => panic!("CUDA: rope_neox_with_factors factors upload failed: {}", e),
+        };
+
+        let q_out = unsafe {
+            self.dispatch_rope_with_factors(
+                q,
+                &factors_buf,
+                pos_offset,
+                freq_base,
+                head_dim,
+                rope_dim,
+                mscale,
+            )
+        };
+        let k_out = unsafe {
+            self.dispatch_rope_with_factors(
+                k,
+                &factors_buf,
+                pos_offset,
+                freq_base,
+                head_dim,
+                rope_dim,
+                mscale,
+            )
+        };
+
+        (q_out, k_out)
+    }
+
     fn copy_rows_into(&self, dest: &DeviceTensor, src: &DeviceTensor, dest_row_offset: usize) {
         debug_assert_eq!(
             src.dtype(),
@@ -1802,6 +2015,7 @@ impl ComputeBackend for CudaBackend {
         head_dim: usize,
         attn_scale: f32,
         softcap: f32,
+        swa_window: usize,
     ) -> DeviceTensor {
         assert!(
             head_dim <= 256,
@@ -1835,8 +2049,9 @@ impl ComputeBackend for CudaBackend {
         let mut p_total_len = total_len as u32;
         let mut p_attn_scale = attn_scale;
         let mut p_softcap = softcap;
+        let mut p_swa_window = swa_window as u32;
 
-        let mut params: [*mut c_void; 10] = [
+        let mut params: [*mut c_void; 11] = [
             &mut p_q as *mut _ as *mut c_void,
             &mut p_k as *mut _ as *mut c_void,
             &mut p_v as *mut _ as *mut c_void,
@@ -1847,6 +2062,7 @@ impl ComputeBackend for CudaBackend {
             &mut p_total_len as *mut _ as *mut c_void,
             &mut p_attn_scale as *mut _ as *mut c_void,
             &mut p_softcap as *mut _ as *mut c_void,
+            &mut p_swa_window as *mut _ as *mut c_void,
         ];
 
         // One block per head, 256 threads per block
@@ -1872,6 +2088,7 @@ impl ComputeBackend for CudaBackend {
         head_dim: usize,
         attn_scale: f32,
         softcap: f32,
+        swa_window: usize,
     ) -> DeviceTensor {
         assert!(
             head_dim <= 256,
@@ -1907,8 +2124,9 @@ impl ComputeBackend for CudaBackend {
         let mut p_pos_offset = pos_offset as u32;
         let mut p_attn_scale = attn_scale;
         let mut p_softcap = softcap;
+        let mut p_swa_window = swa_window as u32;
 
-        let mut params: [*mut c_void; 12] = [
+        let mut params: [*mut c_void; 13] = [
             &mut p_q as *mut _ as *mut c_void,
             &mut p_k as *mut _ as *mut c_void,
             &mut p_v as *mut _ as *mut c_void,
@@ -1921,6 +2139,7 @@ impl ComputeBackend for CudaBackend {
             &mut p_pos_offset as *mut _ as *mut c_void,
             &mut p_attn_scale as *mut _ as *mut c_void,
             &mut p_softcap as *mut _ as *mut c_void,
+            &mut p_swa_window as *mut _ as *mut c_void,
         ];
 
         // One block per (head, query_token) pair, 256 threads per block

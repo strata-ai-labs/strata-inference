@@ -166,7 +166,7 @@ fn multi_head_attention(
     // Step a: Apply RoPE if configured (RoPE applies to Q and K only, not V)
     let (q_proc, k_proc) = if config.position_type == PositionType::RoPE {
         if let Some(params) = longrope {
-            rope_neox_with_factors(
+            backend.rope_neox_with_factors(
                 &q,
                 &k,
                 pos_offset,
@@ -175,7 +175,6 @@ fn multi_head_attention(
                 config.rope_dim,
                 params.factors,
                 params.mscale,
-                backend,
             )
         } else if config.rope_neox {
             backend.rope_neox(
@@ -860,98 +859,6 @@ pub fn model_forward(
 
 use super::cache::KvCache;
 
-/// NeoX-style RoPE with per-dimension LongRoPE frequency factors and mscale.
-///
-/// Same as `rope_neox` but divides theta by `factors[i]` and scales cos/sin by `mscale`:
-///   theta[i] = pos * freq_base^(-2i/rope_dim) / factors[i]
-///   cos_theta = cos(theta) * mscale
-///   sin_theta = sin(theta) * mscale
-fn rope_neox_with_factors(
-    q: &DeviceTensor,
-    k: &DeviceTensor,
-    pos_offset: usize,
-    freq_base: f32,
-    head_dim: usize,
-    rope_dim: usize,
-    factors: &[f32],
-    mscale: f32,
-    backend: &dyn ComputeBackend,
-) -> (DeviceTensor, DeviceTensor) {
-    let half_rope_dim = rope_dim / 2;
-    assert_eq!(
-        factors.len(),
-        half_rope_dim,
-        "rope factors length ({}) must equal rope_dim/2 ({})",
-        factors.len(),
-        half_rope_dim
-    );
-
-    let q_host = backend.download(q);
-    let k_host = backend.download(k);
-    let q_data = q_host.as_f32();
-    let k_data = k_host.as_f32();
-    let q_shape = q.shape();
-    let k_shape = k.shape();
-
-    let seq_len = q_shape[0];
-    let total_dim = q_shape[1];
-    let n_heads = total_dim / head_dim;
-    let k_total_dim = k_shape[1];
-    let k_n_heads = k_total_dim / head_dim;
-
-    // Precompute frequencies with factors (factors are divisors, matching llama.cpp: theta/ff)
-    let inv_ndims = -1.0f32 / rope_dim as f32;
-    let mut freqs = vec![0.0f32; half_rope_dim];
-    for i in 0..half_rope_dim {
-        freqs[i] = freq_base.powf(inv_ndims * (2 * i) as f32) / factors[i];
-    }
-
-    let mut q_rot = q_data.to_vec();
-    let mut k_rot = k_data.to_vec();
-
-    for pos in 0..seq_len {
-        let abs_pos = (pos + pos_offset) as f32;
-
-        for head in 0..n_heads {
-            let offset = pos * total_dim + head * head_dim;
-            for i in 0..half_rope_dim {
-                let theta = abs_pos * freqs[i];
-                let cos_theta = theta.cos() * mscale;
-                let sin_theta = theta.sin() * mscale;
-
-                let q0 = q_data[offset + i];
-                let q1 = q_data[offset + i + half_rope_dim];
-                q_rot[offset + i] = q0 * cos_theta - q1 * sin_theta;
-                q_rot[offset + i + half_rope_dim] = q0 * sin_theta + q1 * cos_theta;
-            }
-        }
-
-        for head in 0..k_n_heads {
-            let offset = pos * k_total_dim + head * head_dim;
-            for i in 0..half_rope_dim {
-                let theta = abs_pos * freqs[i];
-                let cos_theta = theta.cos() * mscale;
-                let sin_theta = theta.sin() * mscale;
-
-                let k0 = k_data[offset + i];
-                let k1 = k_data[offset + i + half_rope_dim];
-                k_rot[offset + i] = k0 * cos_theta - k1 * sin_theta;
-                k_rot[offset + i + half_rope_dim] = k0 * sin_theta + k1 * cos_theta;
-            }
-        }
-    }
-
-    let q_tensor = Tensor::new(q_shape.to_vec(), q_rot);
-    let k_tensor = Tensor::new(k_shape.to_vec(), k_rot);
-
-    // Upload back to GPU if the backend is GPU-resident.
-    if backend.is_gpu() {
-        (backend.upload(&q_tensor), backend.upload(&k_tensor))
-    } else {
-        (DeviceTensor::new(q_tensor), DeviceTensor::new(k_tensor))
-    }
-}
-
 /// LongRoPE parameters: per-dimension frequency factors and magnitude scale.
 pub(crate) struct LongRopeParams<'a> {
     pub(crate) factors: &'a [f32],
@@ -986,7 +893,7 @@ fn multi_head_attention_cached(
     let (q_proc, k_proc) = if config.position_type == PositionType::RoPE {
         if let Some(params) = longrope {
             // LongRoPE with per-dimension frequency factors and mscale
-            rope_neox_with_factors(
+            backend.rope_neox_with_factors(
                 &q,
                 &k_new,
                 pos_offset,
@@ -995,7 +902,6 @@ fn multi_head_attention_cached(
                 config.rope_dim,
                 params.factors,
                 params.mscale,
-                backend,
             )
         } else if config.rope_neox {
             backend.rope_neox(
@@ -1022,9 +928,8 @@ fn multi_head_attention_cached(
 
     // =====================================================================
     // GPU FAST PATH: single-token decode with GPU-resident KV cache
-    // (skipped when SWA is active — the graph path handles SWA on Metal)
     // =====================================================================
-    if n_new == 1 && cache.is_gpu() && swa_window == 0 {
+    if n_new == 1 && cache.is_gpu() {
         let total_len = pos_offset + n_new;
         let attn_scale = config.attn_scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
 
@@ -1045,14 +950,14 @@ fn multi_head_attention_cached(
             head_dim,
             attn_scale,
             config.attn_logit_softcap,
+            swa_window,
         ));
     }
 
     // =====================================================================
     // GPU FAST PATH: multi-token prefill with GPU-resident KV cache
-    // (skipped when SWA is active — the graph path handles SWA on Metal)
     // =====================================================================
-    if n_new > 1 && cache.is_gpu() && swa_window == 0 {
+    if n_new > 1 && cache.is_gpu() {
         let total_len = pos_offset + n_new;
         let attn_scale = config.attn_scale.unwrap_or(1.0 / (head_dim as f32).sqrt());
 
@@ -1075,6 +980,7 @@ fn multi_head_attention_cached(
             head_dim,
             attn_scale,
             config.attn_logit_softcap,
+            swa_window,
         ));
     }
 
@@ -1356,6 +1262,7 @@ pub fn model_forward_step(
     let n_tokens = input_ids.len();
     let pos_offset = cache.len();
     debug!(n_tokens, pos_offset, "model_forward_step");
+    let profile_layers = std::env::var("STRATA_PROFILE_LAYERS").is_ok();
 
     // 1. Validate input_ids
     for &id in input_ids {
@@ -1368,7 +1275,12 @@ pub fn model_forward_step(
     }
 
     // 2. Embedding lookup
+    let fwd_start = std::time::Instant::now();
     let mut hidden = backend.embedding_lookup(&weights.token_embedding, input_ids);
+    if profile_layers {
+        backend.sync_device();
+        eprintln!("[embed token] {:.2}ms", fwd_start.elapsed().as_secs_f64() * 1000.0);
+    }
 
     // 3. Embedding scaling
     if (config.embedding_scale - 1.0).abs() > f32::EPSILON {
@@ -1378,11 +1290,16 @@ pub fn model_forward_step(
     // 4. Add position embeddings (Learned, e.g., BERT)
     if config.position_type == PositionType::Learned {
         if let Some(ref pos_emb) = weights.position_embedding {
+            let pos_start = std::time::Instant::now();
             let pos_ids: Vec<u32> = (pos_offset..pos_offset + n_tokens)
                 .map(|p| p as u32)
                 .collect();
             let pos_embeddings = backend.embedding_lookup(pos_emb, &pos_ids);
             hidden = backend.add(&hidden, &pos_embeddings);
+            if profile_layers {
+                backend.sync_device();
+                eprintln!("[embed pos] {:.2}ms", pos_start.elapsed().as_secs_f64() * 1000.0);
+            }
         }
     }
 
@@ -1420,8 +1337,10 @@ pub fn model_forward_step(
     });
 
     // 7. Run through all transformer layers with cache
+    let layers_start = std::time::Instant::now();
     for (i, layer) in weights.layers.iter().enumerate() {
         trace!(layer = i, "Running cached layer");
+        let layer_start = std::time::Instant::now();
         let layer_rope_base = if config.swa_layers.get(i).copied().unwrap_or(false) {
             config.rope_freq_base_swa
         } else {
@@ -1443,6 +1362,16 @@ pub fn model_forward_step(
             layer_rope_base,
             layer_swa_window,
         )?;
+        if profile_layers {
+            backend.sync_device();
+            let layer_ms = layer_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[layer {}] {:.2}ms", i, layer_ms);
+        }
+    }
+    if profile_layers {
+        backend.sync_device();
+        let total_ms = layers_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[layers total] {:.2}ms for {} layers", total_ms, weights.layers.len());
     }
 
     // 8. Advance cache position after all layers processed
@@ -3760,8 +3689,8 @@ mod tests {
         let q = dt(Tensor::new(vec![1, 4], q_data.clone()));
         let k = dt(Tensor::new(vec![1, 4], k_data.clone()));
 
-        let (q_rot, k_rot) = rope_neox_with_factors(
-            &q, &k, pos_offset, freq_base, head_dim, rope_dim, &factors, mscale, &b,
+        let (q_rot, k_rot) = b.rope_neox_with_factors(
+            &q, &k, pos_offset, freq_base, head_dim, rope_dim, &factors, mscale,
         );
 
         // Manual computation
@@ -3810,8 +3739,8 @@ mod tests {
         }
 
         // Verify mscale != 1.0 actually changes the output magnitude
-        let (q_no_scale, _) = rope_neox_with_factors(
-            &q, &k, pos_offset, freq_base, head_dim, rope_dim, &factors, 1.0, &b,
+        let (q_no_scale, _) = b.rope_neox_with_factors(
+            &q, &k, pos_offset, freq_base, head_dim, rope_dim, &factors, 1.0,
         );
         let q_ns = q_no_scale.as_tensor().as_f32();
         for i in 0..4 {
@@ -3841,11 +3770,11 @@ mod tests {
         let factors_1 = vec![1.0f32, 1.0];
         let factors_2 = vec![2.0f32, 2.0];
 
-        let (q_f1_p5, _) = rope_neox_with_factors(
-            &q, &k, 5, freq_base, head_dim, rope_dim, &factors_1, 1.0, &b,
+        let (q_f1_p5, _) = b.rope_neox_with_factors(
+            &q, &k, 5, freq_base, head_dim, rope_dim, &factors_1, 1.0,
         );
-        let (q_f2_p10, _) = rope_neox_with_factors(
-            &q, &k, 10, freq_base, head_dim, rope_dim, &factors_2, 1.0, &b,
+        let (q_f2_p10, _) = b.rope_neox_with_factors(
+            &q, &k, 10, freq_base, head_dim, rope_dim, &factors_2, 1.0,
         );
 
         let q1_data = q_f1_p5.as_tensor().as_f32();
@@ -3862,8 +3791,8 @@ mod tests {
         }
 
         // Sanity: factor=2 at pos=10 should NOT match factor=2 at pos=5
-        let (q_f2_p5, _) = rope_neox_with_factors(
-            &q, &k, 5, freq_base, head_dim, rope_dim, &factors_2, 1.0, &b,
+        let (q_f2_p5, _) = b.rope_neox_with_factors(
+            &q, &k, 5, freq_base, head_dim, rope_dim, &factors_2, 1.0,
         );
         let q3_data = q_f2_p5.as_tensor().as_f32();
         let mut different = false;
