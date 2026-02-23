@@ -85,12 +85,11 @@ pub struct CudaBackend {
     /// Set to true after a dequant cache allocation fails (OOM).
     /// Once set, new weights are dequanted per-call (temp alloc) or use native kernels.
 
-    // Pre-loaded kernel function handles (24 total)
+    // Pre-loaded kernel function handles (33 total)
     fn_gemm: CUfunction,
     fn_gemm_transpose: CUfunction,
     fn_gelu: CUfunction,
     fn_add_tensor: CUfunction,
-    fn_add_bias: CUfunction,
     fn_scale: CUfunction,
     fn_layer_norm: CUfunction,
     fn_softmax_rows: CUfunction,
@@ -119,6 +118,7 @@ pub struct CudaBackend {
     fn_rope_neox_with_factors: CUfunction,
     fn_dequant_q8_0: CUfunction,
     fn_dequant_q4_0: CUfunction,
+    fn_add_bias_fused: CUfunction,
 }
 
 // SAFETY: All CUDA function handles are process-global, and the Driver API is
@@ -182,7 +182,6 @@ impl CudaBackend {
         let fn_gemm_transpose = get_fn!("gemm_transpose");
         let fn_gelu = get_fn!("gelu");
         let fn_add_tensor = get_fn!("add_tensor");
-        let fn_add_bias = get_fn!("add_bias");
         let fn_scale = get_fn!("scale");
         let fn_layer_norm = get_fn!("layer_norm");
         let fn_softmax_rows = get_fn!("softmax_rows");
@@ -211,8 +210,9 @@ impl CudaBackend {
         let fn_rope_neox_with_factors = get_fn!("rope_neox_with_factors");
         let fn_dequant_q8_0 = get_fn!("dequant_q8_0");
         let fn_dequant_q4_0 = get_fn!("dequant_q4_0");
+        let fn_add_bias_fused = get_fn!("add_bias_fused");
 
-        debug!("CudaBackend initialized with 33 kernel functions");
+        debug!("CudaBackend initialized with 34 kernel functions");
 
         Ok(Self {
             api,
@@ -224,7 +224,6 @@ impl CudaBackend {
             fn_gemm_transpose,
             fn_gelu,
             fn_add_tensor,
-            fn_add_bias,
             fn_scale,
             fn_layer_norm,
             fn_softmax_rows,
@@ -253,6 +252,7 @@ impl CudaBackend {
             fn_rope_neox_with_factors,
             fn_dequant_q8_0,
             fn_dequant_q4_0,
+            fn_add_bias_fused,
         })
     }
 
@@ -280,6 +280,22 @@ impl CudaBackend {
         let ptr = self.api.mem_alloc_async(bytesize, self.stream)?;
         self.api
             .memcpy_h_to_d(ptr, data.as_ptr() as *const c_void, bytesize)?;
+        Ok(CudaBuffer {
+            ptr,
+            len: bytesize,
+            api: Arc::clone(&self.api),
+            stream: self.stream,
+        })
+    }
+
+    /// Allocate device memory for `n` f32 elements without zeroing.
+    ///
+    /// Use this for buffers that will be fully overwritten by a kernel launch
+    /// or cuBLAS call. Avoids the cost of `cuMemsetD32Async` (~2us per call,
+    /// ~500 calls per token for a 32-layer model).
+    fn alloc_f32(&self, n: usize) -> Result<CudaBuffer, String> {
+        let bytesize = n * std::mem::size_of::<f32>();
+        let ptr = self.api.mem_alloc_async(bytesize, self.stream)?;
         Ok(CudaBuffer {
             ptr,
             len: bytesize,
@@ -742,7 +758,7 @@ impl ComputeBackend for CudaBackend {
             k, k2
         );
 
-        let out = match self.alloc_zeros_f32(m * n) {
+        let out = match self.alloc_f32(m * n) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: matmul alloc failed");
@@ -818,7 +834,7 @@ impl ComputeBackend for CudaBackend {
             k, k2
         );
 
-        let out = match self.alloc_zeros_f32(m * n) {
+        let out = match self.alloc_f32(m * n) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: matmul_transpose alloc failed");
@@ -927,7 +943,7 @@ impl ComputeBackend for CudaBackend {
                 _ => None,
             };
             if let Some(func) = func {
-                let out = match self.alloc_zeros_f32(n) {
+                let out = match self.alloc_f32(n) {
                     Ok(buf) => buf,
                     Err(e) => panic!("CUDA: quantized_matmul M=1 alloc failed: {}", e),
                 };
@@ -948,7 +964,7 @@ impl ComputeBackend for CudaBackend {
                     &mut p_k as *mut _ as *mut c_void,
                 ];
 
-                // Grid: (N, 1, 1), Block: (256, 1, 1) — one block per output element
+                // Grid: (N, 1, 1), Block: (256, 1, 1) -- one block per output element
                 let grid = (n as u32, 1, 1);
                 let block = (256, 1, 1);
                 unsafe {
@@ -978,7 +994,7 @@ impl ComputeBackend for CudaBackend {
                 | TensorDtype::Q8_0
                 | TensorDtype::Q4_0
         ) {
-            if let Ok(f32_buf) = self.alloc_zeros_f32(n * k) {
+            if let Ok(f32_buf) = self.alloc_f32(n * k) {
                 trace!(m, k, n, ?dtype, "CUDA quantized_matmul: GPU dequant + cuBLAS");
                 self.launch_dequant(dtype, w_buf.ptr, f32_buf.ptr, n, k);
                 let f32_dt = Self::wrap(f32_buf, vec![n, k], TensorDtype::F32);
@@ -1016,7 +1032,7 @@ impl ComputeBackend for CudaBackend {
         }
 
         // === Native kernel fallback (when cache is full / OOM) ===
-        let out = match self.alloc_zeros_f32(m * n) {
+        let out = match self.alloc_f32(m * n) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: quantized_matmul alloc failed");
@@ -1069,7 +1085,7 @@ impl ComputeBackend for CudaBackend {
     fn add(&self, a: &DeviceTensor, b: &DeviceTensor) -> DeviceTensor {
         let n: usize = a.shape().iter().product();
 
-        let out = match self.alloc_zeros_f32(n) {
+        let out = match self.alloc_f32(n) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: add alloc failed");
@@ -1108,7 +1124,7 @@ impl ComputeBackend for CudaBackend {
         let cols = *a_shape.last().unwrap();
 
         let n_total = rows * cols;
-        let out = match self.alloc_zeros_f32(n_total) {
+        let out = match self.alloc_f32(n_total) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: add_bias alloc failed");
@@ -1119,29 +1135,26 @@ impl ComputeBackend for CudaBackend {
         let a_buf = Self::get_buf(a);
         let bias_buf = Self::get_buf(bias);
 
-        // Copy input to output first, then add bias in-place on the output buffer.
-        // The PTX kernel takes (t, bias, rows, cols) and modifies t in-place.
-        let bytesize = n_total * std::mem::size_of::<f32>();
-        if let Err(e) = self.copy_device_to_device(out.ptr, a_buf.ptr, bytesize) {
-            tracing::warn!(error = %e, "CUDA: add_bias copy failed");
-        }
-
-        let mut p_t = out.ptr;
+        // Fused kernel: out[i] = input[i] + bias[i % cols]
+        // Eliminates D2D copy + zero-init from the old path.
+        let mut p_in = a_buf.ptr;
         let mut p_bias = bias_buf.ptr;
+        let mut p_out = out.ptr;
         let mut p_rows = rows as u32;
         let mut p_cols = cols as u32;
 
-        let mut params: [*mut c_void; 4] = [
-            &mut p_t as *mut _ as *mut c_void,
+        let mut params: [*mut c_void; 5] = [
+            &mut p_in as *mut _ as *mut c_void,
             &mut p_bias as *mut _ as *mut c_void,
+            &mut p_out as *mut _ as *mut c_void,
             &mut p_rows as *mut _ as *mut c_void,
             &mut p_cols as *mut _ as *mut c_void,
         ];
 
-        let grid = (rows as u32, Self::div_ceil(cols as u32, 256), 1);
+        let grid = (Self::div_ceil(n_total as u32, 256), 1, 1);
         let block = (256, 1, 1);
         unsafe {
-            self.launch(self.fn_add_bias, grid, block, 0, &mut params);
+            self.launch(self.fn_add_bias_fused, grid, block, 0, &mut params);
         }
 
         Self::wrap(out, a_shape.to_vec(), TensorDtype::F32)
@@ -1150,7 +1163,7 @@ impl ComputeBackend for CudaBackend {
     fn gelu(&self, t: &DeviceTensor) -> DeviceTensor {
         let n: usize = t.shape().iter().product();
 
-        let out = match self.alloc_zeros_f32(n) {
+        let out = match self.alloc_f32(n) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: gelu alloc failed");
@@ -1182,7 +1195,7 @@ impl ComputeBackend for CudaBackend {
     fn silu(&self, t: &DeviceTensor) -> DeviceTensor {
         let n: usize = t.shape().iter().product();
 
-        let out = match self.alloc_zeros_f32(n) {
+        let out = match self.alloc_f32(n) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: silu alloc failed");
@@ -1214,7 +1227,7 @@ impl ComputeBackend for CudaBackend {
     fn swiglu(&self, gate: &DeviceTensor, up: &DeviceTensor) -> DeviceTensor {
         let n: usize = gate.shape().iter().product();
 
-        let out = match self.alloc_zeros_f32(n) {
+        let out = match self.alloc_f32(n) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: swiglu alloc failed");
@@ -1255,7 +1268,7 @@ impl ComputeBackend for CudaBackend {
     ) -> DeviceTensor {
         let (rows, cols) = Self::shape_2d(t);
 
-        let out = match self.alloc_zeros_f32(rows * cols) {
+        let out = match self.alloc_f32(rows * cols) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: layer_norm alloc failed");
@@ -1299,7 +1312,7 @@ impl ComputeBackend for CudaBackend {
     fn rms_norm(&self, t: &DeviceTensor, weight: &DeviceTensor, eps: f32) -> DeviceTensor {
         let (rows, cols) = Self::shape_2d(t);
 
-        let out = match self.alloc_zeros_f32(rows * cols) {
+        let out = match self.alloc_f32(rows * cols) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: rms_norm alloc failed");
@@ -1341,7 +1354,7 @@ impl ComputeBackend for CudaBackend {
     fn softmax(&self, t: &DeviceTensor) -> DeviceTensor {
         let (rows, cols) = Self::shape_2d(t);
 
-        let out = match self.alloc_zeros_f32(rows * cols) {
+        let out = match self.alloc_f32(rows * cols) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: softmax alloc failed");
@@ -1544,7 +1557,7 @@ impl ComputeBackend for CudaBackend {
             }
         };
 
-        let out = match self.alloc_zeros_f32(cols) {
+        let out = match self.alloc_f32(cols) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: mean_pool alloc failed");
@@ -1661,7 +1674,7 @@ impl ComputeBackend for CudaBackend {
                     | TensorDtype::Q8_0
                     | TensorDtype::Q4_0
             ) {
-                if let Ok(f32_buf) = self.alloc_zeros_f32(vocab_size * hidden_size) {
+                if let Ok(f32_buf) = self.alloc_f32(vocab_size * hidden_size) {
                     self.launch_dequant(dtype, w_ptr, f32_buf.ptr, vocab_size, hidden_size);
                     let f32_dt = Self::wrap(f32_buf, vec![vocab_size, hidden_size], TensorDtype::F32);
                     let result = self.embedding_lookup(&f32_dt, ids);
@@ -1698,7 +1711,7 @@ impl ComputeBackend for CudaBackend {
             }
         };
 
-        let out = match self.alloc_zeros_f32(n_tokens * hidden_size) {
+        let out = match self.alloc_f32(n_tokens * hidden_size) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: embedding_lookup alloc failed");
@@ -1738,7 +1751,7 @@ impl ComputeBackend for CudaBackend {
             // Same-shape element-wise multiply
             let n: usize = a_shape.iter().product();
 
-            let out = match self.alloc_zeros_f32(n) {
+            let out = match self.alloc_f32(n) {
                 Ok(buf) => buf,
                 Err(e) => {
                     tracing::warn!(error = %e, "CUDA: mul alloc failed");
@@ -1797,7 +1810,7 @@ impl ComputeBackend for CudaBackend {
     fn tanh(&self, t: &DeviceTensor) -> DeviceTensor {
         let n: usize = t.shape().iter().product();
 
-        let out = match self.alloc_zeros_f32(n) {
+        let out = match self.alloc_f32(n) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: tanh alloc failed");
@@ -1829,7 +1842,7 @@ impl ComputeBackend for CudaBackend {
     fn geglu(&self, gate: &DeviceTensor, up: &DeviceTensor) -> DeviceTensor {
         let n: usize = gate.shape().iter().product();
 
-        let out = match self.alloc_zeros_f32(n) {
+        let out = match self.alloc_f32(n) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: geglu alloc failed");
@@ -2024,7 +2037,7 @@ impl ComputeBackend for CudaBackend {
         );
         let total_dim = num_heads * head_dim;
 
-        let out = match self.alloc_zeros_f32(total_dim) {
+        let out = match self.alloc_f32(total_dim) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: grouped_attention_decode alloc failed");
@@ -2097,7 +2110,7 @@ impl ComputeBackend for CudaBackend {
         );
         let total_dim = num_heads * head_dim;
 
-        let out = match self.alloc_zeros_f32(n_tokens * total_dim) {
+        let out = match self.alloc_f32(n_tokens * total_dim) {
             Ok(buf) => buf,
             Err(e) => {
                 tracing::warn!(error = %e, "CUDA: batched_causal_attention alloc failed");

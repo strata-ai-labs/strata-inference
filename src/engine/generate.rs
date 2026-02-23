@@ -1150,6 +1150,173 @@ impl GenerationEngine {
     pub fn decode(&self, ids: &[u32]) -> String {
         self.tokenizer.decode(ids)
     }
+
+    /// Encode text to token IDs using the model's tokenizer.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        self.tokenizer.encode(text, true)
+    }
+
+    /// Generate from pre-tokenized input (bypasses the tokenizer).
+    ///
+    /// This is useful for correctness verification: feed the exact same token
+    /// IDs to both strata and llama.cpp to verify model computation is identical.
+    pub fn generate_from_token_ids(
+        &mut self,
+        token_ids: &[u32],
+        gen_config: &GenerationConfig,
+    ) -> Result<GenerationOutput, InferenceError> {
+        self.generate_stream_full_from_token_ids(token_ids, gen_config, |_| true)
+    }
+
+    /// Generate from pre-tokenized input with streaming and full metadata.
+    pub fn generate_stream_full_from_token_ids(
+        &mut self,
+        prompt_ids: &[u32],
+        gen_config: &GenerationConfig,
+        mut callback: impl FnMut(u32) -> bool,
+    ) -> Result<GenerationOutput, InferenceError> {
+        let backend = match &self.executor {
+            Executor::Cpu(cpu) => &cpu.backend,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            _ => {
+                return Err(InferenceError::Generation(
+                    "generate_from_token_ids not yet supported on Metal path".to_string(),
+                ))
+            }
+        };
+
+        if !self.config.causal {
+            return Err(InferenceError::Generation(
+                "generation requires a causal model (not bidirectional)".to_string(),
+            ));
+        }
+
+        let profiling = std::env::var("STRATA_PROFILE").map_or(false, |v| v == "1");
+
+        let prompt_tokens = prompt_ids.len();
+
+        if prompt_ids.is_empty() {
+            return Err(InferenceError::Generation(
+                "token_ids list is empty".to_string(),
+            ));
+        }
+
+        if prompt_ids.len() >= self.config.max_seq_len {
+            return Err(InferenceError::Generation(format!(
+                "token_ids length ({}) exceeds max_seq_len ({})",
+                prompt_ids.len(),
+                self.config.max_seq_len
+            )));
+        }
+
+        let mut rng = XorShiftRng::new(gen_config.sampling.seed.unwrap_or(42));
+        let mut cache = if backend.is_gpu() {
+            KvCache::new_gpu(&self.config, backend.as_ref())
+        } else {
+            KvCache::new(&self.config)
+        };
+        let mut generated_ids: Vec<u32> = Vec::new();
+
+        let mut stop_tokens = gen_config.stop_tokens.clone();
+        if let Some(eos) = self.tokenizer.eos_token_id() {
+            if !stop_tokens.contains(&eos) {
+                stop_tokens.push(eos);
+            }
+        }
+
+        // Prefill
+        if profiling {
+            backend.reset_profile();
+        }
+        let prefill_start = Instant::now();
+        let hidden = model_forward_step(
+            prompt_ids,
+            &self.weights,
+            &self.config,
+            backend.as_ref(),
+            &mut cache,
+        )?;
+
+        let logits =
+            self.project_to_logits_cpu(&hidden, prompt_ids.len() - 1, backend.as_ref());
+
+        let mut next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
+        let prefill_duration = prefill_start.elapsed();
+
+        if profiling {
+            let prefill_ms = prefill_duration.as_secs_f64() * 1000.0;
+            eprintln!(
+                "[profile] prefill: {:.1}ms ({} tokens) | {}",
+                prefill_ms,
+                prompt_tokens,
+                backend.profile_summary(),
+            );
+        }
+
+        // Decode loop
+        let mut stop_reason = StopReason::MaxTokens;
+
+        for step in 0..gen_config.max_tokens {
+            if stop_tokens.contains(&next_token) {
+                stop_reason = StopReason::StopToken;
+                break;
+            }
+
+            generated_ids.push(next_token);
+
+            if !callback(next_token) {
+                stop_reason = StopReason::Cancelled;
+                break;
+            }
+
+            if cache.len() >= self.config.max_seq_len {
+                stop_reason = StopReason::ContextLength;
+                break;
+            }
+
+            if profiling {
+                backend.reset_profile();
+            }
+            let tok_start = Instant::now();
+
+            let hidden = model_forward_step(
+                &[next_token],
+                &self.weights,
+                &self.config,
+                backend.as_ref(),
+                &mut cache,
+            )?;
+            let fwd_ms = tok_start.elapsed().as_secs_f64() * 1000.0;
+
+            let logits_start = Instant::now();
+            let logits = self.project_to_logits_cpu(&hidden, 0, backend.as_ref());
+            let logits_ms = logits_start.elapsed().as_secs_f64() * 1000.0;
+
+            let sample_start = Instant::now();
+            next_token = sample_token(&logits, &gen_config.sampling, &mut rng);
+            let sample_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
+
+            if profiling {
+                let total_ms = tok_start.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[profile] tok {}: {:.1}ms (fwd={:.1}ms logits={:.1}ms sample={:.1}ms) | {}",
+                    step + 1,
+                    total_ms,
+                    fwd_ms,
+                    logits_ms,
+                    sample_ms,
+                    backend.profile_summary(),
+                );
+            }
+        }
+
+        Ok(GenerationOutput {
+            token_ids: generated_ids,
+            stop_reason,
+            prompt_tokens,
+            prefill_duration,
+        })
+    }
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

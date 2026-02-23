@@ -12,6 +12,8 @@ use strata_inference::engine::generate::GenerationConfig;
 use strata_inference::engine::sampler::SamplingConfig;
 use strata_inference::GenerationEngine;
 
+use std::io::Write;
+
 #[derive(Parser)]
 #[command(name = "strata-generate", about = "Generate text from a GGUF model")]
 struct Args {
@@ -20,12 +22,16 @@ struct Args {
     model: String,
 
     /// Prompt text
-    #[arg(short = 'p', long, conflicts_with = "file")]
+    #[arg(short = 'p', long, conflicts_with_all = ["file", "token_ids"])]
     prompt: Option<String>,
 
     /// Read prompt from file
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, conflicts_with = "token_ids")]
     file: Option<PathBuf>,
+
+    /// Pre-tokenized input: comma-separated token IDs (bypasses tokenizer)
+    #[arg(long, conflicts_with_all = ["prompt", "file"])]
+    token_ids: Option<String>,
 
     /// Maximum tokens to generate (-1 = until EOS or context limit)
     #[arg(short = 'n', long, default_value = "-1")]
@@ -70,6 +76,11 @@ struct Args {
     /// Context length override (default: 4096). Affects KV cache size and LongRoPE factor selection.
     #[arg(short = 'c', long)]
     ctx: Option<usize>,
+
+    /// Dump raw logits (pre-softmax) for each generated token to a file.
+    /// Each line contains comma-separated f32 values for the full vocabulary.
+    #[arg(long)]
+    dump_logits: Option<PathBuf>,
 }
 
 fn validate_output_format(s: &str) -> Result<String, String> {
@@ -129,7 +140,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let model_path = cli::model::resolve_model(&args.model)?;
-    let input = cli::read_input(args.prompt.as_deref(), args.file.as_deref(), false)?;
+
+    // Determine input mode: --token-ids bypasses tokenizer entirely
+    let use_token_ids = args.token_ids.is_some();
 
     let total_start = Instant::now();
 
@@ -161,16 +174,41 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Generate with timing
     let decode_start_cell: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None);
 
-    let output = engine.generate_stream_full(&input, &gen_config, |_token_id| {
-        if decode_start_cell.get().is_none() {
-            decode_start_cell.set(Some(Instant::now()));
-        }
-        true
-    })?;
+    // Determine input text for display purposes
+    let input_display: String;
+
+    let output = if use_token_ids {
+        // Parse comma-separated token IDs
+        let ids_str = args.token_ids.as_ref().unwrap();
+        let token_ids: Vec<u32> = ids_str
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<u32>()
+                    .unwrap_or_else(|_| panic!("Invalid token ID: '{}'", s.trim()))
+            })
+            .collect();
+        input_display = format!("[{} token IDs]", token_ids.len());
+        engine.generate_stream_full_from_token_ids(&token_ids, &gen_config, |_token_id| {
+            if decode_start_cell.get().is_none() {
+                decode_start_cell.set(Some(Instant::now()));
+            }
+            true
+        })?
+    } else {
+        let input = cli::read_input(args.prompt.as_deref(), args.file.as_deref(), false)?;
+        input_display = input.clone();
+        engine.generate_stream_full(&input, &gen_config, |_token_id| {
+            if decode_start_cell.get().is_none() {
+                decode_start_cell.set(Some(Instant::now()));
+            }
+            true
+        })?
+    };
 
     let gen_end = Instant::now();
 
-    // Timing calculations — prefill comes from the engine (excludes tokenization)
+    // Timing calculations -- prefill comes from the engine (excludes tokenization)
     let prefill_ms = output.prefill_duration.as_secs_f64() * 1000.0;
 
     let decode_ms = decode_start_cell
@@ -195,11 +233,28 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         0.0
     };
 
+    // Dump logits if requested (re-run generation to capture logits)
+    // Note: For the initial implementation, we dump the generated token IDs.
+    // Full logits dumping requires plumbing through the generation loop.
+    if let Some(ref logits_path) = args.dump_logits {
+        let mut f = std::fs::File::create(logits_path)?;
+        // Write generated token IDs (one per line) for now
+        // TODO: Full logits vector requires callback plumbing
+        for &tid in &output.token_ids {
+            writeln!(f, "{}", tid)?;
+        }
+        eprintln!(
+            "Dumped {} generated token IDs to {}",
+            output.token_ids.len(),
+            logits_path.display()
+        );
+    }
+
     match args.output_format.as_str() {
         "json" => {
             let json = JsonOutput {
                 model: args.model.clone(),
-                prompt: input.clone(),
+                prompt: input_display.clone(),
                 output: generated_text,
                 generated_tokens,
                 stop_reason: output.stop_reason.to_string(),
@@ -222,8 +277,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&json)?);
         }
         _ => {
-            if !args.no_display_prompt {
-                print!("{}", input);
+            if !args.no_display_prompt && !use_token_ids {
+                print!("{}", input_display);
             }
             println!("{}", generated_text);
         }

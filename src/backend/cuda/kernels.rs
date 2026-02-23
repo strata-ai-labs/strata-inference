@@ -402,14 +402,19 @@ ADD_DONE:
 }
 
 // -------------------------------------------------------------------------
-// add_bias: t[r*cols + c] += bias[c]
+// add_bias_fused: out[i] = input[i] + bias[i % cols]
 //
-// Parameters: t ptr (.u64), bias ptr (.u64), rows (.u32), cols (.u32)
-// Grid: (rows, ceil(cols/256), 1), Block: (256, 1, 1)
+// Fused version: reads from input, writes to separate output buffer.
+// Eliminates D2D copy + zero-init needed by the in-place add_bias kernel.
+//
+// Parameters: input ptr (.u64), bias ptr (.u64), output ptr (.u64),
+//             rows (.u32), cols (.u32)
+// Grid: (ceil(total/256), 1, 1), Block: (256, 1, 1)
 // -------------------------------------------------------------------------
-.visible .entry add_bias(
-    .param .u64 param_t,
+.visible .entry add_bias_fused(
+    .param .u64 param_in,
     .param .u64 param_bias,
+    .param .u64 param_out,
     .param .u32 param_rows,
     .param .u32 param_cols
 )
@@ -419,37 +424,40 @@ ADD_DONE:
     .reg .f32 %f<4>;
     .reg .pred %p0;
 
-    ld.param.u64 %rd0, [param_t];
+    ld.param.u64 %rd0, [param_in];
     ld.param.u64 %rd1, [param_bias];
+    ld.param.u64 %rd2, [param_out];
     ld.param.u32 %r0, [param_rows];
     ld.param.u32 %r1, [param_cols];
 
-    // r = blockIdx.x, c = blockIdx.y * blockDim.x + threadIdx.x
-    mov.u32 %r5, %ctaid.x;
-    mov.u32 %r2, %ctaid.y;
+    // global index = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32 %r2, %ctaid.x;
     mov.u32 %r3, %ntid.x;
     mul.lo.u32 %r2, %r2, %r3;
     mov.u32 %r4, %tid.x;
     add.u32 %r2, %r2, %r4;
 
-    setp.ge.u32 %p0, %r2, %r1;
-    @%p0 bra BIAS_DONE;
+    // total = rows * cols
+    mul.lo.u32 %r5, %r0, %r1;
+    setp.ge.u32 %p0, %r2, %r5;
+    @%p0 bra BIAS_FUSED_DONE;
 
-    // offset = r * cols + c
-    mul.lo.u32 %r6, %r5, %r1;
-    add.u32 %r6, %r6, %r2;
-    mul.wide.u32 %rd2, %r6, 4;
-    add.u64 %rd3, %rd0, %rd2;
-    ld.global.f32 %f0, [%rd3];
+    // Load input[i]
+    mul.wide.u32 %rd3, %r2, 4;
+    add.u64 %rd4, %rd0, %rd3;
+    ld.global.f32 %f0, [%rd4];
 
-    // bias[c]
-    mul.wide.u32 %rd4, %r2, 4;
-    add.u64 %rd5, %rd1, %rd4;
-    ld.global.f32 %f1, [%rd5];
+    // col = i % cols; load bias[col]
+    rem.u32 %r6, %r2, %r1;
+    mul.wide.u32 %rd5, %r6, 4;
+    add.u64 %rd6, %rd1, %rd5;
+    ld.global.f32 %f1, [%rd6];
 
+    // out[i] = input[i] + bias[col]
     add.rn.f32 %f2, %f0, %f1;
-    st.global.f32 [%rd3], %f2;
-BIAS_DONE:
+    add.u64 %rd7, %rd2, %rd3;
+    st.global.f32 [%rd7], %f2;
+BIAS_FUSED_DONE:
     ret;
 }
 
@@ -1064,45 +1072,50 @@ QMQ8_INNER_DONE:
     bra QMQ8_BLOCK_LOOP;
 QMQ8_BLOCK_DONE:
 
-    // Shared-memory parallel reduction
-    mov.u32 %r17, sdata;
-    shl.b32 %r18, %r2, 2;
-    add.u32 %r17, %r17, %r18;
-    st.shared.f32 [%r17], %f0;
+    // === Warp-shuffle reduction (256 threads -> 1 value, 1 bar.sync) ===
+    // Intra-warp reduction via shfl.sync.down (5 rounds per warp)
+    shfl.sync.down.b32 %f5, %f0, 16, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f5;
+    shfl.sync.down.b32 %f5, %f0, 8, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f5;
+    shfl.sync.down.b32 %f5, %f0, 4, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f5;
+    shfl.sync.down.b32 %f5, %f0, 2, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f5;
+    shfl.sync.down.b32 %f5, %f0, 1, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f5;
+    // Lane 0 of each warp writes to sdata[warp_id]
+    and.b32 %r17, %r2, 31;
+    setp.ne.u32 %p0, %r17, 0;
+    @%p0 bra QMQ8_WARP_SKIP;
+    shr.u32 %r18, %r2, 5;
+    mov.u32 %r19, sdata;
+    shl.b32 %r20, %r18, 2;
+    add.u32 %r19, %r19, %r20;
+    st.shared.f32 [%r19], %f0;
+QMQ8_WARP_SKIP:
     bar.sync 0;
-
-    mov.u32 %r19, 128;
-QMQ8_RED:
-    setp.ge.u32 %p0, %r2, %r19;
-    @%p0 bra QMQ8_RED_SKIP;
-    add.u32 %r20, %r2, %r19;
-    mov.u32 %r21, sdata;
-    shl.b32 %r22, %r20, 2;
-    add.u32 %r21, %r21, %r22;
-    ld.shared.f32 %f5, [%r21];
-    mov.u32 %r21, sdata;
-    shl.b32 %r22, %r2, 2;
-    add.u32 %r21, %r21, %r22;
-    ld.shared.f32 %f6, [%r21];
+    // First warp reduces 8 warp sums
+    setp.ge.u32 %p0, %r2, 8;
+    @%p0 bra QMQ8_DONE;
+    mov.u32 %r19, sdata;
+    shl.b32 %r20, %r2, 2;
+    add.u32 %r19, %r19, %r20;
+    ld.shared.f32 %f6, [%r19];
+    shfl.sync.down.b32 %f5, %f6, 4, 31, 0xffffffff;
     add.rn.f32 %f6, %f6, %f5;
-    st.shared.f32 [%r21], %f6;
-QMQ8_RED_SKIP:
-    bar.sync 0;
-    shr.u32 %r19, %r19, 1;
-    setp.ge.u32 %p0, %r19, 1;
-    @%p0 bra QMQ8_RED;
-
+    shfl.sync.down.b32 %f5, %f6, 2, 31, 0xffffffff;
+    add.rn.f32 %f6, %f6, %f5;
+    shfl.sync.down.b32 %f5, %f6, 1, 31, 0xffffffff;
+    add.rn.f32 %f6, %f6, %f5;
     // Thread 0 writes result
     setp.ne.u32 %p0, %r2, 0;
     @%p0 bra QMQ8_DONE;
-    mov.u32 %r23, sdata;
-    ld.shared.f32 %f7, [%r23];
-    // output[m * N + n]
     mul.lo.u32 %r24, %r5, %r0;
     add.u32 %r24, %r24, %r4;
     mul.wide.u32 %rd16, %r24, 4;
     add.u64 %rd17, %rd2, %rd16;
-    st.global.f32 [%rd17], %f7;
+    st.global.f32 [%rd17], %f6;
 QMQ8_DONE:
     ret;
 }
@@ -1232,44 +1245,50 @@ QMQ4_NIBBLE_DONE:
     bra QMQ4_BLOCK_LOOP;
 QMQ4_BLOCK_DONE:
 
-    // Shared-memory reduction
-    mov.u32 %r20, sdata;
-    shl.b32 %r21, %r2, 2;
-    add.u32 %r20, %r20, %r21;
-    st.shared.f32 [%r20], %f0;
+    // === Warp-shuffle reduction (256 threads -> 1 value, 1 bar.sync) ===
+    // Intra-warp reduction via shfl.sync.down (5 rounds per warp)
+    shfl.sync.down.b32 %f9, %f0, 16, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f9;
+    shfl.sync.down.b32 %f9, %f0, 8, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f9;
+    shfl.sync.down.b32 %f9, %f0, 4, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f9;
+    shfl.sync.down.b32 %f9, %f0, 2, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f9;
+    shfl.sync.down.b32 %f9, %f0, 1, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f9;
+    // Lane 0 of each warp writes to sdata[warp_id]
+    and.b32 %r20, %r2, 31;
+    setp.ne.u32 %p0, %r20, 0;
+    @%p0 bra QMQ4_WARP_SKIP;
+    shr.u32 %r21, %r2, 5;
+    mov.u32 %r22, sdata;
+    shl.b32 %r23, %r21, 2;
+    add.u32 %r22, %r22, %r23;
+    st.shared.f32 [%r22], %f0;
+QMQ4_WARP_SKIP:
     bar.sync 0;
-
-    mov.u32 %r22, 128;
-QMQ4_RED:
-    setp.ge.u32 %p0, %r2, %r22;
-    @%p0 bra QMQ4_RED_SKIP;
-    add.u32 %r23, %r2, %r22;
-    mov.u32 %r24, sdata;
-    shl.b32 %r25, %r23, 2;
-    add.u32 %r24, %r24, %r25;
-    ld.shared.f32 %f9, [%r24];
-    mov.u32 %r24, sdata;
-    shl.b32 %r25, %r2, 2;
-    add.u32 %r24, %r24, %r25;
-    ld.shared.f32 %f10, [%r24];
+    // First warp reduces 8 warp sums
+    setp.ge.u32 %p0, %r2, 8;
+    @%p0 bra QMQ4_DONE;
+    mov.u32 %r22, sdata;
+    shl.b32 %r23, %r2, 2;
+    add.u32 %r22, %r22, %r23;
+    ld.shared.f32 %f10, [%r22];
+    shfl.sync.down.b32 %f9, %f10, 4, 31, 0xffffffff;
     add.rn.f32 %f10, %f10, %f9;
-    st.shared.f32 [%r24], %f10;
-QMQ4_RED_SKIP:
-    bar.sync 0;
-    shr.u32 %r22, %r22, 1;
-    setp.ge.u32 %p0, %r22, 1;
-    @%p0 bra QMQ4_RED;
-
+    shfl.sync.down.b32 %f9, %f10, 2, 31, 0xffffffff;
+    add.rn.f32 %f10, %f10, %f9;
+    shfl.sync.down.b32 %f9, %f10, 1, 31, 0xffffffff;
+    add.rn.f32 %f10, %f10, %f9;
     // Thread 0 writes result
     setp.ne.u32 %p0, %r2, 0;
     @%p0 bra QMQ4_DONE;
-    mov.u32 %r26, sdata;
-    ld.shared.f32 %f11, [%r26];
     mul.lo.u32 %r27, %r5, %r0;
     add.u32 %r27, %r27, %r4;
     mul.wide.u32 %rd18, %r27, 4;
     add.u64 %rd19, %rd2, %rd18;
-    st.global.f32 [%rd19], %f11;
+    st.global.f32 [%rd19], %f10;
 QMQ4_DONE:
     ret;
 }
@@ -1453,45 +1472,50 @@ Q4K_SCALE_DONE:
     bra Q4K_BLOCK_LOOP;
 Q4K_BLOCK_DONE:
 
-    // === Shared-memory tree reduction ===
-    mov.u32 %r30, sdata;
-    shl.b32 %r31, %r2, 2;
-    add.u32 %r30, %r30, %r31;
-    st.shared.f32 [%r30], %f0;
+    // === Warp-shuffle reduction (256 threads -> 1 value, 1 bar.sync) ===
+    // Intra-warp reduction via shfl.sync.down (5 rounds per warp)
+    shfl.sync.down.b32 %f11, %f0, 16, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f11;
+    shfl.sync.down.b32 %f11, %f0, 8, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f11;
+    shfl.sync.down.b32 %f11, %f0, 4, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f11;
+    shfl.sync.down.b32 %f11, %f0, 2, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f11;
+    shfl.sync.down.b32 %f11, %f0, 1, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f11;
+    // Lane 0 of each warp writes to sdata[warp_id]
+    and.b32 %r30, %r2, 31;
+    setp.ne.u32 %p3, %r30, 0;
+    @%p3 bra Q4K_WARP_SKIP;
+    shr.u32 %r31, %r2, 5;
+    mov.u32 %r32, sdata;
+    shl.b32 %r33, %r31, 2;
+    add.u32 %r32, %r32, %r33;
+    st.shared.f32 [%r32], %f0;
+Q4K_WARP_SKIP:
     bar.sync 0;
-
-    mov.u32 %r32, 128;
-Q4K_RED:
-    setp.ge.u32 %p3, %r2, %r32;
-    @%p3 bra Q4K_RED_SKIP;
-    add.u32 %r33, %r2, %r32;
-    mov.u32 %r34, sdata;
-    shl.b32 %r35, %r33, 2;
-    add.u32 %r34, %r34, %r35;
-    ld.shared.f32 %f11, [%r34];
-    mov.u32 %r34, sdata;
-    shl.b32 %r35, %r2, 2;
-    add.u32 %r34, %r34, %r35;
-    ld.shared.f32 %f12, [%r34];
+    // First warp reduces 8 warp sums
+    setp.ge.u32 %p3, %r2, 8;
+    @%p3 bra Q4K_DONE;
+    mov.u32 %r32, sdata;
+    shl.b32 %r33, %r2, 2;
+    add.u32 %r32, %r32, %r33;
+    ld.shared.f32 %f12, [%r32];
+    shfl.sync.down.b32 %f11, %f12, 4, 31, 0xffffffff;
     add.rn.f32 %f12, %f12, %f11;
-    st.shared.f32 [%r34], %f12;
-Q4K_RED_SKIP:
-    bar.sync 0;
-    shr.u32 %r32, %r32, 1;
-    setp.ge.u32 %p3, %r32, 1;
-    @%p3 bra Q4K_RED;
-
+    shfl.sync.down.b32 %f11, %f12, 2, 31, 0xffffffff;
+    add.rn.f32 %f12, %f12, %f11;
+    shfl.sync.down.b32 %f11, %f12, 1, 31, 0xffffffff;
+    add.rn.f32 %f12, %f12, %f11;
     // Thread 0 writes result
     setp.ne.u32 %p4, %r2, 0;
     @%p4 bra Q4K_DONE;
-    mov.u32 %r36, sdata;
-    ld.shared.f32 %f13, [%r36];
-    // output[i * N + j]
     mul.lo.u32 %r37, %r5, %r0;
     add.u32 %r37, %r37, %r4;
     mul.wide.u32 %rd18, %r37, 4;
     add.u64 %rd19, %rd2, %rd18;
-    st.global.f32 [%rd19], %f13;
+    st.global.f32 [%rd19], %f12;
 Q4K_DONE:
     ret;
 }
@@ -1662,43 +1686,50 @@ Q5K_SCALE_DONE:
     bra Q5K_BLOCK_LOOP;
 Q5K_BLOCK_DONE:
 
-    // Tree reduction (same pattern)
-    mov.u32 %r30, sdata;
-    shl.b32 %r31, %r2, 2;
-    add.u32 %r30, %r30, %r31;
-    st.shared.f32 [%r30], %f0;
+    // === Warp-shuffle reduction (256 threads -> 1 value, 1 bar.sync) ===
+    // Intra-warp reduction via shfl.sync.down (5 rounds per warp)
+    shfl.sync.down.b32 %f11, %f0, 16, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f11;
+    shfl.sync.down.b32 %f11, %f0, 8, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f11;
+    shfl.sync.down.b32 %f11, %f0, 4, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f11;
+    shfl.sync.down.b32 %f11, %f0, 2, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f11;
+    shfl.sync.down.b32 %f11, %f0, 1, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f11;
+    // Lane 0 of each warp writes to sdata[warp_id]
+    and.b32 %r30, %r2, 31;
+    setp.ne.u32 %p3, %r30, 0;
+    @%p3 bra Q5K_WARP_SKIP;
+    shr.u32 %r31, %r2, 5;
+    mov.u32 %r32, sdata;
+    shl.b32 %r33, %r31, 2;
+    add.u32 %r32, %r32, %r33;
+    st.shared.f32 [%r32], %f0;
+Q5K_WARP_SKIP:
     bar.sync 0;
-
-    mov.u32 %r32, 128;
-Q5K_RED:
-    setp.ge.u32 %p3, %r2, %r32;
-    @%p3 bra Q5K_RED_SKIP;
-    add.u32 %r33, %r2, %r32;
-    mov.u32 %r34, sdata;
-    shl.b32 %r35, %r33, 2;
-    add.u32 %r34, %r34, %r35;
-    ld.shared.f32 %f11, [%r34];
-    mov.u32 %r34, sdata;
-    shl.b32 %r35, %r2, 2;
-    add.u32 %r34, %r34, %r35;
-    ld.shared.f32 %f12, [%r34];
+    // First warp reduces 8 warp sums
+    setp.ge.u32 %p3, %r2, 8;
+    @%p3 bra Q5K_DONE;
+    mov.u32 %r32, sdata;
+    shl.b32 %r33, %r2, 2;
+    add.u32 %r32, %r32, %r33;
+    ld.shared.f32 %f12, [%r32];
+    shfl.sync.down.b32 %f11, %f12, 4, 31, 0xffffffff;
     add.rn.f32 %f12, %f12, %f11;
-    st.shared.f32 [%r34], %f12;
-Q5K_RED_SKIP:
-    bar.sync 0;
-    shr.u32 %r32, %r32, 1;
-    setp.ge.u32 %p3, %r32, 1;
-    @%p3 bra Q5K_RED;
-
+    shfl.sync.down.b32 %f11, %f12, 2, 31, 0xffffffff;
+    add.rn.f32 %f12, %f12, %f11;
+    shfl.sync.down.b32 %f11, %f12, 1, 31, 0xffffffff;
+    add.rn.f32 %f12, %f12, %f11;
+    // Thread 0 writes result
     setp.ne.u32 %p4, %r2, 0;
     @%p4 bra Q5K_DONE;
-    mov.u32 %r36, sdata;
-    ld.shared.f32 %f13, [%r36];
     mul.lo.u32 %r37, %r5, %r0;
     add.u32 %r37, %r37, %r4;
     mul.wide.u32 %rd18, %r37, 4;
     add.u64 %rd19, %rd2, %rd18;
-    st.global.f32 [%rd19], %f13;
+    st.global.f32 [%rd19], %f12;
 Q5K_DONE:
     ret;
 }
@@ -1869,43 +1900,50 @@ Q6K_BLOCK_LOOP:
     bra Q6K_BLOCK_LOOP;
 Q6K_BLOCK_DONE:
 
-    // Tree reduction
-    mov.u32 %r33, sdata;
-    shl.b32 %r34, %r2, 2;
-    add.u32 %r33, %r33, %r34;
-    st.shared.f32 [%r33], %f0;
+    // === Warp-shuffle reduction (256 threads -> 1 value, 1 bar.sync) ===
+    // Intra-warp reduction via shfl.sync.down (5 rounds per warp)
+    shfl.sync.down.b32 %f7, %f0, 16, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f7;
+    shfl.sync.down.b32 %f7, %f0, 8, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f7;
+    shfl.sync.down.b32 %f7, %f0, 4, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f7;
+    shfl.sync.down.b32 %f7, %f0, 2, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f7;
+    shfl.sync.down.b32 %f7, %f0, 1, 31, 0xffffffff;
+    add.rn.f32 %f0, %f0, %f7;
+    // Lane 0 of each warp writes to sdata[warp_id]
+    and.b32 %r33, %r2, 31;
+    setp.ne.u32 %p3, %r33, 0;
+    @%p3 bra Q6K_WARP_SKIP;
+    shr.u32 %r34, %r2, 5;
+    mov.u32 %r35, sdata;
+    shl.b32 %r36, %r34, 2;
+    add.u32 %r35, %r35, %r36;
+    st.shared.f32 [%r35], %f0;
+Q6K_WARP_SKIP:
     bar.sync 0;
-
-    mov.u32 %r35, 128;
-Q6K_RED:
-    setp.ge.u32 %p3, %r2, %r35;
-    @%p3 bra Q6K_RED_SKIP;
-    add.u32 %r36, %r2, %r35;
-    mov.u32 %r37, sdata;
-    shl.b32 %r38, %r36, 2;
-    add.u32 %r37, %r37, %r38;
-    ld.shared.f32 %f7, [%r37];
-    mov.u32 %r37, sdata;
-    shl.b32 %r38, %r2, 2;
-    add.u32 %r37, %r37, %r38;
-    ld.shared.f32 %f8, [%r37];
+    // First warp reduces 8 warp sums
+    setp.ge.u32 %p3, %r2, 8;
+    @%p3 bra Q6K_DONE;
+    mov.u32 %r35, sdata;
+    shl.b32 %r36, %r2, 2;
+    add.u32 %r35, %r35, %r36;
+    ld.shared.f32 %f8, [%r35];
+    shfl.sync.down.b32 %f7, %f8, 4, 31, 0xffffffff;
     add.rn.f32 %f8, %f8, %f7;
-    st.shared.f32 [%r37], %f8;
-Q6K_RED_SKIP:
-    bar.sync 0;
-    shr.u32 %r35, %r35, 1;
-    setp.ge.u32 %p3, %r35, 1;
-    @%p3 bra Q6K_RED;
-
+    shfl.sync.down.b32 %f7, %f8, 2, 31, 0xffffffff;
+    add.rn.f32 %f8, %f8, %f7;
+    shfl.sync.down.b32 %f7, %f8, 1, 31, 0xffffffff;
+    add.rn.f32 %f8, %f8, %f7;
+    // Thread 0 writes result
     setp.ne.u32 %p4, %r2, 0;
     @%p4 bra Q6K_DONE;
-    mov.u32 %r39, sdata;
-    ld.shared.f32 %f9, [%r39];
     mul.lo.u32 %r40, %r5, %r0;
     add.u32 %r40, %r40, %r4;
     mul.wide.u32 %rd17, %r40, 4;
     add.u64 %rd18, %rd2, %rd17;
-    st.global.f32 [%rd18], %f9;
+    st.global.f32 [%rd18], %f8;
 Q6K_DONE:
     ret;
 }
@@ -4078,7 +4116,7 @@ mod tests {
             "gemm_transpose",
             "gelu",
             "add_tensor",
-            "add_bias",
+            "add_bias_fused",
             "scale",
             "layer_norm",
             "softmax_rows",
