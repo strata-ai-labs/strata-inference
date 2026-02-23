@@ -77,7 +77,15 @@ pub struct CudaBackend {
     module: CUmodule,
     cublas: Option<CublasApi>,
 
-    // Pre-loaded kernel function handles (22 total)
+    /// Cached F32 dequantizations of quantized weight tensors.
+    /// Key = CudaBuffer.ptr (stable device pointer for model lifetime).
+    /// Uncontended in practice — inference is single-threaded.
+    dequant_cache: std::sync::Mutex<std::collections::HashMap<u64, DeviceTensor>>,
+
+    /// Set to true after a dequant cache allocation fails (OOM).
+    /// Once set, new weights are dequanted per-call (temp alloc) or use native kernels.
+
+    // Pre-loaded kernel function handles (24 total)
     fn_gemm: CUfunction,
     fn_gemm_transpose: CUfunction,
     fn_gelu: CUfunction,
@@ -101,6 +109,13 @@ pub struct CudaBackend {
     fn_l2_normalize: CUfunction,
     fn_embedding_lookup: CUfunction,
     fn_grouped_attn_decode: CUfunction,
+    fn_batched_causal_attention: CUfunction,
+    fn_quantized_matmul_q4_k: CUfunction,
+    fn_quantized_matmul_q5_k: CUfunction,
+    fn_quantized_matmul_q6_k: CUfunction,
+    fn_dequant_q4_k: CUfunction,
+    fn_dequant_q5_k: CUfunction,
+    fn_dequant_q6_k: CUfunction,
 }
 
 // SAFETY: All CUDA function handles are process-global, and the Driver API is
@@ -183,14 +198,22 @@ impl CudaBackend {
         let fn_l2_normalize = get_fn!("l2_normalize");
         let fn_embedding_lookup = get_fn!("embedding_lookup");
         let fn_grouped_attn_decode = get_fn!("grouped_attn_decode");
+        let fn_batched_causal_attention = get_fn!("batched_causal_attention");
+        let fn_quantized_matmul_q4_k = get_fn!("quantized_matmul_q4_k");
+        let fn_quantized_matmul_q5_k = get_fn!("quantized_matmul_q5_k");
+        let fn_quantized_matmul_q6_k = get_fn!("quantized_matmul_q6_k");
+        let fn_dequant_q4_k = get_fn!("dequant_q4_k");
+        let fn_dequant_q5_k = get_fn!("dequant_q5_k");
+        let fn_dequant_q6_k = get_fn!("dequant_q6_k");
 
-        debug!("CudaBackend initialized with 23 kernel functions");
+        debug!("CudaBackend initialized with 30 kernel functions");
 
         Ok(Self {
             api,
             stream,
             module,
             cublas,
+            dequant_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             fn_gemm,
             fn_gemm_transpose,
             fn_gelu,
@@ -214,6 +237,13 @@ impl CudaBackend {
             fn_l2_normalize,
             fn_embedding_lookup,
             fn_grouped_attn_decode,
+            fn_batched_causal_attention,
+            fn_quantized_matmul_q4_k,
+            fn_quantized_matmul_q5_k,
+            fn_quantized_matmul_q6_k,
+            fn_dequant_q4_k,
+            fn_dequant_q5_k,
+            fn_dequant_q6_k,
         })
     }
 
@@ -372,6 +402,49 @@ impl CudaBackend {
     }
 
     // -----------------------------------------------------------------------
+    // GPU dequant dispatch — expands Q4_K/Q5_K/Q6_K to F32 on GPU
+    // -----------------------------------------------------------------------
+
+    /// Launch a GPU dequant kernel to expand quantized weights to F32.
+    ///
+    /// Grid: (n_rows, blocks_per_row, 1), Block: (256, 1, 1).
+    /// Each thread dequantizes one element and writes to the output buffer.
+    fn launch_dequant(
+        &self,
+        dtype: TensorDtype,
+        weights_ptr: CUdeviceptr,
+        output_ptr: CUdeviceptr,
+        n_rows: usize,
+        k: usize,
+    ) {
+        let func = match dtype {
+            TensorDtype::Q4_K => self.fn_dequant_q4_k,
+            TensorDtype::Q5_K => self.fn_dequant_q5_k,
+            TensorDtype::Q6_K => self.fn_dequant_q6_k,
+            _ => panic!("launch_dequant: unsupported dtype {:?}", dtype),
+        };
+
+        let blocks_per_row = (k / 256) as u32;
+        let mut p_w = weights_ptr;
+        let mut p_out = output_ptr;
+        let mut p_n = n_rows as u32;
+        let mut p_k = k as u32;
+
+        let mut params: [*mut c_void; 4] = [
+            &mut p_w as *mut _ as *mut c_void,
+            &mut p_out as *mut _ as *mut c_void,
+            &mut p_n as *mut _ as *mut c_void,
+            &mut p_k as *mut _ as *mut c_void,
+        ];
+
+        let grid = (n_rows as u32, blocks_per_row, 1);
+        let block = (256, 1, 1);
+        unsafe {
+            self.launch(func, grid, block, 0, &mut params);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // RoPE dispatch helper — shared by rope() and rope_neox()
     // -----------------------------------------------------------------------
 
@@ -448,6 +521,10 @@ impl CudaBackend {
 // ---------------------------------------------------------------------------
 
 impl ComputeBackend for CudaBackend {
+    fn is_gpu(&self) -> bool {
+        true
+    }
+
     fn upload(&self, tensor: &Tensor) -> DeviceTensor {
         let shape = tensor.shape().to_vec();
         let dtype = tensor.dtype();
@@ -668,29 +745,32 @@ impl ComputeBackend for CudaBackend {
         // cuBLAS column-major: C^T = B * A^T, i.e.:
         // cublasSgemm(OP_T, OP_N, N, M, K, 1, B, K, A, K, 0, C, N)
         if let Some(ref cublas) = self.cublas {
-            if cublas
-                .sgemm(
-                    ffi::CUBLAS_OP_T,
-                    ffi::CUBLAS_OP_N,
-                    n as i32,
-                    m as i32,
-                    k as i32,
-                    1.0,
-                    b_buf.ptr,
-                    k as i32,
-                    a_buf.ptr,
-                    k as i32,
-                    0.0,
-                    out.ptr,
-                    n as i32,
-                )
-                .is_ok()
-            {
-                return Self::wrap(out, vec![m, n], TensorDtype::F32);
+            match cublas.sgemm(
+                ffi::CUBLAS_OP_T,
+                ffi::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                1.0,
+                b_buf.ptr,
+                k as i32,
+                a_buf.ptr,
+                k as i32,
+                0.0,
+                out.ptr,
+                n as i32,
+            ) {
+                Ok(()) => {
+                    return Self::wrap(out, vec![m, n], TensorDtype::F32);
+                }
+                Err(e) => {
+                    tracing::warn!(m, n, k, error = %e, "cuBLAS sgemm failed in matmul_transpose, using PTX fallback");
+                }
             }
         }
 
         // Fallback: PTX GEMM transpose kernel
+        trace!(m, n, k, "matmul_transpose: using PTX GEMM fallback");
         let mut p_a = a_buf.ptr;
         let mut p_b = b_buf.ptr;
         let mut p_c = out.ptr;
@@ -740,6 +820,51 @@ impl ComputeBackend for CudaBackend {
             k, weight_shape[1]
         );
 
+        let w_buf = Self::get_buf(weights);
+        let in_buf = Self::get_buf(input);
+
+        // === Cache check: all quantized types benefit from cached F32 + cuBLAS ===
+        let w_ptr = w_buf.ptr;
+        {
+            let cache = self.dequant_cache.lock().unwrap();
+            if let Some(cached) = cache.get(&w_ptr) {
+                return self.matmul_transpose(input, cached);
+            }
+        }
+
+        // === Try GPU dequant for Q4_K/Q5_K/Q6_K (has native dequant kernels) ===
+        if matches!(dtype, TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K) {
+            if let Ok(f32_buf) = self.alloc_zeros_f32(n * k) {
+                trace!(m, k, n, ?dtype, "CUDA quantized_matmul: GPU dequant + cuBLAS");
+                self.launch_dequant(dtype, w_buf.ptr, f32_buf.ptr, n, k);
+                let f32_dt = Self::wrap(f32_buf, vec![n, k], TensorDtype::F32);
+                let result = self.matmul_transpose(input, &f32_dt);
+                let mut cache = self.dequant_cache.lock().unwrap();
+                cache.insert(w_ptr, f32_dt);
+                return result;
+            }
+            // Alloc failed for this weight — fall through to native kernel.
+            // Don't set a global flag; smaller weights may still fit.
+        }
+
+        // === Try CPU dequant + cache for Q8_0/Q4_0 and other quantized types ===
+        if dtype.is_quantized()
+            && !matches!(dtype, TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K)
+        {
+            if let Ok(_test) = self.alloc_zeros_f32(n * k) {
+                drop(_test);
+                tracing::info!(?dtype, n, k, "CUDA: caching dequantized weights as F32");
+                let weights_host = self.download(weights);
+                let weights_f32 = weights_host.to_f32();
+                let weights_f32_dev = self.upload(&weights_f32);
+                let mut cache = self.dequant_cache.lock().unwrap();
+                cache.entry(w_ptr).or_insert(weights_f32_dev);
+                return self.matmul_transpose(input, cache.get(&w_ptr).unwrap());
+            }
+            // Alloc failed — fall through to native kernel
+        }
+
+        // === Native kernel fallback (when cache is full / OOM) ===
         let out = match self.alloc_zeros_f32(m * n) {
             Ok(buf) => buf,
             Err(e) => {
@@ -748,31 +873,18 @@ impl ComputeBackend for CudaBackend {
             }
         };
 
-        let w_buf = Self::get_buf(weights);
-        let in_buf = Self::get_buf(input);
-
         let func = match dtype {
             TensorDtype::Q8_0 => {
-                trace!(m, k, n, "CUDA quantized_matmul Q8_0");
+                trace!(m, k, n, "CUDA quantized_matmul Q8_0 (native)");
                 self.fn_quantized_matmul_q8_0
             }
             TensorDtype::Q4_0 => {
-                trace!(m, k, n, "CUDA quantized_matmul Q4_0");
+                trace!(m, k, n, "CUDA quantized_matmul Q4_0 (native)");
                 self.fn_quantized_matmul_q4_0
             }
-            _ if dtype.is_quantized() => {
-                // K-quant and other types without native CUDA kernels: dequant fallback.
-                // Download quantized weights from GPU, dequantize on CPU, re-upload as F32.
-                tracing::debug!(
-                    ?dtype,
-                    "CUDA quantized_matmul: no native kernel for {:?}, using dequant fallback",
-                    dtype
-                );
-                let weights_host = self.download(weights);
-                let weights_f32 = weights_host.to_f32();
-                let weights_f32_dev = self.upload(&weights_f32);
-                return self.matmul_transpose(input, &weights_f32_dev);
-            }
+            TensorDtype::Q4_K => self.fn_quantized_matmul_q4_k,
+            TensorDtype::Q5_K => self.fn_quantized_matmul_q5_k,
+            TensorDtype::Q6_K => self.fn_quantized_matmul_q6_k,
             _ => panic!("quantized_matmul: unsupported dtype {:?}", dtype),
         };
 
@@ -1375,18 +1487,49 @@ impl ComputeBackend for CudaBackend {
 
         trace!(vocab_size, hidden_size, n_tokens, "CUDA embedding_lookup");
 
-        // For quantized embedding tables, dequantize to F32 first and re-upload.
-        // The GPU kernel expects F32 input for simplicity.
-        let table_dt;
-        let effective_table = if table.dtype() != TensorDtype::F32 {
-            // Download, dequantize, re-upload
+        // For quantized embedding tables: GPU-dequant and cache, then use CUDA lookup.
+        if table.dtype() != TensorDtype::F32 {
+            let dtype = table.dtype();
+            let w_ptr = Self::get_buf(table).ptr;
+
+            // Check if we have a cached F32 table
+            {
+                let cache = self.dequant_cache.lock().unwrap();
+                if let Some(cached) = cache.get(&w_ptr) {
+                    // Use the F32 CUDA embedding lookup on the cached table
+                    return self.embedding_lookup(cached, ids);
+                }
+            }
+
+            // Try GPU dequant for supported types
+            if matches!(dtype, TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K) {
+                if let Ok(f32_buf) = self.alloc_zeros_f32(vocab_size * hidden_size) {
+                    self.launch_dequant(dtype, w_ptr, f32_buf.ptr, vocab_size, hidden_size);
+                    let f32_dt = Self::wrap(f32_buf, vec![vocab_size, hidden_size], TensorDtype::F32);
+                    let result = self.embedding_lookup(&f32_dt, ids);
+                    let mut cache = self.dequant_cache.lock().unwrap();
+                    cache.insert(w_ptr, f32_dt);
+                    return result;
+                }
+            }
+
+            // Fallback: CPU dequant (slow but correct)
             let tensor = self.download(table);
             let f32_tensor = tensor.to_f32();
-            table_dt = self.upload(&f32_tensor);
-            &table_dt
-        } else {
-            table
-        };
+            let f32_data = f32_tensor.as_f32();
+            let mut result_data = Vec::with_capacity(n_tokens * hidden_size);
+            for &id in ids {
+                let start = id as usize * hidden_size;
+                result_data.extend_from_slice(&f32_data[start..start + hidden_size]);
+            }
+            let result = crate::tensor::Tensor::new(
+                vec![n_tokens, hidden_size],
+                result_data,
+            );
+            return self.upload(&result);
+        }
+
+        let table_dev_ptr = Self::get_buf(table).ptr;
 
         // Upload token IDs
         let ids_buf = match self.upload_u32(ids) {
@@ -1405,9 +1548,7 @@ impl ComputeBackend for CudaBackend {
             }
         };
 
-        let table_buf = Self::get_buf(effective_table);
-
-        let mut p_table = table_buf.ptr;
+        let mut p_table = table_dev_ptr;
         let mut p_ids = ids_buf.ptr;
         let mut p_out = out.ptr;
         let mut p_n_tokens = n_tokens as u32;
@@ -1718,6 +1859,86 @@ impl ComputeBackend for CudaBackend {
         Self::wrap(out, vec![1, total_dim], TensorDtype::F32)
     }
 
+    fn batched_causal_attention(
+        &self,
+        q: &DeviceTensor,
+        k_cache: &DeviceTensor,
+        v_cache: &DeviceTensor,
+        n_tokens: usize,
+        total_len: usize,
+        pos_offset: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        attn_scale: f32,
+        softcap: f32,
+    ) -> DeviceTensor {
+        assert!(
+            head_dim <= 256,
+            "batched_causal_attention: head_dim {} exceeds max block size 256",
+            head_dim
+        );
+        let total_dim = num_heads * head_dim;
+
+        let out = match self.alloc_zeros_f32(n_tokens * total_dim) {
+            Ok(buf) => buf,
+            Err(e) => {
+                tracing::warn!(error = %e, "CUDA: batched_causal_attention alloc failed");
+                panic!(
+                    "CUDA: failed to allocate batched_causal_attention output: {}",
+                    e
+                );
+            }
+        };
+
+        let q_buf = Self::get_buf(q);
+        let k_buf = Self::get_buf(k_cache);
+        let v_buf = Self::get_buf(v_cache);
+
+        let mut p_q = q_buf.ptr;
+        let mut p_k = k_buf.ptr;
+        let mut p_v = v_buf.ptr;
+        let mut p_out = out.ptr;
+        let mut p_num_heads = num_heads as u32;
+        let mut p_num_kv_heads = num_kv_heads as u32;
+        let mut p_head_dim = head_dim as u32;
+        let mut p_n_tokens = n_tokens as u32;
+        let mut p_total_len = total_len as u32;
+        let mut p_pos_offset = pos_offset as u32;
+        let mut p_attn_scale = attn_scale;
+        let mut p_softcap = softcap;
+
+        let mut params: [*mut c_void; 12] = [
+            &mut p_q as *mut _ as *mut c_void,
+            &mut p_k as *mut _ as *mut c_void,
+            &mut p_v as *mut _ as *mut c_void,
+            &mut p_out as *mut _ as *mut c_void,
+            &mut p_num_heads as *mut _ as *mut c_void,
+            &mut p_num_kv_heads as *mut _ as *mut c_void,
+            &mut p_head_dim as *mut _ as *mut c_void,
+            &mut p_n_tokens as *mut _ as *mut c_void,
+            &mut p_total_len as *mut _ as *mut c_void,
+            &mut p_pos_offset as *mut _ as *mut c_void,
+            &mut p_attn_scale as *mut _ as *mut c_void,
+            &mut p_softcap as *mut _ as *mut c_void,
+        ];
+
+        // One block per (head, query_token) pair, 256 threads per block
+        let grid = (num_heads as u32 * n_tokens as u32, 1, 1);
+        let block = (256, 1, 1);
+        unsafe {
+            self.launch(
+                self.fn_batched_causal_attention,
+                grid,
+                block,
+                0,
+                &mut params,
+            );
+        }
+
+        Self::wrap(out, vec![n_tokens, total_dim], TensorDtype::F32)
+    }
+
     fn create_buffer_empty(
         &self,
         byte_size: usize,
@@ -1754,6 +1975,10 @@ impl Drop for CudaBackend {
     fn drop(&mut self) {
         // Synchronize before cleanup to ensure all work is complete.
         let _ = self.api.stream_synchronize(self.stream);
+
+        // Clear dequant cache BEFORE destroying the stream — CudaBuffers inside
+        // need the stream alive for cuMemFreeAsync.
+        self.dequant_cache.lock().unwrap().clear();
 
         // Drop cuBLAS BEFORE destroying the stream it's bound to.
         // cublasDestroy may synchronize on the stream internally.

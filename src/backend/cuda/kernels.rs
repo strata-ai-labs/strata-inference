@@ -1275,6 +1275,642 @@ QMQ4_DONE:
 }
 
 // -------------------------------------------------------------------------
+// quantized_matmul_q4_k: Fused Q4_K dequantize + matrix multiply
+//
+// Q4_K block layout (144 bytes per block of 256 values):
+//   [0:2]   d    (f16) -- super-block scale
+//   [2:4]   dmin (f16) -- super-block min
+//   [4:16]  scales[12] -- packed 6-bit sub-block scales/mins (8 pairs)
+//   [16:144] qs[128]   -- 256 x 4-bit values (low/high nibbles)
+//
+// Scale extraction (get_scale_min_k4):
+//   j < 4: sc = scales[j] & 63,               m = scales[j+4] & 63
+//   j >= 4: sc = (scales[j+4]&0xF)|((scales[j-4]>>6)<<4)
+//           m  = (scales[j+4]>>4)|((scales[j]>>6)<<4)
+//
+// Dequant: val = d * sc * q_nibble - dmin * m
+//
+// Each block of 256 threads processes one output element [i,j].
+// Thread tid handles element tid within each Q4_K super-block.
+//
+// Grid:  (N, M, 1)
+// Block: (256, 1, 1)
+// -------------------------------------------------------------------------
+.visible .entry quantized_matmul_q4_k(
+    .param .u64 param_weights,
+    .param .u64 param_input,
+    .param .u64 param_output,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .u64 %rd<20>;
+    .reg .u32 %r<40>;
+    .reg .f32 %f<16>;
+    .reg .f16 %h0, %h1;
+    .reg .pred %p<6>;
+    .shared .align 4 .f32 sdata[256];
+
+    ld.param.u64 %rd0, [param_weights];
+    ld.param.u64 %rd1, [param_input];
+    ld.param.u64 %rd2, [param_output];
+    ld.param.u32 %r0, [param_N];
+    ld.param.u32 %r1, [param_K];
+
+    mov.u32 %r2, %tid.x;          // tid (0-255)
+    mov.u32 %r4, %ctaid.x;        // j (weight row / output col)
+    mov.u32 %r5, %ctaid.y;        // i (input row)
+
+    // blocks_per_row = K / 256 = K >> 8
+    shr.u32 %r6, %r1, 8;
+
+    // bytes_per_row = blocks_per_row * 144
+    mul.lo.u32 %r7, %r6, 144;
+
+    // Weight row base: &weights[j * bytes_per_row]
+    mul.lo.u32 %r8, %r4, %r7;
+    cvt.u64.u32 %rd3, %r8;
+    add.u64 %rd4, %rd0, %rd3;
+
+    // Input row base: &input[i * K]
+    mul.lo.u32 %r9, %r5, %r1;
+    mul.wide.u32 %rd5, %r9, 4;
+    add.u64 %rd6, %rd1, %rd5;
+
+    // Decompose tid for Q4_K block structure:
+    // chunk = tid / 64 (0-3)
+    shr.u32 %r11, %r2, 6;
+    // local = tid % 64 (0-63)
+    and.b32 %r12, %r2, 63;
+    // is_low_nibble: local < 32
+    setp.lt.u32 %p0, %r12, 32;
+    // l = is_low ? local : (local - 32)
+    @%p0 mov.u32 %r13, %r12;
+    @!%p0 sub.u32 %r13, %r12, 32;
+    // q_off = chunk * 32 (byte offset within qs[128])
+    shl.b32 %r14, %r11, 5;
+    // scale_idx = chunk * 2 + (is_low ? 0 : 1)
+    shl.b32 %r15, %r11, 1;
+    @!%p0 add.u32 %r15, %r15, 1;
+
+    // Initialize partial sum
+    mov.f32 %f0, 0f00000000;
+
+    // Loop over Q4_K super-blocks
+    mov.u32 %r10, 0;
+Q4K_BLOCK_LOOP:
+    setp.ge.u32 %p1, %r10, %r6;
+    @%p1 bra Q4K_BLOCK_DONE;
+
+    // Block address: weight_row + block_idx * 144
+    mul.lo.u32 %r16, %r10, 144;
+    cvt.u64.u32 %rd7, %r16;
+    add.u64 %rd8, %rd4, %rd7;
+
+    // Load d (f16) at offset 0, dmin (f16) at offset 2
+    ld.global.b16 %h0, [%rd8];
+    ld.global.b16 %h1, [%rd8+2];
+    cvt.f32.f16 %f1, %h0;           // d as f32
+    cvt.f32.f16 %f2, %h1;           // dmin as f32
+
+    // --- Extract scale and min for this thread's scale_idx ---
+    // scales[12] at block + 4; load scales[j], scales[j+4], and scales[j-4] if needed
+    add.u64 %rd9, %rd8, 4;          // &scales[0]
+
+    // Load scales[scale_idx]
+    cvt.u64.u32 %rd10, %r15;
+    add.u64 %rd11, %rd9, %rd10;
+    ld.global.u8 %r17, [%rd11];     // scales[j]
+
+    // Load scales[scale_idx + 4]
+    add.u64 %rd12, %rd11, 4;
+    ld.global.u8 %r18, [%rd12];     // scales[j+4]
+
+    // Branch: j < 4 vs j >= 4
+    setp.lt.u32 %p2, %r15, 4;
+    @%p2 bra Q4K_SCALE_LOW;
+
+    // j >= 4 path:
+    // Load scales[j-4]
+    sub.u64 %rd13, %rd11, 4;
+    ld.global.u8 %r19, [%rd13];
+
+    // sc = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
+    and.b32 %r20, %r18, 0xF;
+    shr.u32 %r21, %r19, 6;
+    shl.b32 %r21, %r21, 4;
+    or.b32 %r22, %r20, %r21;
+
+    // m = (scales[j+4] >> 4) | ((scales[j] >> 6) << 4)
+    shr.u32 %r23, %r18, 4;
+    shr.u32 %r24, %r17, 6;
+    shl.b32 %r24, %r24, 4;
+    or.b32 %r25, %r23, %r24;
+    bra Q4K_SCALE_DONE;
+
+Q4K_SCALE_LOW:
+    // j < 4 path:
+    // sc = scales[j] & 63
+    and.b32 %r22, %r17, 63;
+    // m = scales[j+4] & 63
+    and.b32 %r25, %r18, 63;
+
+Q4K_SCALE_DONE:
+    // %r22 = sc, %r25 = m_val
+
+    // Load qs byte: qs[q_off + l] at block + 16 + q_off + l
+    add.u32 %r26, %r14, %r13;       // q_off + l
+    add.u32 %r26, %r26, 16;         // + 16 (header size: 2+2+12)
+    cvt.u64.u32 %rd14, %r26;
+    add.u64 %rd15, %rd8, %rd14;
+    ld.global.u8 %r27, [%rd15];
+
+    // Extract nibble: low if is_low, high otherwise
+    @%p0 and.b32 %r28, %r27, 0xF;
+    @!%p0 shr.u32 %r28, %r27, 4;
+
+    // Dequantize: val = d * sc * q - dmin * m
+    cvt.rn.f32.u32 %f3, %r22;       // sc as f32
+    cvt.rn.f32.u32 %f4, %r25;       // m as f32
+    cvt.rn.f32.u32 %f5, %r28;       // q as f32
+    mul.rn.f32 %f6, %f1, %f3;       // d * sc
+    mul.rn.f32 %f7, %f6, %f5;       // d * sc * q
+    mul.rn.f32 %f8, %f2, %f4;       // dmin * m
+    sub.rn.f32 %f9, %f7, %f8;       // val
+
+    // Load input element: input[i*K + block_idx*256 + tid]
+    shl.b32 %r29, %r10, 8;          // block_idx * 256
+    add.u32 %r29, %r29, %r2;        // + tid
+    mul.wide.u32 %rd16, %r29, 4;
+    add.u64 %rd17, %rd6, %rd16;
+    ld.global.f32 %f10, [%rd17];
+
+    // partial_sum += val * input
+    fma.rn.f32 %f0, %f9, %f10, %f0;
+
+    // Next super-block
+    add.u32 %r10, %r10, 1;
+    bra Q4K_BLOCK_LOOP;
+Q4K_BLOCK_DONE:
+
+    // === Shared-memory tree reduction ===
+    mov.u32 %r30, sdata;
+    shl.b32 %r31, %r2, 2;
+    add.u32 %r30, %r30, %r31;
+    st.shared.f32 [%r30], %f0;
+    bar.sync 0;
+
+    mov.u32 %r32, 128;
+Q4K_RED:
+    setp.ge.u32 %p3, %r2, %r32;
+    @%p3 bra Q4K_RED_SKIP;
+    add.u32 %r33, %r2, %r32;
+    mov.u32 %r34, sdata;
+    shl.b32 %r35, %r33, 2;
+    add.u32 %r34, %r34, %r35;
+    ld.shared.f32 %f11, [%r34];
+    mov.u32 %r34, sdata;
+    shl.b32 %r35, %r2, 2;
+    add.u32 %r34, %r34, %r35;
+    ld.shared.f32 %f12, [%r34];
+    add.rn.f32 %f12, %f12, %f11;
+    st.shared.f32 [%r34], %f12;
+Q4K_RED_SKIP:
+    bar.sync 0;
+    shr.u32 %r32, %r32, 1;
+    setp.ge.u32 %p3, %r32, 1;
+    @%p3 bra Q4K_RED;
+
+    // Thread 0 writes result
+    setp.ne.u32 %p4, %r2, 0;
+    @%p4 bra Q4K_DONE;
+    mov.u32 %r36, sdata;
+    ld.shared.f32 %f13, [%r36];
+    // output[i * N + j]
+    mul.lo.u32 %r37, %r5, %r0;
+    add.u32 %r37, %r37, %r4;
+    mul.wide.u32 %rd18, %r37, 4;
+    add.u64 %rd19, %rd2, %rd18;
+    st.global.f32 [%rd19], %f13;
+Q4K_DONE:
+    ret;
+}
+
+// -------------------------------------------------------------------------
+// quantized_matmul_q5_k: Fused Q5_K dequantize + matrix multiply
+//
+// Q5_K block layout (176 bytes per block of 256 values):
+//   [0:2]   d    (f16) -- super-block scale
+//   [2:4]   dmin (f16) -- super-block min
+//   [4:16]  scales[12] -- packed 6-bit sub-block scales/mins (same as Q4_K)
+//   [16:48] qh[32]     -- high bit per value (1 bit each, packed in bytes)
+//   [48:176] qs[128]   -- low 4-bit values (same as Q4_K)
+//
+// Dequant: val = d * sc * (q_low + high*16) - dmin * m
+//   high = (qh[l] >> bit_pos) & 1
+//   bit_pos for low_nibble:  chunk * 2
+//   bit_pos for high_nibble: chunk * 2 + 1
+//
+// Grid:  (N, M, 1)
+// Block: (256, 1, 1)
+// -------------------------------------------------------------------------
+.visible .entry quantized_matmul_q5_k(
+    .param .u64 param_weights,
+    .param .u64 param_input,
+    .param .u64 param_output,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .u64 %rd<20>;
+    .reg .u32 %r<42>;
+    .reg .f32 %f<16>;
+    .reg .f16 %h0, %h1;
+    .reg .pred %p<6>;
+    .shared .align 4 .f32 sdata[256];
+
+    ld.param.u64 %rd0, [param_weights];
+    ld.param.u64 %rd1, [param_input];
+    ld.param.u64 %rd2, [param_output];
+    ld.param.u32 %r0, [param_N];
+    ld.param.u32 %r1, [param_K];
+
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r4, %ctaid.x;        // j (weight row)
+    mov.u32 %r5, %ctaid.y;        // i (input row)
+
+    // blocks_per_row = K >> 8
+    shr.u32 %r6, %r1, 8;
+
+    // bytes_per_row = blocks_per_row * 176
+    mul.lo.u32 %r7, %r6, 176;
+
+    // Weight row base
+    mul.lo.u32 %r8, %r4, %r7;
+    cvt.u64.u32 %rd3, %r8;
+    add.u64 %rd4, %rd0, %rd3;
+
+    // Input row base
+    mul.lo.u32 %r9, %r5, %r1;
+    mul.wide.u32 %rd5, %r9, 4;
+    add.u64 %rd6, %rd1, %rd5;
+
+    // Decompose tid (same as Q4_K)
+    shr.u32 %r11, %r2, 6;         // chunk
+    and.b32 %r12, %r2, 63;        // local
+    setp.lt.u32 %p0, %r12, 32;    // is_low
+    @%p0 mov.u32 %r13, %r12;      // l
+    @!%p0 sub.u32 %r13, %r12, 32;
+    shl.b32 %r14, %r11, 5;        // q_off = chunk*32
+    shl.b32 %r15, %r11, 1;        // scale_idx = chunk*2
+    @!%p0 add.u32 %r15, %r15, 1;  // + 1 if high nibble
+
+    // qh bit mask: 1 << scale_idx (= 1 << (chunk*2 + nibble))
+    mov.u32 %r38, 1;
+    shl.b32 %r38, %r38, %r15;     // qh_mask
+
+    mov.f32 %f0, 0f00000000;
+    mov.u32 %r10, 0;
+Q5K_BLOCK_LOOP:
+    setp.ge.u32 %p1, %r10, %r6;
+    @%p1 bra Q5K_BLOCK_DONE;
+
+    // Block address
+    mul.lo.u32 %r16, %r10, 176;
+    cvt.u64.u32 %rd7, %r16;
+    add.u64 %rd8, %rd4, %rd7;
+
+    // Load d, dmin
+    ld.global.b16 %h0, [%rd8];
+    ld.global.b16 %h1, [%rd8+2];
+    cvt.f32.f16 %f1, %h0;
+    cvt.f32.f16 %f2, %h1;
+
+    // Scale extraction (identical to Q4_K)
+    add.u64 %rd9, %rd8, 4;
+    cvt.u64.u32 %rd10, %r15;
+    add.u64 %rd11, %rd9, %rd10;
+    ld.global.u8 %r17, [%rd11];
+    add.u64 %rd12, %rd11, 4;
+    ld.global.u8 %r18, [%rd12];
+
+    setp.lt.u32 %p2, %r15, 4;
+    @%p2 bra Q5K_SCALE_LOW;
+
+    sub.u64 %rd13, %rd11, 4;
+    ld.global.u8 %r19, [%rd13];
+    and.b32 %r20, %r18, 0xF;
+    shr.u32 %r21, %r19, 6;
+    shl.b32 %r21, %r21, 4;
+    or.b32 %r22, %r20, %r21;
+    shr.u32 %r23, %r18, 4;
+    shr.u32 %r24, %r17, 6;
+    shl.b32 %r24, %r24, 4;
+    or.b32 %r25, %r23, %r24;
+    bra Q5K_SCALE_DONE;
+
+Q5K_SCALE_LOW:
+    and.b32 %r22, %r17, 63;
+    and.b32 %r25, %r18, 63;
+
+Q5K_SCALE_DONE:
+
+    // Load qs byte: qs[q_off + l] at block + 48 + q_off + l
+    add.u32 %r26, %r14, %r13;
+    add.u32 %r26, %r26, 48;       // qs start at offset 48 (2+2+12+32)
+    cvt.u64.u32 %rd14, %r26;
+    add.u64 %rd15, %rd8, %rd14;
+    ld.global.u8 %r27, [%rd15];
+
+    // Extract low nibble
+    @%p0 and.b32 %r28, %r27, 0xF;
+    @!%p0 shr.u32 %r28, %r27, 4;
+
+    // Load qh byte: qh[l] at block + 16 + l
+    add.u32 %r39, %r13, 16;       // qh start at offset 16
+    cvt.u64.u32 %rd14, %r39;
+    add.u64 %rd15, %rd8, %rd14;
+    ld.global.u8 %r40, [%rd15];
+
+    // high = (qh[l] & qh_mask) ? 16 : 0
+    and.b32 %r41, %r40, %r38;
+    setp.ne.u32 %p4, %r41, 0;
+    selp.u32 %r41, 16, 0, %p4;
+
+    // q_total = q_low + high
+    add.u32 %r28, %r28, %r41;
+
+    // Dequantize: val = d * sc * q_total - dmin * m
+    cvt.rn.f32.u32 %f3, %r22;
+    cvt.rn.f32.u32 %f4, %r25;
+    cvt.rn.f32.u32 %f5, %r28;
+    mul.rn.f32 %f6, %f1, %f3;
+    mul.rn.f32 %f7, %f6, %f5;
+    mul.rn.f32 %f8, %f2, %f4;
+    sub.rn.f32 %f9, %f7, %f8;
+
+    // Load input element
+    shl.b32 %r29, %r10, 8;
+    add.u32 %r29, %r29, %r2;
+    mul.wide.u32 %rd16, %r29, 4;
+    add.u64 %rd17, %rd6, %rd16;
+    ld.global.f32 %f10, [%rd17];
+
+    fma.rn.f32 %f0, %f9, %f10, %f0;
+
+    add.u32 %r10, %r10, 1;
+    bra Q5K_BLOCK_LOOP;
+Q5K_BLOCK_DONE:
+
+    // Tree reduction (same pattern)
+    mov.u32 %r30, sdata;
+    shl.b32 %r31, %r2, 2;
+    add.u32 %r30, %r30, %r31;
+    st.shared.f32 [%r30], %f0;
+    bar.sync 0;
+
+    mov.u32 %r32, 128;
+Q5K_RED:
+    setp.ge.u32 %p3, %r2, %r32;
+    @%p3 bra Q5K_RED_SKIP;
+    add.u32 %r33, %r2, %r32;
+    mov.u32 %r34, sdata;
+    shl.b32 %r35, %r33, 2;
+    add.u32 %r34, %r34, %r35;
+    ld.shared.f32 %f11, [%r34];
+    mov.u32 %r34, sdata;
+    shl.b32 %r35, %r2, 2;
+    add.u32 %r34, %r34, %r35;
+    ld.shared.f32 %f12, [%r34];
+    add.rn.f32 %f12, %f12, %f11;
+    st.shared.f32 [%r34], %f12;
+Q5K_RED_SKIP:
+    bar.sync 0;
+    shr.u32 %r32, %r32, 1;
+    setp.ge.u32 %p3, %r32, 1;
+    @%p3 bra Q5K_RED;
+
+    setp.ne.u32 %p4, %r2, 0;
+    @%p4 bra Q5K_DONE;
+    mov.u32 %r36, sdata;
+    ld.shared.f32 %f13, [%r36];
+    mul.lo.u32 %r37, %r5, %r0;
+    add.u32 %r37, %r37, %r4;
+    mul.wide.u32 %rd18, %r37, 4;
+    add.u64 %rd19, %rd2, %rd18;
+    st.global.f32 [%rd19], %f13;
+Q5K_DONE:
+    ret;
+}
+
+// -------------------------------------------------------------------------
+// quantized_matmul_q6_k: Fused Q6_K dequantize + matrix multiply
+//
+// Q6_K block layout (210 bytes per block of 256 values):
+//   [0:128]   ql[128]    -- low 4-bit values (packed nibbles)
+//   [128:192] qh[64]     -- high 2-bit values (packed 2-bit pairs)
+//   [192:208] scales[16] -- signed i8, one per 16-element group
+//   [208:210] d (f16)    -- super-block scale
+//
+// Organization: 2 chunks of 128 elements. Each chunk has 4 sub-groups of 32:
+//   sub 0 (pos 0-31):   low nibble of ql[off+l],     qh bits 0-1, scales[off+is]
+//   sub 1 (pos 32-63):  low nibble of ql[off+l+32],  qh bits 2-3, scales[off+is+2]
+//   sub 2 (pos 64-95):  high nibble of ql[off+l],    qh bits 4-5, scales[off+is+4]
+//   sub 3 (pos 96-127): high nibble of ql[off+l+32], qh bits 6-7, scales[off+is+6]
+//
+// Dequant: val = d * scales[sc_idx] * ((ql_nibble | (qh_bits << 4)) - 32)
+//
+// Grid:  (N, M, 1)
+// Block: (256, 1, 1)
+// -------------------------------------------------------------------------
+.visible .entry quantized_matmul_q6_k(
+    .param .u64 param_weights,
+    .param .u64 param_input,
+    .param .u64 param_output,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .u64 %rd<20>;
+    .reg .u32 %r<44>;
+    .reg .f32 %f<16>;
+    .reg .f16 %h0;
+    .reg .pred %p<6>;
+    .shared .align 4 .f32 sdata[256];
+
+    ld.param.u64 %rd0, [param_weights];
+    ld.param.u64 %rd1, [param_input];
+    ld.param.u64 %rd2, [param_output];
+    ld.param.u32 %r0, [param_N];
+    ld.param.u32 %r1, [param_K];
+
+    mov.u32 %r2, %tid.x;          // tid (0-255)
+    mov.u32 %r4, %ctaid.x;        // j (weight row)
+    mov.u32 %r5, %ctaid.y;        // i (input row)
+
+    // blocks_per_row = K >> 8
+    shr.u32 %r6, %r1, 8;
+
+    // bytes_per_row = blocks_per_row * 210
+    mul.lo.u32 %r7, %r6, 210;
+
+    // Weight row base
+    mul.lo.u32 %r8, %r4, %r7;
+    cvt.u64.u32 %rd3, %r8;
+    add.u64 %rd4, %rd0, %rd3;
+
+    // Input row base
+    mul.lo.u32 %r9, %r5, %r1;
+    mul.wide.u32 %rd5, %r9, 4;
+    add.u64 %rd6, %rd1, %rd5;
+
+    // Decompose tid into Q6_K position:
+    // chunk = tid / 128 (0 or 1)
+    shr.u32 %r11, %r2, 7;
+    // pos_in_chunk = tid % 128
+    and.b32 %r12, %r2, 127;
+    // sub = pos_in_chunk / 32 (0-3)
+    shr.u32 %r13, %r12, 5;
+    // l = pos_in_chunk % 32 (0-31)
+    and.b32 %r14, %r12, 31;
+
+    // ql_off = chunk * 64
+    shl.b32 %r15, %r11, 6;
+    // qh_off = chunk * 32
+    shl.b32 %r16, %r11, 5;
+    // sc_off = chunk * 8
+    shl.b32 %r17, %r11, 3;
+    // is = l / 16 (0 or 1)
+    shr.u32 %r18, %r14, 4;
+
+    // ql byte index: ql_off + l + (sub & 1) * 32
+    and.b32 %r19, %r13, 1;
+    shl.b32 %r19, %r19, 5;         // (sub & 1) * 32
+    add.u32 %r19, %r19, %r15;      // + ql_off
+    add.u32 %r19, %r19, %r14;      // + l
+    // %r19 = ql byte index within ql[128]
+
+    // use_high_nibble = (sub >= 2)
+    setp.ge.u32 %p0, %r13, 2;
+
+    // qh shift = sub * 2
+    shl.b32 %r20, %r13, 1;         // sub * 2
+
+    // scale index = sc_off + is + sub * 2
+    add.u32 %r21, %r17, %r18;      // sc_off + is
+    add.u32 %r21, %r21, %r20;      // + sub * 2
+    // %r21 = scale index within scales[16]
+
+    mov.f32 %f0, 0f00000000;
+    mov.u32 %r10, 0;
+Q6K_BLOCK_LOOP:
+    setp.ge.u32 %p1, %r10, %r6;
+    @%p1 bra Q6K_BLOCK_DONE;
+
+    // Block address: weight_row + block_idx * 210
+    mul.lo.u32 %r22, %r10, 210;
+    cvt.u64.u32 %rd7, %r22;
+    add.u64 %rd8, %rd4, %rd7;
+
+    // Load d (f16) at block + 208
+    ld.global.b16 %h0, [%rd8+208];
+    cvt.f32.f16 %f1, %h0;           // d as f32
+
+    // Load ql byte at block + ql_byte_index
+    cvt.u64.u32 %rd9, %r19;
+    add.u64 %rd10, %rd8, %rd9;
+    ld.global.u8 %r23, [%rd10];
+
+    // Extract nibble
+    @%p0 shr.u32 %r24, %r23, 4;     // high nibble
+    @!%p0 mov.u32 %r24, %r23;
+    and.b32 %r24, %r24, 0xF;         // mask to 4 bits
+
+    // Load qh byte at block + 128 + qh_off + l
+    add.u32 %r25, %r16, %r14;        // qh_off + l
+    add.u32 %r25, %r25, 128;         // + 128 (qh starts at offset 128)
+    cvt.u64.u32 %rd11, %r25;
+    add.u64 %rd12, %rd8, %rd11;
+    ld.global.u8 %r26, [%rd12];
+
+    // Extract 2 high bits: (qh_byte >> qh_shift) & 3
+    shr.u32 %r27, %r26, %r20;
+    and.b32 %r27, %r27, 3;
+
+    // q6 = ql_nibble | (qh_bits << 4)
+    shl.b32 %r28, %r27, 4;
+    or.b32 %r28, %r24, %r28;
+
+    // q6_centered = q6 - 32 (signed)
+    sub.u32 %r29, %r28, 32;
+
+    // Load scale (signed i8) at block + 192 + scale_index
+    add.u32 %r30, %r21, 192;
+    cvt.u64.u32 %rd13, %r30;
+    add.u64 %rd14, %rd8, %rd13;
+    ld.global.s8 %r31, [%rd14];      // signed byte
+
+    // Dequantize: val = d * sc * q6_centered
+    cvt.rn.f32.s32 %f2, %r31;        // sc as f32 (signed)
+    cvt.rn.f32.s32 %f3, %r29;        // q6_centered as f32 (signed)
+    mul.rn.f32 %f4, %f1, %f2;        // d * sc
+    mul.rn.f32 %f5, %f4, %f3;        // d * sc * q6_centered
+
+    // Load input element
+    shl.b32 %r32, %r10, 8;           // block_idx * 256
+    add.u32 %r32, %r32, %r2;         // + tid
+    mul.wide.u32 %rd15, %r32, 4;
+    add.u64 %rd16, %rd6, %rd15;
+    ld.global.f32 %f6, [%rd16];
+
+    fma.rn.f32 %f0, %f5, %f6, %f0;
+
+    add.u32 %r10, %r10, 1;
+    bra Q6K_BLOCK_LOOP;
+Q6K_BLOCK_DONE:
+
+    // Tree reduction
+    mov.u32 %r33, sdata;
+    shl.b32 %r34, %r2, 2;
+    add.u32 %r33, %r33, %r34;
+    st.shared.f32 [%r33], %f0;
+    bar.sync 0;
+
+    mov.u32 %r35, 128;
+Q6K_RED:
+    setp.ge.u32 %p3, %r2, %r35;
+    @%p3 bra Q6K_RED_SKIP;
+    add.u32 %r36, %r2, %r35;
+    mov.u32 %r37, sdata;
+    shl.b32 %r38, %r36, 2;
+    add.u32 %r37, %r37, %r38;
+    ld.shared.f32 %f7, [%r37];
+    mov.u32 %r37, sdata;
+    shl.b32 %r38, %r2, 2;
+    add.u32 %r37, %r37, %r38;
+    ld.shared.f32 %f8, [%r37];
+    add.rn.f32 %f8, %f8, %f7;
+    st.shared.f32 [%r37], %f8;
+Q6K_RED_SKIP:
+    bar.sync 0;
+    shr.u32 %r35, %r35, 1;
+    setp.ge.u32 %p3, %r35, 1;
+    @%p3 bra Q6K_RED;
+
+    setp.ne.u32 %p4, %r2, 0;
+    @%p4 bra Q6K_DONE;
+    mov.u32 %r39, sdata;
+    ld.shared.f32 %f9, [%r39];
+    mul.lo.u32 %r40, %r5, %r0;
+    add.u32 %r40, %r40, %r4;
+    mul.wide.u32 %rd17, %r40, 4;
+    add.u64 %rd18, %rd2, %rd17;
+    st.global.f32 [%rd18], %f9;
+Q6K_DONE:
+    ret;
+}
+
+// -------------------------------------------------------------------------
 // rms_norm: per-row RMSNorm
 //   out[c] = x[c] * rsqrt(mean(x^2) + eps) * w[c]
 //
@@ -2463,6 +3099,636 @@ GAD_EXIT:
     ret;
 }
 
+// -------------------------------------------------------------------------
+// batched_causal_attention: multi-token prefill with online softmax
+//
+// Fused Q@K^T + causal mask + softmax + @V for multiple query tokens.
+// Ported from Metal kernel. Uses online softmax (single pass, no separate
+// max-find pass) for numerical stability and efficiency.
+//
+// Parameters:
+//   Q          (.u64)  [n_tokens, num_heads * head_dim]
+//   K          (.u64)  [max_len, num_kv_heads * head_dim]
+//   V          (.u64)  [max_len, num_kv_heads * head_dim]
+//   output     (.u64)  [n_tokens, num_heads * head_dim]
+//   num_heads     (.u32)
+//   num_kv_heads  (.u32)
+//   head_dim      (.u32)
+//   n_tokens      (.u32)
+//   total_len     (.u32)
+//   pos_offset    (.u32)
+//   attn_scale    (.f32)
+//   softcap       (.f32)
+//
+// Grid:  (num_heads * n_tokens, 1, 1) -- one block per (head, query_token)
+// Block: (256, 1, 1)
+// -------------------------------------------------------------------------
+.visible .entry batched_causal_attention(
+    .param .u64 param_Q,
+    .param .u64 param_K,
+    .param .u64 param_V,
+    .param .u64 param_output,
+    .param .u32 param_num_heads,
+    .param .u32 param_num_kv_heads,
+    .param .u32 param_head_dim,
+    .param .u32 param_n_tokens,
+    .param .u32 param_total_len,
+    .param .u32 param_pos_offset,
+    .param .f32 param_attn_scale,
+    .param .f32 param_softcap
+)
+{
+    .reg .u64 %rd<20>;
+    .reg .u32 %r<35>;
+    .reg .f32 %f<28>;
+    .reg .pred %p<10>;
+    .shared .align 4 .f32 sdata[256];
+
+    ld.param.u64 %rd0, [param_Q];
+    ld.param.u64 %rd1, [param_K];
+    ld.param.u64 %rd2, [param_V];
+    ld.param.u64 %rd3, [param_output];
+    ld.param.u32 %r0, [param_num_heads];
+    ld.param.u32 %r1, [param_num_kv_heads];
+    ld.param.u32 %r2, [param_head_dim];
+    ld.param.u32 %r3, [param_n_tokens];
+    ld.param.u32 %r4, [param_total_len];
+    ld.param.u32 %r5, [param_pos_offset];
+    ld.param.f32 %f0, [param_attn_scale];
+    ld.param.f32 %f1, [param_softcap];
+
+    // gid = blockIdx.x
+    mov.u32 %r6, %ctaid.x;
+    // lid = threadIdx.x
+    mov.u32 %r7, %tid.x;
+    // tpg = blockDim.x
+    mov.u32 %r8, %ntid.x;
+
+    // Decompose gid: h = gid % num_heads, q_idx = gid / num_heads
+    cvt.rn.f32.u32 %f2, %r6;
+    cvt.rn.f32.u32 %f3, %r0;
+    div.approx.f32 %f2, %f2, %f3;
+    cvt.rzi.u32.f32 %r9, %f2;           // q_idx = gid / num_heads
+    mul.lo.u32 %r10, %r9, %r0;
+    sub.u32 %r10, %r6, %r10;            // h = gid - q_idx * num_heads
+
+    // Bounds check
+    setp.ge.u32 %p0, %r9, %r3;
+    @%p0 bra BCA_EXIT;
+
+    // GQA: kv_head = h * num_kv_heads / num_heads
+    mul.lo.u32 %r11, %r10, %r1;
+    cvt.rn.f32.u32 %f2, %r11;
+    div.approx.f32 %f2, %f2, %f3;
+    cvt.rzi.u32.f32 %r11, %f2;          // kv_head
+
+    // kv_dim = num_kv_heads * head_dim
+    mul.lo.u32 %r12, %r1, %r2;
+    // total_dim = num_heads * head_dim
+    mul.lo.u32 %r13, %r0, %r2;
+    // kv_off = kv_head * head_dim
+    mul.lo.u32 %r14, %r11, %r2;
+
+    // Causal mask: max_attend = min(pos_offset + q_idx + 1, total_len)
+    add.u32 %r15, %r5, %r9;
+    add.u32 %r15, %r15, 1;              // pos_offset + q_idx + 1
+    min.u32 %r15, %r15, %r4;            // max_attend
+
+    // q_head = Q + q_idx * total_dim + h * head_dim (byte offset)
+    mul.lo.u32 %r16, %r9, %r13;
+    mul.lo.u32 %r17, %r10, %r2;
+    add.u32 %r16, %r16, %r17;
+    mul.wide.u32 %rd4, %r16, 4;
+    add.u64 %rd4, %rd0, %rd4;           // q_head ptr
+
+    // Constants
+    mov.f32 %f4, 0f00000000;            // 0.0
+    mov.f32 %f5, 0f3FB8AA3B;            // log2(e) = 1.4426950
+    mov.f32 %f6, 0f40000000;            // 2.0
+    mov.f32 %f7, 0f3F800000;            // 1.0
+
+    // Online softmax state
+    mov.f32 %f8, 0fFF800000;            // running_max = -inf
+    mov.f32 %f9, 0f00000000;            // running_sum = 0
+    mov.f32 %f10, 0f00000000;           // v_acc = 0
+
+    // Tile loop: tile = 0, tpg, 2*tpg, ...
+    mov.u32 %r18, 0;
+BCA_TILE:
+    setp.ge.u32 %p1, %r18, %r15;
+    @%p1 bra BCA_TILE_END;
+
+    // --- Step A: each thread computes Q.K score for position j = tile + lid ---
+    add.u32 %r19, %r18, %r7;            // j = tile + lid
+    mov.f32 %f11, 0fFF800000;           // score = -inf (masked by default)
+    setp.ge.u32 %p2, %r19, %r15;
+    @%p2 bra BCA_STORE_SCORE;
+
+    // dot = sum(q_head[d] * K[j * kv_dim + kv_off + d])
+    mov.f32 %f11, 0f00000000;
+    mul.lo.u32 %r20, %r19, %r12;
+    add.u32 %r20, %r20, %r14;
+    mul.wide.u32 %rd5, %r20, 4;
+    add.u64 %rd5, %rd1, %rd5;           // K[j] row ptr
+    mov.u32 %r21, 0;
+BCA_DOT:
+    setp.ge.u32 %p3, %r21, %r2;
+    @%p3 bra BCA_DOT_END;
+    mul.wide.u32 %rd6, %r21, 4;
+    add.u64 %rd7, %rd4, %rd6;
+    ld.global.f32 %f12, [%rd7];
+    add.u64 %rd8, %rd5, %rd6;
+    ld.global.f32 %f13, [%rd8];
+    fma.rn.f32 %f11, %f12, %f13, %f11;
+    add.u32 %r21, %r21, 1;
+    bra BCA_DOT;
+BCA_DOT_END:
+
+    // score = dot * attn_scale
+    mul.rn.f32 %f11, %f11, %f0;
+
+    // softcap: if softcap > 0, score = softcap * tanh(score / softcap)
+    setp.le.f32 %p4, %f1, %f4;
+    @%p4 bra BCA_STORE_SCORE;
+    div.approx.f32 %f14, %f11, %f1;
+    // tanh(x) = 1 - 2/(exp(2x)+1)
+    mul.rn.f32 %f14, %f14, %f6;
+    mul.rn.f32 %f14, %f14, %f5;
+    ex2.approx.f32 %f14, %f14;
+    add.rn.f32 %f14, %f14, %f7;
+    div.approx.f32 %f14, %f6, %f14;
+    sub.rn.f32 %f14, %f7, %f14;
+    mul.rn.f32 %f11, %f1, %f14;
+
+BCA_STORE_SCORE:
+    // Store score to shared memory
+    mov.u32 %r22, sdata;
+    shl.b32 %r23, %r7, 2;
+    add.u32 %r22, %r22, %r23;
+    st.shared.f32 [%r22], %f11;
+    bar.sync 0;
+
+    // --- Step B: threads parallel over head_dim, online softmax accumulation ---
+    setp.ge.u32 %p5, %r7, %r2;
+    @%p5 bra BCA_VACC_SKIP;
+
+    // active = min(tpg, max_attend - tile)
+    sub.u32 %r24, %r15, %r18;
+    min.u32 %r24, %r8, %r24;
+    mov.u32 %r25, 0;
+BCA_VACC:
+    setp.ge.u32 %p6, %r25, %r24;
+    @%p6 bra BCA_VACC_SKIP;
+
+    // s = shared[t]
+    mov.u32 %r26, sdata;
+    shl.b32 %r27, %r25, 2;
+    add.u32 %r26, %r26, %r27;
+    ld.shared.f32 %f15, [%r26];
+
+    // Online softmax update
+    setp.gt.f32 %p7, %f15, %f8;
+    @!%p7 bra BCA_SCORE_LE;
+
+    // Case: score > running_max -- apply correction
+    // correction = exp(running_max - score) = exp2((running_max - score) * log2e)
+    sub.rn.f32 %f16, %f8, %f15;
+    mul.rn.f32 %f16, %f16, %f5;
+    ex2.approx.f32 %f16, %f16;
+    mul.rn.f32 %f9, %f9, %f16;          // running_sum *= correction
+    add.rn.f32 %f9, %f9, %f7;           // running_sum += 1.0
+    mul.rn.f32 %f10, %f10, %f16;        // v_acc *= correction
+    // v_acc += V[(tile+t) * kv_dim + kv_off + lid]
+    add.u32 %r28, %r18, %r25;
+    mul.lo.u32 %r29, %r28, %r12;
+    add.u32 %r29, %r29, %r14;
+    add.u32 %r29, %r29, %r7;
+    mul.wide.u32 %rd9, %r29, 4;
+    add.u64 %rd10, %rd2, %rd9;
+    ld.global.f32 %f17, [%rd10];
+    add.rn.f32 %f10, %f10, %f17;
+    mov.f32 %f8, %f15;                  // running_max = score
+    bra BCA_VACC_NEXT;
+
+BCA_SCORE_LE:
+    // Case: score <= running_max -- accumulate normally
+    // w = exp(score - running_max) = exp2((score - running_max) * log2e)
+    sub.rn.f32 %f16, %f15, %f8;
+    mul.rn.f32 %f16, %f16, %f5;
+    ex2.approx.f32 %f16, %f16;
+    add.rn.f32 %f9, %f9, %f16;          // running_sum += w
+    // v_acc += w * V[(tile+t) * kv_dim + kv_off + lid]
+    add.u32 %r28, %r18, %r25;
+    mul.lo.u32 %r29, %r28, %r12;
+    add.u32 %r29, %r29, %r14;
+    add.u32 %r29, %r29, %r7;
+    mul.wide.u32 %rd9, %r29, 4;
+    add.u64 %rd10, %rd2, %rd9;
+    ld.global.f32 %f17, [%rd10];
+    fma.rn.f32 %f10, %f16, %f17, %f10;
+
+BCA_VACC_NEXT:
+    add.u32 %r25, %r25, 1;
+    bra BCA_VACC;
+
+BCA_VACC_SKIP:
+    bar.sync 0;
+
+    // Advance tile
+    add.u32 %r18, %r18, %r8;
+    bra BCA_TILE;
+BCA_TILE_END:
+
+    // --- Write normalized output ---
+    setp.ge.u32 %p8, %r7, %r2;
+    @%p8 bra BCA_EXIT;
+    setp.le.f32 %p9, %f9, %f4;
+    @%p9 bra BCA_EXIT;
+    div.approx.f32 %f18, %f10, %f9;     // v_acc / running_sum
+
+    // out_head = output + q_idx * total_dim + h * head_dim + lid
+    mul.lo.u32 %r30, %r9, %r13;
+    mul.lo.u32 %r31, %r10, %r2;
+    add.u32 %r30, %r30, %r31;
+    add.u32 %r30, %r30, %r7;
+    mul.wide.u32 %rd11, %r30, 4;
+    add.u64 %rd12, %rd3, %rd11;
+    st.global.f32 [%rd12], %f18;
+BCA_EXIT:
+    ret;
+}
+
+// -------------------------------------------------------------------------
+// dequant_q4_k: Expand Q4_K quantized weights to F32
+//
+// Grid:  (N, blocks_per_row, 1) -- one block per (row, super-block)
+// Block: (256, 1, 1)            -- one thread per element in super-block
+//
+// Each thread dequantizes one element and writes F32 to output.
+// No dot product, no reduction -- pure dequant for cuBLAS to consume.
+// -------------------------------------------------------------------------
+.visible .entry dequant_q4_k(
+    .param .u64 param_weights,
+    .param .u64 param_output,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .u64 %rd<12>;
+    .reg .u32 %r<28>;
+    .reg .f32 %f<10>;
+    .reg .f16 %h0, %h1;
+    .reg .pred %p<3>;
+
+    ld.param.u64 %rd0, [param_weights];
+    ld.param.u64 %rd1, [param_output];
+    ld.param.u32 %r0, [param_N];
+    ld.param.u32 %r1, [param_K];
+
+    mov.u32 %r2, %tid.x;          // tid (0-255)
+    mov.u32 %r3, %ctaid.x;        // row index
+    mov.u32 %r4, %ctaid.y;        // super-block index
+
+    // blocks_per_row = K >> 8
+    shr.u32 %r5, %r1, 8;
+    // bytes_per_row = blocks_per_row * 144
+    mul.lo.u32 %r6, %r5, 144;
+
+    // Weight block address: weights + row * bytes_per_row + block * 144
+    mul.lo.u32 %r7, %r3, %r6;
+    mul.lo.u32 %r8, %r4, 144;
+    add.u32 %r7, %r7, %r8;
+    cvt.u64.u32 %rd2, %r7;
+    add.u64 %rd2, %rd0, %rd2;
+
+    // Decompose tid for Q4_K block structure
+    shr.u32 %r9, %r2, 6;          // chunk = tid / 64
+    and.b32 %r10, %r2, 63;        // local = tid % 64
+    setp.lt.u32 %p0, %r10, 32;    // is_low
+    @%p0 mov.u32 %r11, %r10;
+    @!%p0 sub.u32 %r11, %r10, 32; // l
+    shl.b32 %r12, %r9, 5;         // q_off = chunk * 32
+    shl.b32 %r13, %r9, 1;         // scale_idx = chunk * 2
+    @!%p0 add.u32 %r13, %r13, 1;
+
+    // Load d, dmin
+    ld.global.b16 %h0, [%rd2];
+    ld.global.b16 %h1, [%rd2+2];
+    cvt.f32.f16 %f1, %h0;
+    cvt.f32.f16 %f2, %h1;
+
+    // Scale extraction
+    add.u64 %rd3, %rd2, 4;
+    cvt.u64.u32 %rd4, %r13;
+    add.u64 %rd5, %rd3, %rd4;
+    ld.global.u8 %r14, [%rd5];
+    add.u64 %rd6, %rd5, 4;
+    ld.global.u8 %r15, [%rd6];
+
+    setp.lt.u32 %p1, %r13, 4;
+    @%p1 bra DQ4K_SCALE_LOW;
+
+    sub.u64 %rd7, %rd5, 4;
+    ld.global.u8 %r16, [%rd7];
+    and.b32 %r17, %r15, 0xF;
+    shr.u32 %r18, %r16, 6;
+    shl.b32 %r18, %r18, 4;
+    or.b32 %r17, %r17, %r18;
+    shr.u32 %r18, %r15, 4;
+    shr.u32 %r19, %r14, 6;
+    shl.b32 %r19, %r19, 4;
+    or.b32 %r18, %r18, %r19;
+    bra DQ4K_SCALE_DONE;
+
+DQ4K_SCALE_LOW:
+    and.b32 %r17, %r14, 63;
+    and.b32 %r18, %r15, 63;
+
+DQ4K_SCALE_DONE:
+    // Load qs byte
+    add.u32 %r20, %r12, %r11;
+    add.u32 %r20, %r20, 16;
+    cvt.u64.u32 %rd8, %r20;
+    add.u64 %rd8, %rd2, %rd8;
+    ld.global.u8 %r21, [%rd8];
+
+    @%p0 and.b32 %r22, %r21, 0xF;
+    @!%p0 shr.u32 %r22, %r21, 4;
+
+    // Dequantize: val = d * sc * q - dmin * m
+    cvt.rn.f32.u32 %f3, %r17;
+    cvt.rn.f32.u32 %f4, %r18;
+    cvt.rn.f32.u32 %f5, %r22;
+    mul.rn.f32 %f6, %f1, %f3;
+    mul.rn.f32 %f7, %f6, %f5;
+    mul.rn.f32 %f8, %f2, %f4;
+    sub.rn.f32 %f9, %f7, %f8;
+
+    // Write output[row * K + block * 256 + tid]
+    mul.lo.u32 %r23, %r3, %r1;
+    shl.b32 %r24, %r4, 8;
+    add.u32 %r23, %r23, %r24;
+    add.u32 %r23, %r23, %r2;
+    mul.wide.u32 %rd9, %r23, 4;
+    add.u64 %rd10, %rd1, %rd9;
+    st.global.f32 [%rd10], %f9;
+
+    ret;
+}
+
+// -------------------------------------------------------------------------
+// dequant_q5_k: Expand Q5_K quantized weights to F32
+//
+// Grid:  (N, blocks_per_row, 1)
+// Block: (256, 1, 1)
+// -------------------------------------------------------------------------
+.visible .entry dequant_q5_k(
+    .param .u64 param_weights,
+    .param .u64 param_output,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .u64 %rd<12>;
+    .reg .u32 %r<30>;
+    .reg .f32 %f<10>;
+    .reg .f16 %h0, %h1;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd0, [param_weights];
+    ld.param.u64 %rd1, [param_output];
+    ld.param.u32 %r0, [param_N];
+    ld.param.u32 %r1, [param_K];
+
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;        // row
+    mov.u32 %r4, %ctaid.y;        // super-block
+
+    shr.u32 %r5, %r1, 8;
+    mul.lo.u32 %r6, %r5, 176;
+
+    // Block address
+    mul.lo.u32 %r7, %r3, %r6;
+    mul.lo.u32 %r8, %r4, 176;
+    add.u32 %r7, %r7, %r8;
+    cvt.u64.u32 %rd2, %r7;
+    add.u64 %rd2, %rd0, %rd2;
+
+    // Decompose tid
+    shr.u32 %r9, %r2, 6;
+    and.b32 %r10, %r2, 63;
+    setp.lt.u32 %p0, %r10, 32;
+    @%p0 mov.u32 %r11, %r10;
+    @!%p0 sub.u32 %r11, %r10, 32;
+    shl.b32 %r12, %r9, 5;
+    shl.b32 %r13, %r9, 1;
+    @!%p0 add.u32 %r13, %r13, 1;
+
+    // qh bit mask
+    mov.u32 %r25, 1;
+    shl.b32 %r25, %r25, %r13;
+
+    // Load d, dmin
+    ld.global.b16 %h0, [%rd2];
+    ld.global.b16 %h1, [%rd2+2];
+    cvt.f32.f16 %f1, %h0;
+    cvt.f32.f16 %f2, %h1;
+
+    // Scale extraction (same as Q4_K)
+    add.u64 %rd3, %rd2, 4;
+    cvt.u64.u32 %rd4, %r13;
+    add.u64 %rd5, %rd3, %rd4;
+    ld.global.u8 %r14, [%rd5];
+    add.u64 %rd6, %rd5, 4;
+    ld.global.u8 %r15, [%rd6];
+
+    setp.lt.u32 %p1, %r13, 4;
+    @%p1 bra DQ5K_SCALE_LOW;
+
+    sub.u64 %rd7, %rd5, 4;
+    ld.global.u8 %r16, [%rd7];
+    and.b32 %r17, %r15, 0xF;
+    shr.u32 %r18, %r16, 6;
+    shl.b32 %r18, %r18, 4;
+    or.b32 %r17, %r17, %r18;
+    shr.u32 %r18, %r15, 4;
+    shr.u32 %r19, %r14, 6;
+    shl.b32 %r19, %r19, 4;
+    or.b32 %r18, %r18, %r19;
+    bra DQ5K_SCALE_DONE;
+
+DQ5K_SCALE_LOW:
+    and.b32 %r17, %r14, 63;
+    and.b32 %r18, %r15, 63;
+
+DQ5K_SCALE_DONE:
+    // Load qs byte at block + 48 + q_off + l
+    add.u32 %r20, %r12, %r11;
+    add.u32 %r20, %r20, 48;
+    cvt.u64.u32 %rd8, %r20;
+    add.u64 %rd8, %rd2, %rd8;
+    ld.global.u8 %r21, [%rd8];
+
+    @%p0 and.b32 %r22, %r21, 0xF;
+    @!%p0 shr.u32 %r22, %r21, 4;
+
+    // Load qh byte at block + 16 + l
+    add.u32 %r26, %r11, 16;
+    cvt.u64.u32 %rd8, %r26;
+    add.u64 %rd8, %rd2, %rd8;
+    ld.global.u8 %r27, [%rd8];
+
+    // high = (qh[l] & qh_mask) ? 16 : 0
+    and.b32 %r28, %r27, %r25;
+    setp.ne.u32 %p2, %r28, 0;
+    selp.u32 %r28, 16, 0, %p2;
+    add.u32 %r22, %r22, %r28;
+
+    // Dequantize: val = d * sc * q_total - dmin * m
+    cvt.rn.f32.u32 %f3, %r17;
+    cvt.rn.f32.u32 %f4, %r18;
+    cvt.rn.f32.u32 %f5, %r22;
+    mul.rn.f32 %f6, %f1, %f3;
+    mul.rn.f32 %f7, %f6, %f5;
+    mul.rn.f32 %f8, %f2, %f4;
+    sub.rn.f32 %f9, %f7, %f8;
+
+    // Write output
+    mul.lo.u32 %r23, %r3, %r1;
+    shl.b32 %r24, %r4, 8;
+    add.u32 %r23, %r23, %r24;
+    add.u32 %r23, %r23, %r2;
+    mul.wide.u32 %rd9, %r23, 4;
+    add.u64 %rd10, %rd1, %rd9;
+    st.global.f32 [%rd10], %f9;
+
+    ret;
+}
+
+// -------------------------------------------------------------------------
+// dequant_q6_k: Expand Q6_K quantized weights to F32
+//
+// Grid:  (N, blocks_per_row, 1)
+// Block: (256, 1, 1)
+// -------------------------------------------------------------------------
+.visible .entry dequant_q6_k(
+    .param .u64 param_weights,
+    .param .u64 param_output,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .u64 %rd<12>;
+    .reg .u32 %r<30>;
+    .reg .f32 %f<8>;
+    .reg .f16 %h0;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd0, [param_weights];
+    ld.param.u64 %rd1, [param_output];
+    ld.param.u32 %r0, [param_N];
+    ld.param.u32 %r1, [param_K];
+
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;        // row
+    mov.u32 %r4, %ctaid.y;        // super-block
+
+    shr.u32 %r5, %r1, 8;
+    mul.lo.u32 %r6, %r5, 210;
+
+    // Block address
+    mul.lo.u32 %r7, %r3, %r6;
+    mul.lo.u32 %r8, %r4, 210;
+    add.u32 %r7, %r7, %r8;
+    cvt.u64.u32 %rd2, %r7;
+    add.u64 %rd2, %rd0, %rd2;
+
+    // Decompose tid into Q6_K position
+    shr.u32 %r9, %r2, 7;          // chunk = tid / 128
+    and.b32 %r10, %r2, 127;       // pos_in_chunk
+    shr.u32 %r11, %r10, 5;        // sub = pos_in_chunk / 32
+    and.b32 %r12, %r10, 31;       // l = pos_in_chunk % 32
+
+    // ql_off = chunk * 64
+    shl.b32 %r13, %r9, 6;
+    // qh_off = chunk * 32
+    shl.b32 %r14, %r9, 5;
+    // sc_off = chunk * 8
+    shl.b32 %r15, %r9, 3;
+    // is = l / 16
+    shr.u32 %r16, %r12, 4;
+
+    // ql byte index: ql_off + l + (sub & 1) * 32
+    and.b32 %r17, %r11, 1;
+    shl.b32 %r17, %r17, 5;
+    add.u32 %r17, %r17, %r13;
+    add.u32 %r17, %r17, %r12;
+
+    // use_high_nibble = (sub >= 2)
+    setp.ge.u32 %p0, %r11, 2;
+
+    // qh shift = sub * 2
+    shl.b32 %r18, %r11, 1;
+
+    // scale index = sc_off + is + sub * 2
+    add.u32 %r19, %r15, %r16;
+    add.u32 %r19, %r19, %r18;
+
+    // Load d at block + 208
+    ld.global.b16 %h0, [%rd2+208];
+    cvt.f32.f16 %f1, %h0;
+
+    // Load ql byte
+    cvt.u64.u32 %rd3, %r17;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.global.u8 %r20, [%rd4];
+
+    @%p0 shr.u32 %r21, %r20, 4;
+    @!%p0 mov.u32 %r21, %r20;
+    and.b32 %r21, %r21, 0xF;
+
+    // Load qh byte at block + 128 + qh_off + l
+    add.u32 %r22, %r14, %r12;
+    add.u32 %r22, %r22, 128;
+    cvt.u64.u32 %rd5, %r22;
+    add.u64 %rd6, %rd2, %rd5;
+    ld.global.u8 %r23, [%rd6];
+
+    // Extract 2 high bits
+    shr.u32 %r24, %r23, %r18;
+    and.b32 %r24, %r24, 3;
+
+    // q6 = ql_nibble | (qh_bits << 4)
+    shl.b32 %r25, %r24, 4;
+    or.b32 %r25, %r21, %r25;
+
+    // q6_centered = q6 - 32
+    sub.u32 %r26, %r25, 32;
+
+    // Load scale (signed i8) at block + 192 + scale_index
+    add.u32 %r27, %r19, 192;
+    cvt.u64.u32 %rd7, %r27;
+    add.u64 %rd8, %rd2, %rd7;
+    ld.global.s8 %r28, [%rd8];
+
+    // Dequantize: val = d * sc * q6_centered
+    cvt.rn.f32.s32 %f2, %r28;
+    cvt.rn.f32.s32 %f3, %r26;
+    mul.rn.f32 %f4, %f1, %f2;
+    mul.rn.f32 %f5, %f4, %f3;
+
+    // Write output
+    mul.lo.u32 %r23, %r3, %r1;
+    shl.b32 %r24, %r4, 8;
+    add.u32 %r23, %r23, %r24;
+    add.u32 %r23, %r23, %r2;
+    mul.wide.u32 %rd9, %r23, 4;
+    add.u64 %rd10, %rd1, %rd9;
+    st.global.f32 [%rd10], %f5;
+
+    ret;
+}
+
 "#,
     "\0"
 );
@@ -2523,6 +3789,13 @@ mod tests {
             "l2_normalize",
             "embedding_lookup",
             "grouped_attn_decode",
+            "batched_causal_attention",
+            "quantized_matmul_q4_k",
+            "quantized_matmul_q5_k",
+            "quantized_matmul_q6_k",
+            "dequant_q4_k",
+            "dequant_q5_k",
+            "dequant_q6_k",
         ];
         for name in &new_kernels {
             let entry = format!(".visible .entry {}(", name);
@@ -2533,8 +3806,8 @@ mod tests {
     #[test]
     fn ptx_module_total_kernel_count() {
         let count = PTX_MODULE.matches(".visible .entry ").count();
-        // 9 ported + 14 new = 23 kernels
-        assert_eq!(count, 23, "Expected 23 kernels, found {}", count);
+        // 9 ported + 14 new + 1 batched_causal_attention + 3 Q4_K/Q5_K/Q6_K + 3 dequant = 30 kernels
+        assert_eq!(count, 30, "Expected 30 kernels, found {}", count);
     }
 
     #[test]

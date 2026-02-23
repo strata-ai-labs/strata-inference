@@ -941,10 +941,15 @@ fn rope_neox_with_factors(
         }
     }
 
-    (
-        DeviceTensor::new(Tensor::new(q_shape.to_vec(), q_rot)),
-        DeviceTensor::new(Tensor::new(k_shape.to_vec(), k_rot)),
-    )
+    let q_tensor = Tensor::new(q_shape.to_vec(), q_rot);
+    let k_tensor = Tensor::new(k_shape.to_vec(), k_rot);
+
+    // Upload back to GPU if the backend is GPU-resident.
+    if backend.is_gpu() {
+        (backend.upload(&q_tensor), backend.upload(&k_tensor))
+    } else {
+        (DeviceTensor::new(q_tensor), DeviceTensor::new(k_tensor))
+    }
 }
 
 /// LongRoPE parameters: per-dimension frequency factors and magnitude scale.
